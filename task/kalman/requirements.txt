@@ -1,0 +1,6 @@
+akshare>=1.14.0
+numpy>=1.24.0
+pandas>=2.0.0
+plotly>=5.0.0
+mplfinance>=0.12.10
+matplotlib>=3.7.0

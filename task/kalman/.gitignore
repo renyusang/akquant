@@ -1,0 +1,15 @@
+# 隔离虚拟环境
+venv/
+
+# 生成的图表和报告
+kline_*.html
+kline_*.png
+report_*.html
+trades_*.csv
+
+# Python 缓存
+__pycache__/
+*.pyc
+signals.csv
+.cache/
+logs/

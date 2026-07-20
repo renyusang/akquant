@@ -1,0 +1,18 @@
+[
+  {
+    "symbol": "600900",
+    "name": "长江电力",
+    "shares": 3200,
+    "signal_price": 28.98,
+    "signal_date": "2026-07-20",
+    "target_pct": 0.95
+  },
+  {
+    "symbol": "000933",
+    "name": "神火股份",
+    "shares": 3700,
+    "signal_price": 25.2,
+    "signal_date": "2026-07-20",
+    "target_pct": 0.95
+  }
+]
