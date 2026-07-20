@@ -6,7 +6,7 @@
 # 全局默认策略参数（可被个股覆盖）
 defaults:
   # 资金管理
-  initial_cash: 100000           # 初始资金
+  initial_cash: 200000           # 初始资金
   max_positions: 5               # 最多同时持有股票数
   single_position_pct: 0.20      # 单只股票最大仓位比例
 

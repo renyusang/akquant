@@ -374,24 +374,33 @@ def evaluate_stock(
     result["shares"] = shares
     result["error"] = None
 
-    # 4. 过滤：已有待执行订单时不重复生成买入信号
+    # 4. 过滤：已有待执行订单时 / 超过最大持仓数时不生成买入信号
     if result["signal"] == "buy":
         from orders import load_pending as _load_pending
         existing = _load_pending()
         sym = str(symbol).zfill(6)
         if any(o["symbol"] == sym for o in existing):
             result["signal"] = "hold"
-            result["target_pct"] = 0.95
+            result["target_pct"] = result["target_pct"]
             result["reason"] = "已有待执行订单，等待成交"
+        else:
+            max_pos = int(params.get("max_positions", 999))
+            current_count = len(load_positions()) + len(existing)
+            if max_pos > 0 and current_count >= max_pos:
+                result["signal"] = "hold"
+                result["target_pct"] = 0.0
+                result["reason"] = f"已达最大持仓数({max_pos})"
 
     # 5. 持久化：记录买卖操作
     entry_date = str(last.get("date", ""))[:10]
     if result["signal"] == "buy" and result["target_pct"] > 0:
         # 买入 → 待执行订单（次日开盘价成交）
         cash = float(stock.get("cash", params.get("initial_cash", 100000)))
-        buy_qty = int(cash * result["target_pct"] / result["close"] / 100) * 100
+        max_pct = float(params.get("single_position_pct", 0.95))
+        capped_pct = min(result["target_pct"], max_pct)
+        buy_qty = int(cash * capped_pct / result["close"] / 100) * 100
         if buy_qty > 0:
-            add_pending_order(symbol, name, buy_qty, result["close"], entry_date, result["target_pct"])
+            add_pending_order(symbol, name, buy_qty, result["close"], entry_date, capped_pct)
             result["shares"] = buy_qty
     elif result["signal"] == "sell":
         # 卖出 → 立即执行（从 positions.json 移除，写入 trades.csv）
@@ -618,21 +627,33 @@ def _execute_today_pending(defaults: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def print_position_summary() -> None:
-    """打印当前持仓总览和已实现盈亏。"""
+    """打印当前持仓总览和已实现盈亏，标记超标仓位。"""
     positions = load_positions()
     from portfolio import get_trade_summary
 
     if not positions:
         print("\n  (当前无持仓)")
     else:
-        print(f"\n{'=' * 75}")
-        print(f"  {'持仓总览':^67s}")
-        print(f"{'=' * 75}")
-        print(f"  {'代码':<8s} {'名称':<8s} {'股数':>6s} {'成本':>8s} {'市值':>10s} {'浮动盈亏':>10s} {'收益率':>8s}")
-        print(f"  {'-' * 66}")
+        # 读取配置获取仓位上限
+        import yaml
+        max_pct = 0.20
+        cash = 100000
+        try:
+            with open(os.path.join(TASK_DIR, "stocks.yaml")) as f:
+                cfg = yaml.safe_load(f)
+            defaults = cfg.get("defaults", {})
+            cash = float(defaults.get("initial_cash", 100000))
+            max_pct = float(defaults.get("single_position_pct", 0.20))
+        except Exception:
+            pass
+        max_value = cash * max_pct
 
-        # 需要获取当前价格（从本次结果中读取）
-        # 简化：读取最后一次 signals.csv 中的 close 作为当前价
+        print(f"\n{'=' * 80}")
+        print(f"  {'持仓总览 (上限 {max_pct*100:.0f}% = ¥{max_value:,.0f})':^72s}")
+        print(f"{'=' * 80}")
+        print(f"  {'代码':<8s} {'名称':<8s} {'股数':>6s} {'成本':>8s} {'市值':>10s} {'占比':>6s} {'浮动盈亏':>10s} {'收益率':>8s}")
+        print(f"  {'-' * 72}")
+
         total_value = 0.0
         total_pnl = 0.0
         try:
@@ -651,13 +672,16 @@ def print_position_summary() -> None:
             value = pos["shares"] * price
             pnl = (price - pos["avg_cost"]) * pos["shares"]
             pnl_pct = (price / pos["avg_cost"] - 1) * 100
+            pct = value / cash * 100 if cash > 0 else 0
             total_value += value
             total_pnl += pnl
-            print(f"  {sym:<8s} {pos['name']:<8s} {pos['shares']:>6d} "
-                  f"{pos['avg_cost']:>8.2f} {value:>10.0f} {pnl:>+10.0f} {pnl_pct:>+7.1f}%")
+            flag = " ⚠️超标" if value > max_value * 1.01 else ""
+            print(f"  {sym:<8s} {pos['name']:<8s} {pos['shares']:>6d}  "
+                  f"{pos['avg_cost']:>8.2f} {value:>10.0f} {pct:>5.1f}% {pnl:>+10.0f} {pnl_pct:>+7.1f}%{flag}")
 
-        print(f"  {'-' * 66}")
-        print(f"  持仓市值: ¥{total_value:,.0f}    浮动盈亏: ¥{total_pnl:+,.0f}")
+        print(f"  {'-' * 72}")
+        total_pct = total_value / cash * 100 if cash > 0 else 0
+        print(f"  持仓市值: ¥{total_value:,.0f} / ¥{cash:,.0f} = {total_pct:.1f}%    浮动盈亏: ¥{total_pnl:+,.0f}")
 
     # 待执行订单
     from orders import load_pending

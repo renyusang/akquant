@@ -13,3 +13,8 @@ __pycache__/
 signals.csv
 .cache/
 logs/
+signals.csv
+grid_search_*.csv
+positions.json
+pending_orders.json
+trades.csv
