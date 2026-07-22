@@ -18,3 +18,4 @@ grid_search_*.csv
 positions.json
 pending_orders.json
 trades.csv
+execution_log.csv

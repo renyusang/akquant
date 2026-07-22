@@ -31,15 +31,10 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kalman_filter import KalmanFilter2D
+from exec_log import log_executed, log_failed, log_pending, log_skipped
 from orders import add_pending_order, execute_pending_orders
-from portfolio import (
-    add_position,
-    get_position,
-    has_position,
-    load_positions,
-    record_trade,
-    remove_position,
-)
+from portfolio import add_position, get_position, has_position, load_positions, record_trade, remove_position
+from state_check import print_check_result, save_snapshot
 
 # ---- 常量 ----
 TASK_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -372,51 +367,59 @@ def evaluate_stock(
     result["name"] = name
     result["date"] = str(last.get("date", ""))[:10]
     result["shares"] = shares
+    result["kalman_price"] = evaluator.kf.get_filtered_price()
     result["error"] = None
 
-    # 4. 过滤：已有待执行订单时 / 超过最大持仓数时不生成买入信号
-    if result["signal"] == "buy":
+    # 4. 过滤：已有待执行订单 / 超仓 / 资金不足 → 不生成买入信号
+    entry_date = str(last.get("date", ""))[:10]
+    if result["signal"] in ("buy", "sell"):
         from orders import load_pending as _load_pending
         existing = _load_pending()
         sym = str(symbol).zfill(6)
         if any(o["symbol"] == sym for o in existing):
             result["signal"] = "hold"
-            result["target_pct"] = result["target_pct"]
             result["reason"] = "已有待执行订单，等待成交"
+            if result["signal"] == "sell":
+                return result  # 不重复生成卖出信号
         else:
             max_pos = int(params.get("max_positions", 999))
             current_count = len(load_positions()) + len(existing)
             if max_pos > 0 and current_count >= max_pos:
+                buy_reason = result.get("reason", "")  # 保存原始买入原因
                 result["signal"] = "hold"
                 result["target_pct"] = 0.0
-                result["reason"] = f"已达最大持仓数({max_pos})"
+                reason = f"已达最大持仓数({max_pos})"
+                result["reason"] = reason
+                log_skipped(symbol, name, entry_date, reason, buy_reason)
+                result["_skipped"] = True
 
     # 5. 持久化：记录买卖操作
-    entry_date = str(last.get("date", ""))[:10]
     if result["signal"] == "buy" and result["target_pct"] > 0:
-        # 买入 → 待执行订单（次日开盘价成交）
         cash = float(stock.get("cash", params.get("initial_cash", 100000)))
         max_pct = float(params.get("single_position_pct", 0.95))
         capped_pct = min(result["target_pct"], max_pct)
         buy_qty = int(cash * capped_pct / result["close"] / 100) * 100
         if buy_qty > 0:
-            add_pending_order(symbol, name, buy_qty, result["close"], entry_date, capped_pct)
-            result["shares"] = buy_qty
+            used = sum(p["shares"] * p["avg_cost"] for p in load_positions().values())
+            remaining_cash = cash - used
+            if buy_qty * result["close"] > remaining_cash * 1.05:
+                reason = f"资金不足(需¥{buy_qty * result['close']:,.0f}>可用¥{remaining_cash:,.0f})"
+                log_skipped(symbol, name, entry_date, reason, result.get("reason", ""))
+            else:
+                add_pending_order(symbol, name, "buy", buy_qty, result["close"], entry_date, capped_pct)
+                log_pending(symbol, name, "buy", capped_pct, buy_qty, result["reason"], entry_date)
+                result["shares"] = buy_qty
+        else:
+            buy_reason = result.get("reason", "")
+            log_skipped(symbol, name, entry_date, f"资金不足(单只上限¥{cash*max_pct:,.0f}, 股价¥{result['close']:.2f})", buy_reason)
     elif result["signal"] == "sell":
-        # 卖出 → 立即执行（从 positions.json 移除，写入 trades.csv）
-        removed = remove_position(symbol)
-        if removed:
-            record_trade(
-                symbol=symbol,
-                name=name,
-                shares=removed.get("shares", shares),
-                entry_price=removed.get("avg_cost", avg_price),
-                exit_price=result["close"],
-                entry_date=removed.get("first_buy_date", entry_date),
-                exit_date=entry_date,
-                reason=result["reason"],
-            )
-            result["shares"] = 0
+        # 卖出 → 待执行订单（次日开盘价成交）
+        if has_pos and pos_info:
+            sell_shares = pos_info["shares"]
+            add_pending_order(symbol, name, "sell", sell_shares, result["close"], entry_date, 0.0)
+            from exec_log import log_pending as _lp
+            _lp(symbol, name, "sell", 0, sell_shares, result["reason"], entry_date, result["reason"])
+            result["shares"] = sell_shares
 
     return result
 
@@ -539,15 +542,29 @@ def main() -> None:
         sys.exit(1)
 
     today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - __import__('datetime').timedelta(days=1)).strftime("%Y-%m-%d")
     print(f"\n{'=' * 60}")
     print(f"  每日信号扫描  {today}")
     print(f"  监控股票: {len(watchlist)} 只")
     print(f"{'=' * 60}")
 
-    # ---- 0. 执行待处理订单（昨日的买入信号，以今日开盘价成交） ----
-    executed_today = _execute_today_pending(defaults)
+    # ---- 0. 数据新鲜度检查 ----
+    data_fresh = _check_data_freshness(watchlist, yesterday)
 
+    # ---- 1. 执行待处理订单 ----
+    executed_today: List[Dict[str, Any]] = []
+    if data_fresh:
+        executed_today = _execute_today_pending(defaults, today)
+    else:
+        print(f"  ⚠️ 数据未更新（最新日期 < {yesterday}），跳过待执行订单")
+        from orders import load_pending
+        pending_count = len(load_pending())
+        if pending_count > 0:
+            print(f"  ⏳ {pending_count} 笔待执行订单等待数据更新后成交")
+
+    positions_before = len(load_positions())
     results = []
+    skipped_buys: List[Dict[str, Any]] = []  # 被跳过的买入信号（等仓位空出）
     for i, stock in enumerate(watchlist, 1):
         symbol = stock["symbol"]
         name = stock.get("name", symbol)
@@ -557,6 +574,8 @@ def main() -> None:
         try:
             result = evaluate_stock(stock, defaults, data_years)
             results.append(result)
+            if result.get("_skipped"):
+                skipped_buys.append(result)
             if not args.quiet:
                 print(format_signal(result))
         except Exception as e:
@@ -567,6 +586,10 @@ def main() -> None:
             if not args.quiet:
                 print(f"  ❌ 错误: {e}")
 
+    # 数据延迟时追加警告标记
+    if not data_fresh and not args.quiet:
+        print(f"\n  ⚠️ 警告: 数据未更新到 {yesterday}，信号基于旧数据，仅供参考")
+
     if not args.quiet:
         print_summary(results)
 
@@ -576,16 +599,94 @@ def main() -> None:
             append_signals_csv(valid)
             print(f"\n信号已保存: {SIGNALS_CSV} ({len(valid)} 条)")
 
+    # 持仓状态表 + 一致性检查 + 快照
+    # 显示被跳过的买入信号
+    if skipped_buys and not args.quiet:
+        print(f"\n  ⏸️ 被跳过 ({len(skipped_buys)} 笔，等仓位空出):")
+        skipped_buys.sort(key=lambda x: abs(float(x.get("kalman_price", 0)) - float(x.get("close", 0))) / float(x.get("close", 1)), reverse=True)
+        for s in skipped_buys[:5]:
+            deviation = (float(s.get("close", 0)) / float(s.get("kalman_price", 1)) - 1) * 100
+            print(f"     {s['symbol']} {s.get('name',''):<6s} ¥{s.get('close',0):>8.2f}  "
+                  f"偏离{deviation:+.1f}%  趋势={s.get('trend','?')}")
+
+    # 仓位空出时自动买入最强信号
+    positions_now = len(load_positions())
+    freed = positions_before - positions_now
+    if freed > 0 and skipped_buys:
+        remaining_slots = int(defaults.get("max_positions", 5)) - positions_now
+        if remaining_slots > 0:
+            skipped_buys.sort(
+                key=lambda x: abs(float(x.get("close", 0)) / float(x.get("kalman_price", 1)) - 1),
+                reverse=True,
+            )
+            filled = 0
+            for s in skipped_buys:
+                if filled >= remaining_slots:
+                    break
+                sym = str(s["symbol"]).zfill(6)
+                # 检查涨停
+                cache_path = os.path.join(CACHE_DIR, f"{sym}.parquet")
+                blocked = False
+                if os.path.exists(cache_path):
+                    try:
+                        cached = pd.read_parquet(cache_path)
+                        if len(cached) >= 1:
+                            last_close = float(cached["close"].iloc[-1])
+                            limit_up = last_close * 1.20 if sym.startswith("688") or sym.startswith("300") or sym.startswith("301") else last_close * 1.10
+                            if s["close"] >= limit_up * 0.999:
+                                print(f"  ⚠️ {sym} {s['name']} 涨停(收盘¥{s['close']:.2f}≥涨停¥{limit_up:.2f})，跳过")
+                                blocked = True
+                    except Exception:
+                        pass
+                if blocked:
+                    continue
+                cash = float(defaults.get("initial_cash", 100000))
+                max_pct = float(defaults.get("single_position_pct", 0.95))
+                capped_pct = min(s.get("target_pct", 0.95), max_pct)
+                buy_qty = int(cash * capped_pct / s["close"] / 100) * 100
+                if buy_qty > 0:
+                    add_pending_order(s["symbol"], s["name"], "buy", buy_qty, s["close"], s["date"], capped_pct)
+                    log_pending(s["symbol"], s["name"], "buy", capped_pct, buy_qty, s.get("reason", ""), s["date"])
+                    print(f"  🟢 自动补仓 {s['symbol']} {s['name']}: {buy_qty}股 "
+                          f"(仓位{positions_before}→{positions_now}, 空出{freed}个, "
+                          f"候选排名 #{filled+1})")
+                    filled += 1
+
     # 持仓状态表
     if not args.quiet:
         print_position_summary()
+        print_check_result()
+    save_snapshot()
 
 
-def _execute_today_pending(defaults: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _check_data_freshness(watchlist: list, yesterday: str) -> bool:
+    """检查缓存数据是否覆盖到昨天（至少）。
+
+    采样前 3 只股票检查缓存最新日期。任意一只 >= yesterday 即认为数据新鲜。
+    """
+    from data_utils import download_stock_data
+    sample = watchlist[:3]
+    for stock in sample:
+        sym = str(stock["symbol"]).zfill(6)
+        cache_path = os.path.join(CACHE_DIR, f"{sym}.parquet")
+        if os.path.exists(cache_path):
+            try:
+                cached = pd.read_parquet(cache_path)
+                last_date = str(pd.to_datetime(cached["date"].max()).date())
+                if last_date >= yesterday:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def _execute_today_pending(defaults: Dict[str, Any], today: str = "") -> List[Dict[str, Any]]:
     """执行昨日的待处理订单（以今日开盘价成交）。
 
     返回已成交订单列表。
     """
+    if not today:
+        today = datetime.now().strftime("%Y-%m-%d")
     executed = []
 
     # 收集今日开盘价和昨日收盘价
@@ -602,26 +703,43 @@ def _execute_today_pending(defaults: Dict[str, Any]) -> List[Dict[str, Any]]:
             except Exception:
                 pass
 
-    pending = execute_pending_orders(today_open, prev_close)
+    pending = execute_pending_orders(today_open, prev_close, today_str=today)
     for order in pending:
         sym = order["symbol"]
         name = order.get("name", sym)
         exec_price = order["exec_price"]
-        # first_buy_date 记录信号日期（决策日），非执行日
-        add_position(sym, name, order["shares"], exec_price, order["signal_date"])
+        action = order.get("action", "buy")
+        if action == "sell":
+            # 执行卖出：移除持仓，记录交易
+            removed = remove_position(sym)
+            if removed:
+                record_trade(
+                    symbol=sym, name=name,
+                    shares=order["shares"],
+                    entry_price=removed.get("avg_cost", 0),
+                    exit_price=exec_price,
+                    entry_date=removed.get("first_buy_date", order["signal_date"]),
+                    exit_date=today,
+                    reason=order.get("signal_reason", ""),
+                )
+            log_executed(sym, order["signal_date"], exec_price, today)
+            print(f"  ✅ 卖出 {sym} {name}: {order['shares']}股 @ ¥{exec_price:.2f} "
+                  f"(信号日 {order['signal_date']})")
+        else:
+            add_position(sym, name, order["shares"], exec_price, order["signal_date"])
+            log_executed(sym, order["signal_date"], exec_price, today)
+            print(f"  ✅ 买入 {sym} {name}: {order['shares']}股 @ ¥{exec_price:.2f} "
+                  f"(信号日 {order['signal_date']} 信号价 ¥{order['signal_price']:.2f})")
         executed.append(order)
-        print(f"  ✅ 成交 {sym} {name}: {order['shares']}股 @ ¥{exec_price:.2f} "
-              f"(信号日 {order['signal_date']} 信号价 ¥{order['signal_price']:.2f})")
 
-    # 报告失败/等待中的订单
     from orders import load_pending
     remaining = load_pending()
+    for order in remaining:
+        log_failed(order["symbol"], order["signal_date"], order.get("reason", "等待数据"))
     if remaining:
-        print(f"  ⏳ 待执行 {len(remaining)} 笔 (等待次日数据):")
+        print(f"  ⚠️ 未成交 {len(remaining)} 笔:")
         for order in remaining:
-            print(f"     {order['symbol']} {order.get('name','')}: "
-                  f"{order['shares']}股 信号价 ¥{order['signal_price']:.2f} "
-                  f"({order.get('reason','等待开盘数据')})")
+            print(f"     {order['symbol']} {order.get('name','')}: {order.get('reason','')}")
 
     return executed
 
@@ -683,19 +801,14 @@ def print_position_summary() -> None:
         total_pct = total_value / cash * 100 if cash > 0 else 0
         print(f"  持仓市值: ¥{total_value:,.0f} / ¥{cash:,.0f} = {total_pct:.1f}%    浮动盈亏: ¥{total_pnl:+,.0f}")
 
-    # 待执行订单
-    from orders import load_pending
-    pending = load_pending()
-    if pending:
-        print(f"\n  待执行买单 ({len(pending)} 笔，次交易日开盘价成交):")
-        for o in pending:
-            print(f"    {o['symbol']} {o['name']:<6s} {o['shares']}股  "
-                  f"信号价 ¥{o['signal_price']:.2f}  日期 {o['signal_date']}")
+    # 执行日志摘要
+    from exec_log import get_summary as _exec_summary, get_pending_count
+    print(f"\n  执行日志: {_exec_summary()}")
 
     # 已完成交易汇总
     trade_summary = get_trade_summary()
     if trade_summary["count"] > 0:
-        print(f"\n  已完成交易: {trade_summary['count']} 笔 | "
+        print(f"  已完成交易: {trade_summary['count']} 笔 | "
               f"盈利 {trade_summary['wins']} | 亏损 {trade_summary['losses']} | "
               f"累计盈亏: ¥{trade_summary['total_pnl']:+,.0f}")
 

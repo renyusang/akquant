@@ -64,6 +64,9 @@ watchlist:
 
   - symbol: "300373"
     name: "扬杰科技"
+
+  - symbol: "000977"
+    name: "浪潮信息"
   
   - symbol: "000021"
     name: "深科技"
@@ -92,6 +95,14 @@ watchlist:
     name: "沪深300ETF"
     type: etf
 
+  - symbol: "512500"
+    name: "中证500ETF"
+    type: etf
+  
+  - symbol: "159845"
+    name: "中证1000ETF"
+    type: etf
+
   - symbol: "159367"
     name: "创业板50ETF"
     type: etf
@@ -99,6 +110,15 @@ watchlist:
   - symbol: "588000"
     name: "科创板50ETF"
     type: etf
-  # - symbol: "159915"
-  #   name: "创业板ETF"
-  #   type: etf
+
+  - symbol: "159783"
+    name: "科创创业50"
+    type: etf
+  
+  - symbol: "159957"
+    name: "创业板ETF"
+    type: etf
+
+  - symbol: "518880"
+    name: "黄金ETF"
+    type: etf

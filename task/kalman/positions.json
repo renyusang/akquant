@@ -1,8 +1,32 @@
 {
+  "600900": {
+    "name": "长江电力",
+    "shares": 1300,
+    "avg_cost": 29.0,
+    "first_buy_date": "2026-07-20"
+  },
+  "000933": {
+    "name": "神火股份",
+    "shares": 1600,
+    "avg_cost": 24.85,
+    "first_buy_date": "2026-07-20"
+  },
+  "300750": {
+    "name": "宁德时代",
+    "shares": 100,
+    "avg_cost": 372.67,
+    "first_buy_date": "2026-07-21"
+  },
+  "688041": {
+    "name": "海光信息",
+    "shares": 100,
+    "avg_cost": 338.0,
+    "first_buy_date": "2026-07-21"
+  },
   "002594": {
     "name": "比亚迪",
     "shares": 400,
     "avg_cost": 93.49,
-    "first_buy_date": "2026-07-20"
+    "first_buy_date": "2026-07-17"
   }
 }

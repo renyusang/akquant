@@ -18,6 +18,24 @@ import sys
 import pandas as pd
 import yaml
 
+
+def _dwidth(s: str) -> int:
+    """估算字符串在终端中的显示宽度（CJK≈2，ASCII≈1）。"""
+    w = 0
+    for c in str(s):
+        w += 2 if '一' <= c <= '鿿' or '　' <= c <= '〿' or '＀' <= c <= '￯' else 1
+    return w
+
+
+def _pad(s: str, width: int, align: str = "left") -> str:
+    """按显示宽度填充字符串。"""
+    need = width - _dwidth(s)
+    if need <= 0:
+        return s
+    if align == "right":
+        return " " * need + s
+    return s + " " * need
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from portfolio import (
@@ -45,8 +63,9 @@ def cmd_show() -> None:
         defaults = cfg.get("defaults", {})
         cash = float(defaults.get("initial_cash", 100000))
         max_pct = float(defaults.get("single_position_pct", 0.20))
+        max_pos = int(defaults.get("max_positions", 5))
     except Exception:
-        pass
+        max_pos = 5
     max_value = cash * max_pct
 
     if not positions:
@@ -64,29 +83,46 @@ def cmd_show() -> None:
                 except Exception:
                     pass
 
-        print(f"\n{'代码':<10s} {'名称':<8s} {'股数':>6s} {'成本':>8s} {'现价':>8s} {'市值':>8s} {'占比':>5s} {'浮动盈亏':>8s} {'收益率':>8s}")
-        print("-" * 78)
+        # 列宽（按显示宽度）
+        CW = [6, 8, 5, 9, 9, 9, 5, 10, 7]  # 代码,名称,股数,成本,现价,市值,占比,浮动盈亏,收益率
+        headers = ["代码", "名称", "股数", "成本", "现价", "市值", "占比", "浮动盈亏", "收益率"]
+        aligns = ["left", "left", "right", "right", "right", "right", "right", "right", "right"]
+
+        # 表头
+        hdr = "  " + "  ".join(_pad(h, CW[i], aligns[i]) for i, h in enumerate(headers))
+        sep = "  " + "  ".join("-" * w for w in CW)
+        print(f"\n{hdr}\n{sep}")
+
         total_cost_val = 0.0; total_market_val = 0.0
         for sym, pos in sorted(positions.items()):
             price = price_map.get(sym, pos["avg_cost"])
-            cost_val = pos["shares"] * pos["avg_cost"]
             market_val = pos["shares"] * price
-            pnl = market_val - cost_val
+            pnl = market_val - pos["shares"] * pos["avg_cost"]
             pnl_pct = (price / pos["avg_cost"] - 1) * 100
             pct = market_val / cash * 100 if cash > 0 else 0
-            total_cost_val += cost_val; total_market_val += market_val
-            flag = " ⚠️" if market_val > max_value * 1.01 else ""
-            print(f"{sym:<10s} {pos['name']:<8s} {pos['shares']:>6d}  "
-                  f"¥{pos['avg_cost']:>7.2f} ¥{price:>7.2f} ¥{market_val:>7.0f} "
-                  f"{pct:>4.1f}% ¥{pnl:>+7.0f} {pnl_pct:>+7.1f}%{flag}")
-        print("-" * 78)
+            total_cost_val += pos["shares"] * pos["avg_cost"]
+            total_market_val += market_val
+            flag = " !" if market_val > max_value * 1.01 else ""
+            vals = [
+                sym, pos['name'],
+                f"{pos['shares']:,d}",
+                f"¥{pos['avg_cost']:.2f}",
+                f"¥{price:.2f}",
+                f"¥{market_val:,.0f}",
+                f"{pct:.1f}%",
+                f"¥{pnl:+,.0f}{flag}",
+                f"{pnl_pct:+.1f}%",
+            ]
+            row = "  " + "  ".join(_pad(v, CW[i], aligns[i]) for i, v in enumerate(vals))
+            print(row)
+        print(sep)
         total_pnl = total_market_val - total_cost_val
         total_pnl_pct = (total_market_val / total_cost_val - 1) * 100 if total_cost_val > 0 else 0
         total_pct = total_market_val / cash * 100 if cash > 0 else 0
-        print(f"持仓市值: ¥{total_market_val:,.0f} / ¥{cash:,.0f} = {total_pct:.1f}%  "
+        print(f"  持仓市值: ¥{total_market_val:,.0f} / ¥{cash:,.0f} = {total_pct:.1f}%  "
               f"浮动盈亏: ¥{total_pnl:+,.0f} ({total_pnl_pct:+.1f}%)  ({len(positions)} 只)")
         if any(pos["shares"] * price_map.get(sym, pos["avg_cost"]) > max_value * 1.01 for sym, pos in positions.items()):
-            print(f"⚠️ 有仓位超过单只上限 ¥{max_value:,.0f} ({max_pct*100:.0f}%)")
+            print(f"  ⚠️ 有仓位超过单只上限 ¥{max_value:,.0f} ({max_pct*100:.0f}%)")
 
     # 已完成交易
     trade_summary = get_trade_summary()
@@ -111,7 +147,70 @@ def cmd_show() -> None:
     if pending:
         print(f"\n⏳ 待执行 ({len(pending)} 笔):")
         for o in pending:
-            print(f"   {o['symbol']} {o['name']} {o['shares']}股  信号价¥{o['signal_price']:.2f}  信号日{o['signal_date']}")
+            icon = "🔴" if o.get("action") == "sell" else "🟢"
+            print(f"   {icon} {o['symbol']} {o['name']} {o['action']} {o['shares']}股  "
+                  f"信号价¥{o['signal_price']:.2f}  信号日{o['signal_date']}")
+
+    # 被跳过的买入信号（从 execution_log 获取 skipped 列表，从 signals.csv 获取价格）
+    skipped = []
+    elog_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "execution_log.csv")
+    sig_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals.csv")
+    if os.path.exists(elog_csv) and os.path.exists(sig_csv):
+        elog = pd.read_csv(elog_csv, dtype={"symbol": str})
+        elog["symbol"] = elog["symbol"].str.zfill(6)
+        sig_df = pd.read_csv(sig_csv, dtype={"symbol": str})
+        sig_df["symbol"] = sig_df["symbol"].str.zfill(6)
+        latest = sig_df.sort_values("date").groupby("symbol").last()
+        pos_set = set(positions.keys())
+        pend_set = {o["symbol"] for o in pending}
+        for _, r in elog.iterrows():
+            sym = r["symbol"]
+            if r.get("status") != "skipped" or r.get("action") != "buy":
+                continue
+            if sym in pos_set or sym in pend_set:
+                continue
+            if sym in latest.index:
+                row = latest.loc[sym]
+                c = float(row.get("close", 0))
+                k = float(row.get("kalman_price", c))
+                dev = abs((c / k - 1) * 100) if k > 0 else 0
+                skipped.append({
+                    "symbol": sym, "name": row.get("name", sym),
+                    "close": c, "deviation": dev,
+                    "trend": row.get("trend", "?"),
+                })
+        skipped.sort(key=lambda x: x["deviation"], reverse=True)
+
+    if skipped:
+        pending_sells = sum(1 for o in pending if o.get("action") == "sell")
+        pending_buys = len(pending) - pending_sells
+        slots = max_pos - len(positions) - pending_buys + pending_sells
+        print(f"\n⏸️ 等待买入 ({len(skipped)} 只，空位{slots}个):")
+        picked = 0
+        for s in skipped:
+            sym = s["symbol"]
+            blocked = False
+            cp = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", f"{sym}.parquet")
+            if os.path.exists(cp):
+                try:
+                    cd = pd.read_parquet(cp)
+                    if len(cd) >= 1:
+                        pc = float(cd["close"].iloc[-1])
+                        lp = 0.20 if sym.startswith("688") or sym.startswith("300") or sym.startswith("301") else 0.10
+                        if s["close"] >= pc * (1 + lp) * 0.999:
+                            blocked = True
+                except Exception:
+                    pass
+            if blocked:
+                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  偏离{s['deviation']:+.1f}%  趋势={s['trend']}  ⚠️涨停跳过")
+            elif picked < slots:
+                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  偏离{s['deviation']:+.1f}%  趋势={s['trend']}  ← 买入 #{picked+1}")
+                picked += 1
+            else:
+                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  偏离{s['deviation']:+.1f}%  趋势={s['trend']}")
+
+    print()
+    print()
     print()
 
 
