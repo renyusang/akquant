@@ -35,6 +35,8 @@ from exec_log import log_executed, log_failed, log_pending, log_skipped
 from orders import add_pending_order, execute_pending_orders
 from portfolio import add_position, get_position, has_position, load_positions, record_trade, remove_position
 from state_check import print_check_result, save_snapshot
+from backup import create_backup
+from validate import run_all_checks, save_validation_log
 
 # ---- 常量 ----
 TASK_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -64,17 +66,35 @@ def load_config(path: str = CONFIG_FILE) -> Dict[str, Any]:
         config = yaml.safe_load(f)
     if not config or "watchlist" not in config:
         raise ValueError("配置文件格式错误: 缺少 'watchlist' 字段")
+    # 兼容旧格式（扁平 watchlist）
+    if isinstance(config["watchlist"], list):
+        config["watchlist"] = {"stocks": config["watchlist"], "etfs": []}
     return config
 
 
+def _pool_config(config: Dict[str, Any], asset_type: str) -> Dict[str, Any]:
+    """获取指定资产类型的资金池配置。"""
+    pool = config.get(asset_type, {})
+    return {
+        "initial_cash": float(pool.get("initial_cash", 200000 if asset_type == "stock" else 100000)),
+        "max_positions": int(pool.get("max_positions", 5 if asset_type == "stock" else 3)),
+        "single_position_pct": float(pool.get("single_position_pct", 0.20 if asset_type == "stock" else 0.30)),
+    }
+
+
 def get_stock_params(
-    stock: Dict[str, Any], defaults: Dict[str, Any]
+    stock: Dict[str, Any], config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """合并全局默认参数和个股覆盖参数。"""
-    params = dict(defaults)
-    for key in defaults:
+    """合并策略参数 + 资金池参数。"""
+    strategy = config.get("strategy", {})
+    asset_type = stock.get("type", "stock")
+    pool = _pool_config(config, asset_type)
+    params = dict(strategy)
+    params.update(pool)
+    for key in strategy:
         if key in stock:
             params[key] = stock[key]
+    params["asset_type"] = asset_type
     return params
 
 
@@ -323,13 +343,13 @@ class SignalEvaluator:
 # =============================================================================
 def evaluate_stock(
     stock: Dict[str, Any],
-    defaults: Dict[str, Any],
+    config: Dict[str, Any],
     data_years: int,
 ) -> Dict[str, Any]:
     """对单只股票执行信号评估。"""
     symbol = stock["symbol"]
     name = stock.get("name", symbol)
-    params = get_stock_params(stock, defaults)
+    params = get_stock_params(stock, config)
 
     # 1. 获取数据
     asset_type = stock.get("type", "stock")
@@ -376,31 +396,45 @@ def evaluate_stock(
         from orders import load_pending as _load_pending
         existing = _load_pending()
         sym = str(symbol).zfill(6)
-        if any(o["symbol"] == sym for o in existing):
-            result["signal"] = "hold"
-            result["reason"] = "已有待执行订单，等待成交"
+        existing_order = next((o for o in existing if o["symbol"] == sym), None)
+        if existing_order:
             if result["signal"] == "sell":
-                return result  # 不重复生成卖出信号
-        else:
-            max_pos = int(params.get("max_positions", 999))
-            current_count = len(load_positions()) + len(existing)
-            if max_pos > 0 and current_count >= max_pos:
-                buy_reason = result.get("reason", "")  # 保存原始买入原因
+                # 卖出信号优先级最高：取消旧订单，允许卖出
+                pass
+            else:
                 result["signal"] = "hold"
-                result["target_pct"] = 0.0
-                reason = f"已达最大持仓数({max_pos})"
-                result["reason"] = reason
-                log_skipped(symbol, name, entry_date, reason, buy_reason)
-                result["_skipped"] = True
+                result["reason"] = "已有待执行订单，等待成交"  # 不重复生成卖出信号
+        else:
+            if result["signal"] == "buy":
+                max_pos = int(params.get("max_positions", 999))
+                asset_type = params.get("asset_type", "stock")
+                pool_positions = sum(1 for s in load_positions().keys()
+                                     if (s.startswith("5") or s.startswith("1")) == (asset_type == "etf"))
+                pool_pending = sum(1 for o in existing
+                                   if (o["symbol"].startswith("5") or o["symbol"].startswith("1")) == (asset_type == "etf"))
+                current_count = pool_positions + pool_pending
+                if max_pos > 0 and current_count >= max_pos:
+                    buy_reason = result.get("reason", "")
+                    result["signal"] = "hold"
+                    result["target_pct"] = 0.0
+                    reason = f"已达最大持仓数({max_pos})"
+                    result["reason"] = reason
+                    log_skipped(symbol, name, entry_date, reason, buy_reason)
+                    result["_skipped"] = True
 
     # 5. 持久化：记录买卖操作
     if result["signal"] == "buy" and result["target_pct"] > 0:
         cash = float(stock.get("cash", params.get("initial_cash", 100000)))
         max_pct = float(params.get("single_position_pct", 0.95))
-        capped_pct = min(result["target_pct"], max_pct)
-        buy_qty = int(cash * capped_pct / result["close"] / 100) * 100
+        capped_pct = round(result["target_pct"] * max_pct, 4)
+        lot = 200 if str(symbol).startswith("688") else 100
+        buy_qty = int(cash * capped_pct / result["close"] / lot) * lot
         if buy_qty > 0:
-            used = sum(p["shares"] * p["avg_cost"] for p in load_positions().values())
+            etf_pfx = ("51", "15", "58", "56")
+            is_etf = (asset_type == "etf")
+            pool_pos = {s: p for s, p in load_positions().items()
+                        if (s.startswith(etf_pfx)) == is_etf}
+            used = sum(p["shares"] * p["avg_cost"] for p in pool_pos.values())
             remaining_cash = cash - used
             if buy_qty * result["close"] > remaining_cash * 1.05:
                 reason = f"资金不足(需¥{buy_qty * result['close']:,.0f}>可用¥{remaining_cash:,.0f})"
@@ -533,46 +567,47 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
-    defaults = config.get("defaults", {})
-    watchlist = config.get("watchlist", [])
     data_years = int(config.get("data_years", 2))
+    watchlist_raw = config.get("watchlist", {})
+    if isinstance(watchlist_raw, list):
+        stocks_list = watchlist_raw
+        etfs_list = []
+    else:
+        stocks_list = watchlist_raw.get("stocks", [])
+        etfs_list = watchlist_raw.get("etfs", [])
+    all_watchlist = stocks_list + etfs_list
 
-    if not watchlist:
+    if not all_watchlist:
         print("错误: watchlist 为空")
         sys.exit(1)
 
     today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - __import__('datetime').timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # 运行前备份
+    backup_tag = create_backup()
+    if not args.quiet:
+        print(f"  📦 备份: {backup_tag}")
+
     print(f"\n{'=' * 60}")
     print(f"  每日信号扫描  {today}")
-    print(f"  监控股票: {len(watchlist)} 只")
+    print(f"  股票: {len(stocks_list)} 只  ETF: {len(etfs_list)} 只  (共 {len(all_watchlist)} 只)")
     print(f"{'=' * 60}")
 
-    # ---- 0. 数据新鲜度检查 ----
-    data_fresh = _check_data_freshness(watchlist, yesterday)
-
-    # ---- 1. 执行待处理订单 ----
-    executed_today: List[Dict[str, Any]] = []
-    if data_fresh:
-        executed_today = _execute_today_pending(defaults, today)
-    else:
-        print(f"  ⚠️ 数据未更新（最新日期 < {yesterday}），跳过待执行订单")
-        from orders import load_pending
-        pending_count = len(load_pending())
-        if pending_count > 0:
-            print(f"  ⏳ {pending_count} 笔待执行订单等待数据更新后成交")
+    # ---- 0. 数据校验 ----
+    data_issues, order_issues = run_all_checks(all_watchlist, quiet=args.quiet)
+    all_validation_issues = data_issues + order_issues
 
     positions_before = len(load_positions())
     results = []
     skipped_buys: List[Dict[str, Any]] = []  # 被跳过的买入信号（等仓位空出）
-    for i, stock in enumerate(watchlist, 1):
+    for i, stock in enumerate(all_watchlist, 1):
         symbol = stock["symbol"]
         name = stock.get("name", symbol)
         if not args.quiet:
-            print(f"\n[{i}/{len(watchlist)}] {symbol} {name} ...")
+            print(f"\n[{i}/{len(all_watchlist)}] {symbol} {name} ...")
 
         try:
-            result = evaluate_stock(stock, defaults, data_years)
+            result = evaluate_stock(stock, config, data_years)
             results.append(result)
             if result.get("_skipped"):
                 skipped_buys.append(result)
@@ -586,10 +621,6 @@ def main() -> None:
             if not args.quiet:
                 print(f"  ❌ 错误: {e}")
 
-    # 数据延迟时追加警告标记
-    if not data_fresh and not args.quiet:
-        print(f"\n  ⚠️ 警告: 数据未更新到 {yesterday}，信号基于旧数据，仅供参考")
-
     if not args.quiet:
         print_summary(results)
 
@@ -598,6 +629,21 @@ def main() -> None:
         if valid:
             append_signals_csv(valid)
             print(f"\n信号已保存: {SIGNALS_CSV} ({len(valid)} 条)")
+
+    # ---- 数据就绪后执行待处理订单 ----
+    data_fresh = _check_data_freshness(all_watchlist, today)
+    if not data_fresh:
+        all_validation_issues.append({
+            "symbol": "*", "name": "全局", "check": "数据未更新",
+            "level": "warn", "detail": f"最新数据 < {today}，跳过待执行订单",
+        })
+        print(f"  ⚠️ 当日数据未就绪，跳过待执行订单（需 {today} 数据）")
+        from orders import load_pending
+        pending_count = len(load_pending())
+        if pending_count > 0:
+            print(f"  ⏳ {pending_count} 笔待执行订单等待数据更新后成交")
+    else:
+        _execute_today_pending(config, today)
 
     # 持仓状态表 + 一致性检查 + 快照
     # 显示被跳过的买入信号
@@ -613,7 +659,8 @@ def main() -> None:
     positions_now = len(load_positions())
     freed = positions_before - positions_now
     if freed > 0 and skipped_buys:
-        remaining_slots = int(defaults.get("max_positions", 5)) - positions_now
+        stock_pool = _pool_config(config, "stock")
+        remaining_slots = int(stock_pool["max_positions"]) - positions_now
         if remaining_slots > 0:
             skipped_buys.sort(
                 key=lambda x: abs(float(x.get("close", 0)) / float(x.get("kalman_price", 1)) - 1),
@@ -640,10 +687,11 @@ def main() -> None:
                         pass
                 if blocked:
                     continue
-                cash = float(defaults.get("initial_cash", 100000))
-                max_pct = float(defaults.get("single_position_pct", 0.95))
-                capped_pct = min(s.get("target_pct", 0.95), max_pct)
-                buy_qty = int(cash * capped_pct / s["close"] / 100) * 100
+                cash = float(stock_pool["initial_cash"])
+                max_pct = float(stock_pool["single_position_pct"])
+                capped_pct = round(float(s.get("target_pct", 0.95)) * max_pct, 4)
+                lot = 200 if str(s["symbol"]).startswith("688") else 100
+                buy_qty = int(cash * capped_pct / s["close"] / lot) * lot
                 if buy_qty > 0:
                     add_pending_order(s["symbol"], s["name"], "buy", buy_qty, s["close"], s["date"], capped_pct)
                     log_pending(s["symbol"], s["name"], "buy", capped_pct, buy_qty, s.get("reason", ""), s["date"])
@@ -652,17 +700,32 @@ def main() -> None:
                           f"候选排名 #{filled+1})")
                     filled += 1
 
+    # 校验结果
+    if all_validation_issues:
+        errors = [i for i in all_validation_issues if i["level"] == "error"]
+        warns = [i for i in all_validation_issues if i["level"] == "warn"]
+        print(f"\n⚠️ 数据校验: {len(errors)} 错误 {len(warns)} 警告")
+        if errors:
+            for i in errors:
+                print(f"  ❌ {i['symbol']} {i.get('name','')}: {i['detail']}")
+        if warns:
+            for i in warns:
+                print(f"  ⚠️ {i['symbol']} {i.get('name','')}: {i['detail']}")
+    if not args.no_save:
+        save_validation_log(all_validation_issues)
+
     # 持仓状态表
     if not args.quiet:
         print_position_summary()
         print_check_result()
     save_snapshot()
+    save_snapshot()
 
 
-def _check_data_freshness(watchlist: list, yesterday: str) -> bool:
-    """检查缓存数据是否覆盖到昨天（至少）。
+def _check_data_freshness(watchlist: list, today: str) -> bool:
+    """检查缓存数据是否覆盖到今天。
 
-    采样前 3 只股票检查缓存最新日期。任意一只 >= yesterday 即认为数据新鲜。
+    只有当日数据就绪时才认为数据新鲜，才能用当日开盘价执行待处理订单。
     """
     from data_utils import download_stock_data
     sample = watchlist[:3]
@@ -673,14 +736,14 @@ def _check_data_freshness(watchlist: list, yesterday: str) -> bool:
             try:
                 cached = pd.read_parquet(cache_path)
                 last_date = str(pd.to_datetime(cached["date"].max()).date())
-                if last_date >= yesterday:
+                if last_date >= today:
                     return True
             except Exception:
                 pass
     return False
 
 
-def _execute_today_pending(defaults: Dict[str, Any], today: str = "") -> List[Dict[str, Any]]:
+def _execute_today_pending(config: Dict[str, Any], today: str = "") -> List[Dict[str, Any]]:
     """执行昨日的待处理订单（以今日开盘价成交）。
 
     返回已成交订单列表。
@@ -759,9 +822,9 @@ def print_position_summary() -> None:
         try:
             with open(os.path.join(TASK_DIR, "stocks.yaml")) as f:
                 cfg = yaml.safe_load(f)
-            defaults = cfg.get("defaults", {})
-            cash = float(defaults.get("initial_cash", 100000))
-            max_pct = float(defaults.get("single_position_pct", 0.20))
+            stock_cfg = cfg.get("stock", {})
+            cash = float(stock_cfg.get("initial_cash", 200000))
+            max_pct = float(stock_cfg.get("single_position_pct", 0.20))
         except Exception:
             pass
         max_value = cash * max_pct

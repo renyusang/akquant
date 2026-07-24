@@ -51,107 +51,137 @@ import pandas as pd
 
 
 def cmd_show() -> None:
-    """显示持仓总览（含浮动盈亏和已实现盈亏）。"""
+    """显示持仓总览，分股票和 ETF 两个池。"""
     positions = load_positions()
     from portfolio import get_trade_summary
 
-    # 读取仓位上限配置
-    max_pct = 0.20; cash = 100000
+    max_pct = 0.20; cash = 100000; etf_cash = 100000; etf_max_pct = 0.30; etf_max_pos = 3
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "stocks.yaml")) as f:
             cfg = yaml.safe_load(f)
-        defaults = cfg.get("defaults", {})
-        cash = float(defaults.get("initial_cash", 100000))
-        max_pct = float(defaults.get("single_position_pct", 0.20))
-        max_pos = int(defaults.get("max_positions", 5))
+        stock_cfg = cfg.get("stock", cfg.get("defaults", {}))
+        etf_cfg = cfg.get("etf", {})
+        cash = float(stock_cfg.get("initial_cash", 200000))
+        max_pct = float(stock_cfg.get("single_position_pct", 0.20))
+        max_pos = int(stock_cfg.get("max_positions", 5))
+        etf_cash = float(etf_cfg.get("initial_cash", 100000))
+        etf_max_pct = float(etf_cfg.get("single_position_pct", 0.20))
+        etf_max_pos = int(etf_cfg.get("max_positions", 5))
     except Exception:
-        max_pos = 5
+        max_pos = 5; etf_max_pos = 5
     max_value = cash * max_pct
+    etf_max_value = etf_cash * etf_max_pct
+
+    price_map = {}
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+    for fname in os.listdir(cache_dir):
+        if fname.endswith(".parquet"):
+            try:
+                df = pd.read_parquet(os.path.join(cache_dir, fname))
+                if len(df) > 0:
+                    sym = fname.replace(".parquet", "").zfill(6)
+                    price_map[sym] = float(df["close"].iloc[-1])
+            except Exception:
+                pass
+
+    etf_prefixes = ("51", "15", "58", "56")
+    stock_pos = {s: p for s, p in positions.items() if not s.startswith(etf_prefixes)}
+    etf_pos = {s: p for s, p in positions.items() if s.startswith(etf_prefixes)}
+
+    def _print_table(label, pool_positions, pool_cash, pool_max_pct, pool_max_value):
+        if not pool_positions:
+            print(f"\n  [{label}] 当前无持仓  (可用: ¥{pool_cash:,.0f})")
+            return
+        CW = [6, 8, 5, 9, 9, 9, 5, 10, 7]
+        headers = ["代码", "名称", "股数", "成本", "现价", "市值", "占比", "浮动盈亏", "收益率"]
+        aligns = ["left", "left", "right", "right", "right", "right", "right", "right", "right"]
+        hdr = "  " + "  ".join(_pad(h, CW[i], aligns[i]) for i, h in enumerate(headers))
+        sep = "  " + "  ".join("-" * w for w in CW)
+        total_cost = 0.0; total_market = 0.0
+        rows = []
+        for sym, pos in sorted(pool_positions.items()):
+            price = price_map.get(sym, pos["avg_cost"])
+            cost_v = pos["shares"] * pos["avg_cost"]
+            market_v = pos["shares"] * price
+            pnl = market_v - cost_v
+            pnl_pct = (price / pos["avg_cost"] - 1) * 100
+            pct = market_v / pool_cash * 100 if pool_cash > 0 else 0
+            total_cost += cost_v; total_market += market_v
+            flag = " !" if market_v > pool_max_value * 1.01 else ""
+            rows.append([sym, pos['name'], f"{pos['shares']:,d}",
+                         f"¥{pos['avg_cost']:.2f}", f"¥{price:.2f}",
+                         f"¥{market_v:,.0f}", f"{pct:.1f}%",
+                         f"¥{pnl:+,.0f}{flag}", f"{pnl_pct:+.1f}%"])
+        total_pnl = total_market - total_cost
+        total_pnl_pct = (total_market / total_cost - 1) * 100 if total_cost > 0 else 0
+        total_pct = total_market / pool_cash * 100 if pool_cash > 0 else 0
+        print(f"\n  [{label}] ({len(pool_positions)} 只, 上限{pool_max_pct*100:.0f}%/只 ¥{pool_max_value:,.0f})")
+        print(hdr); print(sep)
+        for r in rows:
+            print("  " + "  ".join(_pad(v, CW[i], aligns[i]) for i, v in enumerate(r)))
+        print(sep)
+        print(f"  持仓市值: ¥{total_market:,.0f} / ¥{pool_cash:,.0f} = {total_pct:.1f}%  浮动盈亏: ¥{total_pnl:+,.0f} ({total_pnl_pct:+.1f}%)")
+        return total_cost, total_market
 
     if not positions:
         print("当前无持仓")
     else:
-        price_map = {}
-        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
-        for fname in os.listdir(cache_dir):
-            if fname.endswith(".parquet"):
-                try:
-                    df = pd.read_parquet(os.path.join(cache_dir, fname))
-                    if len(df) > 0:
-                        sym = fname.replace(".parquet", "").zfill(6)
-                        price_map[sym] = float(df["close"].iloc[-1])
-                except Exception:
-                    pass
+        stock_cost, stock_market = _print_table("股票", stock_pos, cash, max_pct, max_value)
+        etf_cost, etf_market = _print_table("ETF", etf_pos, etf_cash, etf_max_pct, etf_max_value)
 
-        # 列宽（按显示宽度）
-        CW = [6, 8, 5, 9, 9, 9, 5, 10, 7]  # 代码,名称,股数,成本,现价,市值,占比,浮动盈亏,收益率
-        headers = ["代码", "名称", "股数", "成本", "现价", "市值", "占比", "浮动盈亏", "收益率"]
-        aligns = ["left", "left", "right", "right", "right", "right", "right", "right", "right"]
+    total_cost = stock_cost + etf_cost
+    if total_cost > 0:
+        stock_pnl = stock_market - stock_cost
+        etf_pnl = etf_market - etf_cost
+        total_pnl = stock_pnl + etf_pnl
+        print(f"\n  [股票] 成本 ¥{stock_cost:,.0f}  市值 ¥{stock_market:,.0f}  浮动 ¥{stock_pnl:+,.0f}")
+        print(f"  [ETF]  成本 ¥{etf_cost:,.0f}  市值 ¥{etf_market:,.0f}  浮动 ¥{etf_pnl:+,.0f}")
+        print(f"  [合计] 成本 ¥{stock_cost+etf_cost:,.0f}  市值 ¥{stock_market+etf_market:,.0f}  浮动 ¥{total_pnl:+,.0f}  ({len(positions)} 只)")
 
-        # 表头
-        hdr = "  " + "  ".join(_pad(h, CW[i], aligns[i]) for i, h in enumerate(headers))
-        sep = "  " + "  ".join("-" * w for w in CW)
-        print(f"\n{hdr}\n{sep}")
-
-        total_cost_val = 0.0; total_market_val = 0.0
-        for sym, pos in sorted(positions.items()):
-            price = price_map.get(sym, pos["avg_cost"])
-            market_val = pos["shares"] * price
-            pnl = market_val - pos["shares"] * pos["avg_cost"]
-            pnl_pct = (price / pos["avg_cost"] - 1) * 100
-            pct = market_val / cash * 100 if cash > 0 else 0
-            total_cost_val += pos["shares"] * pos["avg_cost"]
-            total_market_val += market_val
-            flag = " !" if market_val > max_value * 1.01 else ""
-            vals = [
-                sym, pos['name'],
-                f"{pos['shares']:,d}",
-                f"¥{pos['avg_cost']:.2f}",
-                f"¥{price:.2f}",
-                f"¥{market_val:,.0f}",
-                f"{pct:.1f}%",
-                f"¥{pnl:+,.0f}{flag}",
-                f"{pnl_pct:+.1f}%",
-            ]
-            row = "  " + "  ".join(_pad(v, CW[i], aligns[i]) for i, v in enumerate(vals))
-            print(row)
-        print(sep)
-        total_pnl = total_market_val - total_cost_val
-        total_pnl_pct = (total_market_val / total_cost_val - 1) * 100 if total_cost_val > 0 else 0
-        total_pct = total_market_val / cash * 100 if cash > 0 else 0
-        print(f"  持仓市值: ¥{total_market_val:,.0f} / ¥{cash:,.0f} = {total_pct:.1f}%  "
-              f"浮动盈亏: ¥{total_pnl:+,.0f} ({total_pnl_pct:+.1f}%)  ({len(positions)} 只)")
-        if any(pos["shares"] * price_map.get(sym, pos["avg_cost"]) > max_value * 1.01 for sym, pos in positions.items()):
-            print(f"  ⚠️ 有仓位超过单只上限 ¥{max_value:,.0f} ({max_pct*100:.0f}%)")
-
-    # 已完成交易
     trade_summary = get_trade_summary()
     if trade_summary["count"] > 0:
-        print(f"\n已完成交易: {trade_summary['count']} 笔  "
-              f"盈利 {trade_summary['wins']} 亏损 {trade_summary['losses']}  "
-              f"累计盈亏: ¥{trade_summary['total_pnl']:+,.0f}")
-        # 最近 5 笔
-        trades = pd.read_csv(TRADES_FILE)
-        if len(trades) > 0:
-            print(f"\n{'入场':<12s} {'出场':<12s} {'代码':<10s} {'名称':<8s} {'股数':>6s} {'入场价':>8s} {'出场价':>8s} {'盈亏':>10s}")
-            print("-" * 80)
-            for _, t in trades.tail(5).iterrows():
-                print(f"{str(t['entry_date']):<12s} {str(t['exit_date']):<12s} "
-                      f"{str(t['symbol']):<10s} {str(t['name']):<8s} {int(t['shares']):>6d}  "
-                      f"¥{float(t['entry_price']):>7.2f}  ¥{float(t['exit_price']):>7.2f}  "
-                      f"¥{float(t['pnl']):>+9.0f}")
+        print(f"  已实现盈亏: ¥{trade_summary['total_pnl']:+,.0f}")
+        print(f"  总盈亏(浮+实): ¥{total_pnl + trade_summary['total_pnl']:+,.0f}")
 
-    # 待执行订单
     from orders import load_pending
     pending = load_pending()
-    if pending:
-        print(f"\n⏳ 待执行 ({len(pending)} 笔):")
-        for o in pending:
-            icon = "🔴" if o.get("action") == "sell" else "🟢"
-            print(f"   {icon} {o['symbol']} {o['name']} {o['action']} {o['shares']}股  "
-                  f"信号价¥{o['signal_price']:.2f}  信号日{o['signal_date']}")
+    sells = [o for o in pending if o.get("action") == "sell"]
+    buys = [o for o in pending if o.get("action") != "sell"]
+    if sells:
+        print(f"\n🔴 待卖出 ({len(sells)} 笔):")
+        for o in sells:
+            print(f"   {o['symbol']} {o['name']} {o['shares']}股  信号价¥{o['signal_price']:.2f}  信号日{o['signal_date']}")
+    if buys:
+        print(f"\n🟢 待买入 ({len(buys)} 笔):")
+        for o in buys:
+            pct = float(o.get("target_pct", 0)) * 100
+            print(f"   {o['symbol']} {o['name']} {o['shares']}股 ({pct:.0f}%)  信号价¥{o['signal_price']:.2f}  信号日{o['signal_date']}")
 
-    # 被跳过的买入信号（从 execution_log 获取 skipped 列表，从 signals.csv 获取价格）
+    # 最近买入（从 execution_log）
+    elog_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "execution_log.csv")
+    if os.path.exists(elog_path):
+        elog = pd.read_csv(elog_path, dtype={"symbol": str})
+        elog["symbol"] = elog["symbol"].str.zfill(6)
+        recent_buys = elog[(elog["status"] == "executed") & (elog["action"] == "buy")]
+        if len(recent_buys) > 0:
+            recent_buys = recent_buys.sort_values("exec_date").tail(3)
+            print(f"\n🟢 最近买入 ({len(recent_buys)} 笔):")
+            for _, t in recent_buys.iterrows():
+                print(f"   {t['symbol']} {t['name']} {int(t['shares'])}股  ¥{float(t['exec_price']):.2f}  {t['exec_date']}")
+
+    # 最近卖出（从 trades.csv）
+    tp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.csv")
+    if os.path.exists(tp):
+        trades_df = pd.read_csv(tp, dtype={"symbol": str})
+        if len(trades_df) > 0:
+            trades_df["symbol"] = trades_df["symbol"].str.zfill(6)
+            recent = trades_df.tail(3)
+            print(f"\n🔴 最近卖出 ({len(recent)} 笔):")
+            for _, t in recent.iterrows():
+                pnl = float(t["pnl"])
+                ps = f"+¥{pnl:,.0f}" if pnl >= 0 else f"¥{pnl:,.0f}"
+                print(f"   {t['symbol']} {t['name']} {int(t['shares'])}股  ¥{float(t['entry_price']):.2f}→¥{float(t['exit_price']):.2f}  {ps}  {t['entry_date']}→{t['exit_date']}")
+
     skipped = []
     elog_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "execution_log.csv")
     sig_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals.csv")
@@ -163,31 +193,32 @@ def cmd_show() -> None:
         latest = sig_df.sort_values("date").groupby("symbol").last()
         pos_set = set(positions.keys())
         pend_set = {o["symbol"] for o in pending}
+        seen = set()
         for _, r in elog.iterrows():
             sym = r["symbol"]
             if r.get("status") != "skipped" or r.get("action") != "buy":
                 continue
-            if sym in pos_set or sym in pend_set:
+            if sym in pos_set or sym in pend_set or sym in seen:
                 continue
+            seen.add(sym)
             if sym in latest.index:
                 row = latest.loc[sym]
                 c = float(row.get("close", 0))
                 k = float(row.get("kalman_price", c))
                 dev = abs((c / k - 1) * 100) if k > 0 else 0
-                skipped.append({
-                    "symbol": sym, "name": row.get("name", sym),
-                    "close": c, "deviation": dev,
-                    "trend": row.get("trend", "?"),
-                })
+                target_pct = float(row.get("target_pct", 0.95))
+                skipped.append({"symbol": sym, "name": row.get("name", sym), "close": c, "deviation": dev, "trend": row.get("trend", "?"), "target_pct": target_pct})
         skipped.sort(key=lambda x: x["deviation"], reverse=True)
 
-    if skipped:
-        pending_sells = sum(1 for o in pending if o.get("action") == "sell")
-        pending_buys = len(pending) - pending_sells
-        slots = max_pos - len(positions) - pending_buys + pending_sells
-        print(f"\n⏸️ 等待买入 ({len(skipped)} 只，空位{slots}个):")
+    stock_skipped = [s for s in skipped if not s["symbol"].startswith(etf_prefixes)]
+    etf_skipped = [s for s in skipped if s["symbol"].startswith(etf_prefixes)]
+
+    def _show_group(label, items, pool_slots, pool_cash, pool_max_pct):
+        if not items:
+            return
+        print(f"\n⏸️ [{label}] 待买入 ({len(items)} 只，空位{pool_slots}个):")
         picked = 0
-        for s in skipped:
+        for s in items:
             sym = s["symbol"]
             blocked = False
             cp = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", f"{sym}.parquet")
@@ -201,19 +232,27 @@ def cmd_show() -> None:
                             blocked = True
                 except Exception:
                     pass
+            lot = 200 if sym.startswith("688") else 100
+            # 从趋势推断原始仓位：上涨 95%，下跌 30%
+            trend = s.get("trend", "up")
+            target = 0.30 if trend == "down" else 0.95
+            est_qty = int(pool_cash * pool_max_pct * target / s["close"] / lot) * lot
             if blocked:
                 print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  偏离{s['deviation']:+.1f}%  趋势={s['trend']}  ⚠️涨停跳过")
-            elif picked < slots:
-                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  偏离{s['deviation']:+.1f}%  趋势={s['trend']}  ← 买入 #{picked+1}")
+            elif picked < pool_slots:
+                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  {est_qty}股  偏离{s['deviation']:+.1f}%  趋势={s['trend']}  ← 买入 #{picked+1}")
                 picked += 1
             else:
-                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  偏离{s['deviation']:+.1f}%  趋势={s['trend']}")
+                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  {est_qty}股  偏离{s['deviation']:+.1f}%  趋势={s['trend']}")
+
+    pending_sells = sum(1 for o in pending if o.get("action") == "sell")
+    pending_buys = len(pending) - pending_sells
+    stock_slots = max_pos - len(stock_pos) - pending_buys + pending_sells
+    etf_slots = etf_max_pos - len(etf_pos)
+    _show_group("股票", stock_skipped, stock_slots, cash, max_pct)
+    _show_group("ETF", etf_skipped, etf_slots, etf_cash, etf_max_pct)
 
     print()
-    print()
-    print()
-
-
 def cmd_add(symbol: str, name: str, shares: int, cost: float, date: str) -> None:
     """手动新增持仓。"""
     # 读取配置中的资金限制
@@ -222,9 +261,9 @@ def cmd_add(symbol: str, name: str, shares: int, cost: float, date: str) -> None
     try:
         with open(config_path) as f:
             cfg = yaml.safe_load(f)
-        defaults = cfg.get("defaults", {})
-        cash = float(defaults.get("initial_cash", 100000))
-        max_pct = float(defaults.get("single_position_pct", 0.20))
+        stock_cfg = cfg.get("stock", cfg.get("defaults", {}))
+        cash = float(stock_cfg.get("initial_cash", 200000))
+        max_pct = float(stock_cfg.get("single_position_pct", 0.20))
         max_value = cash * max_pct
         add_value = shares * cost
         if add_value > max_value * 1.01:  # 1% 容差
@@ -262,9 +301,9 @@ def cmd_adjust(symbol: str, shares: int, cost: float) -> None:
     try:
         with open(config_path) as f:
             cfg = yaml.safe_load(f)
-        defaults = cfg.get("defaults", {})
-        cash = float(defaults.get("initial_cash", 100000))
-        max_pct = float(defaults.get("single_position_pct", 0.20))
+        stock_cfg = cfg.get("stock", cfg.get("defaults", {}))
+        cash = float(stock_cfg.get("initial_cash", 200000))
+        max_pct = float(stock_cfg.get("single_position_pct", 0.20))
         max_value = cash * max_pct
         new_value = shares * cost
         if new_value > max_value * 1.01:
@@ -331,6 +370,10 @@ def main() -> None:
     p_restore = sub.add_parser("restore", help="从交易记录恢复持仓")
     p_restore.add_argument("symbol", help="股票代码")
 
+    p_backups = sub.add_parser("backups", help="列出所有备份")
+    p_rollback = sub.add_parser("rollback", help="回滚到指定备份")
+    p_rollback.add_argument("timestamp", nargs="?", default=None, help="备份时间戳 (默认最新)")
+
     args = parser.parse_args()
 
     if args.command == "show":
@@ -343,6 +386,18 @@ def main() -> None:
         cmd_adjust(args.symbol, args.shares, args.cost)
     elif args.command == "restore":
         cmd_restore(args.symbol)
+    elif args.command == "backups":
+        from backup import list_backups
+        backups = list_backups()
+        if backups:
+            print(f"\n备份快照 ({len(backups)} 个):")
+            for b in backups:
+                print(f"  {b}")
+        else:
+            print("无备份")
+    elif args.command == "rollback":
+        from backup import restore_backup
+        restore_backup(args.timestamp)
     else:
         parser.print_help()
 

@@ -19,3 +19,6 @@ positions.json
 pending_orders.json
 trades.csv
 execution_log.csv
+backups/
+backups/*
+validation_log.csv

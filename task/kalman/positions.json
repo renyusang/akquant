@@ -17,16 +17,46 @@
     "avg_cost": 372.67,
     "first_buy_date": "2026-07-21"
   },
-  "688041": {
-    "name": "海光信息",
-    "shares": 100,
-    "avg_cost": 338.0,
-    "first_buy_date": "2026-07-21"
+  "510050": {
+    "name": "上证50ETF",
+    "shares": 6400,
+    "avg_cost": 3.104,
+    "first_buy_date": "2026-07-22"
   },
-  "002594": {
-    "name": "比亚迪",
-    "shares": 400,
-    "avg_cost": 93.49,
-    "first_buy_date": "2026-07-17"
+  "515790": {
+    "name": "光伏ETF",
+    "shares": 24300,
+    "avg_cost": 0.816,
+    "first_buy_date": "2026-07-22"
+  },
+  "512480": {
+    "name": "半导体ETF",
+    "shares": 17300,
+    "avg_cost": 1.163,
+    "first_buy_date": "2026-07-22"
+  },
+  "515220": {
+    "name": "煤炭ETF",
+    "shares": 16300,
+    "avg_cost": 1.21,
+    "first_buy_date": "2026-07-22"
+  },
+  "512400": {
+    "name": "有色金属ETF",
+    "shares": 11300,
+    "avg_cost": 1.775,
+    "first_buy_date": "2026-07-22"
+  },
+  "002192": {
+    "name": "融捷股份",
+    "shares": 100,
+    "avg_cost": 62.86,
+    "first_buy_date": "2026-07-23"
+  },
+  "002460": {
+    "name": "赣锋锂业",
+    "shares": 200,
+    "avg_cost": 50.0,
+    "first_buy_date": "2026-07-22"
   }
 }

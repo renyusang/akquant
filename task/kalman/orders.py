@@ -43,12 +43,17 @@ def add_pending_order(
     signal_date: str,
     target_pct: float = 0.0,
 ) -> None:
-    """新增待执行订单（买入或卖出）。
+    """新增待执行订单。
 
-    同一股票只保留最近一条（覆盖旧订单）。
+    同一股票已有同向订单时不覆盖（保留最早的信号日期）。
+    不同向时替换（卖出替换买入，反之亦然）。
     """
     orders = load_pending()
     key = str(symbol).zfill(6)
+    existing = next((o for o in orders if o["symbol"] == key), None)
+    if existing and existing.get("action") == action:
+        # 同向不覆盖，保留原信号日期
+        return
     orders = [o for o in orders if o["symbol"] != key]
     orders.append({
         "symbol": key,
