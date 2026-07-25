@@ -35,7 +35,7 @@ from akquant import run_grid_search
 # 确保可以从 task 目录导入本地模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from data_utils import download_stock_data, get_data_summary, preprocess_data
+from data_utils import get_data_summary, load_cached_data
 from strategy import KalmanStrategy
 
 # ---- 默认配置 ----
@@ -247,10 +247,9 @@ def main() -> None:
 
     print_grid_info(grid, total)
 
-    # ---- 1. 下载并预处理数据 ----
+    # ---- 1. 加载数据(catalog 缓存,与组合回测同源) ----
     print("\n[1/3] 准备数据...")
-    df = download_stock_data(args.symbol, args.start, args.end, adjust="qfq")
-    df = preprocess_data(df)
+    df = load_cached_data(args.symbol, args.start, args.end)
     effective_bars = len(df) - 40  # warmup_period = 40
     print(f"  数据: {len(df)} 条（有效 bar 数: {effective_bars}，扣除预热期 40）")
     print(get_data_summary(df))

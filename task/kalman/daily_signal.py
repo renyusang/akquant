@@ -17,23 +17,29 @@
 """
 
 import argparse
-import csv
 import os
 import sys
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
-import numpy as np
 import pandas as pd
 import yaml
 
 # 确保可以导入本地模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from kalman_filter import KalmanFilter2D
+from signal_engine import SignalEngine
 from exec_log import log_executed, log_failed, log_pending, log_skipped
 from orders import add_pending_order, execute_pending_orders
-from portfolio import add_position, get_position, has_position, load_positions, record_trade, remove_position
+from portfolio import (
+    add_position,
+    calc_fee,
+    get_position,
+    has_position,
+    load_positions,
+    record_trade,
+    remove_position,
+)
 from state_check import print_check_result, save_snapshot
 from backup import create_backup
 from validate import run_all_checks, save_validation_log
@@ -141,204 +147,6 @@ def download_with_cache(symbol: str, data_years: int = 2, asset_type: str = "sto
 
 
 # =============================================================================
-# 当前持仓推断
-# =============================================================================
-# =============================================================================
-# 信号计算（纯函数，不依赖 akquant 回测引擎）
-# =============================================================================
-class SignalEvaluator:
-    """单股信号评估器。
-
-    直接使用 kalman_filter.py 中的 KalmanFilter2D，
-    不依赖 akquant 回测引擎。适合每日批量运行。
-    """
-
-    def __init__(self, params: Dict[str, Any]):
-        self.params = params
-        self.kf = KalmanFilter2D(
-            Q_price=float(params["kalman_q_price"]),
-            Q_vel=float(params["kalman_q_vel"]),
-            R=float(params["kalman_r"]),
-        )
-        self._prev_velocity: float = 0.0
-        self._trend_state: str = "up"
-        self._trend_counter: int = 0
-        self._bars_processed: int = 0
-
-    def process_history(self, df: pd.DataFrame) -> None:
-        """用历史数据预热卡尔曼滤波器和趋势状态。"""
-        if df.empty:
-            return
-        for i in range(len(df)):
-            close = float(df["close"].iloc[i])
-            self.kf.update(close)
-            self._bars_processed += 1
-
-            # 预热趋势
-            if len(df) >= 21 and i >= 20:
-                ma20_cur = float(df["close"].iloc[i - 19:i + 1].mean())
-                ma20_prev = float(df["close"].iloc[i - 20:i].mean())
-                self._update_trend_state(close, ma20_cur, ma20_prev)
-
-            if i >= 1:
-                self._prev_velocity = self.kf.get_velocity()
-
-    def evaluate(self, bar: Dict[str, float]) -> Dict[str, Any]:
-        """评估当前 bar 的信号。
-
-        bar 需包含: close, ma20_cur, ma20_prev
-        返回信号字典。
-        """
-        close = float(bar["close"])
-        ma20_cur = float(bar["ma20_cur"])
-        ma20_prev = float(bar["ma20_prev"])
-
-        # 更新卡尔曼
-        filtered, velocity = self.kf.update(close)
-        prev_velocity = self._prev_velocity
-
-        # 更新趋势
-        self._update_trend_state(close, ma20_cur, ma20_prev)
-
-        # 判断信号
-        signal, target_pct, reason = self._evaluate(
-            close, filtered, velocity, prev_velocity,
-        )
-
-        self._prev_velocity = velocity
-        self._bars_processed += 1
-
-        return {
-            "close": close,
-            "kalman_price": filtered,
-            "kalman_velocity": velocity,
-            "ma20": ma20_cur,
-            "ma20_rising": ma20_cur > ma20_prev,
-            "trend": self._trend_state,
-            "signal": signal,
-            "target_pct": target_pct,
-            "reason": reason,
-        }
-
-    # ------------------------------------------------------------------
-    def _update_trend_state(
-        self, close: float, ma20_cur: float, ma20_prev: float
-    ) -> None:
-        """更新趋势状态。"""
-        if not self.params.get("trend_filter_enabled", False):
-            self._trend_state = "up"
-            return
-
-        is_bearish = close < ma20_cur
-        ma20_rising = ma20_cur > ma20_prev
-        confirm = int(self.params.get("trend_confirm_bars", 1))
-
-        if is_bearish:
-            self._trend_counter += 1
-            if self._trend_counter >= confirm and self._trend_state == "up":
-                self._trend_state = "down"
-        elif ma20_rising:
-            self._trend_counter = 0
-            if self._trend_state == "down":
-                self._trend_state = "up"
-        else:
-            self._trend_counter = max(self._trend_counter, confirm)
-
-    # ------------------------------------------------------------------
-    def _evaluate(
-        self,
-        close: float,
-        filtered: float,
-        velocity: float,
-        prev_velocity: float,
-    ) -> Tuple[str, float, str]:
-        """评估买卖信号。
-
-        返回 (signal, target_pct, reason)
-            signal: "buy" | "sell" | "hold"
-        """
-        params = self.params
-        has_position = self._has_position
-
-        # 趋势决定仓位
-        if params.get("trend_filter_enabled", False):
-            if self._trend_state == "down":
-                target_pct = float(params.get("trend_bear_pct", 0.0))
-            else:
-                target_pct = 0.95
-        else:
-            target_pct = 0.95
-
-        # 卖出逻辑（有持仓时检查）
-        if has_position:
-            # 止损
-            stop_loss = float(params.get("stop_loss_pct", 0.05))
-            if self._entry_price > 0:
-                pnl = close / self._entry_price - 1.0
-                if pnl < -stop_loss:
-                    return "sell", 0.0, f"止损({pnl * 100:.1f}%)"
-
-            # 价格回归
-            exit_threshold = float(params.get("exit_threshold", 0.005))
-            if close < filtered * (1.0 - exit_threshold):
-                return "sell", 0.0, f"价格回归(偏离{(close / filtered - 1) * 100:.1f}%)"
-
-            # 速度反转
-            if params.get("use_velocity_signal", True):
-                if velocity < 0.0 and prev_velocity >= 0.0:
-                    return "sell", 0.0, "速度反转(转空)"
-
-            # 持有
-            trend_info = f"趋势={self._trend_state}"
-            return "hold", target_pct, f"持仓中 | {trend_info}"
-
-        # 买入逻辑（空仓时检查）
-        else:
-            if params.get("trend_filter_enabled") and self._trend_state == "down":
-                # 下跌趋势中需更强信号
-                entry_threshold = float(params.get("downtrend_entry", 0.03))
-                extra = f"下跌趋势(+{entry_threshold * 100:.0f}%阈值)"
-            else:
-                entry_threshold = float(params.get("entry_threshold", 0.02))
-                extra = ""
-
-            reasons = []
-
-            # 价格突破
-            if params.get("use_price_signal", True):
-                if close > filtered * (1.0 + entry_threshold):
-                    reasons.append(
-                        f"价格突破(偏离{(close / filtered - 1) * 100:.1f}%)"
-                    )
-
-            # 速度反转
-            if params.get("use_velocity_signal", True):
-                if velocity > 0.0 and prev_velocity <= 0.0:
-                    reasons.append("速度反转(转多)")
-
-            if reasons:
-                reason_str = " + ".join(reasons)
-                if extra:
-                    reason_str += f" | {extra}"
-                return "buy", target_pct, reason_str
-
-            # 无信号
-            trend_info = f"趋势={self._trend_state}"
-            if extra:
-                trend_info += f" | {extra}"
-            return "hold", 0.0, f"等待信号 | {trend_info}"
-
-    # 持仓状态（由外部设置）
-    _has_position: bool = False
-    _entry_price: float = 0.0
-
-    def set_position(self, has_position: bool, entry_price: float = 0.0) -> None:
-        """设置当前持仓状态。"""
-        self._has_position = has_position
-        self._entry_price = entry_price
-
-
-# =============================================================================
 # 主流程
 # =============================================================================
 def evaluate_stock(
@@ -363,12 +171,12 @@ def evaluate_stock(
     shares = pos_info["shares"] if pos_info else 0
     avg_price = pos_info["avg_cost"] if pos_info else 0.0
 
-    # 3. 预热
-    evaluator = SignalEvaluator(params)
-    evaluator.set_position(has_pos, avg_price)
+    # 3. 创建引擎并预热
+    engine = SignalEngine(**params)
+    engine.set_position(has_pos, avg_price)
 
     if len(df) > WARMUP_BARS:
-        evaluator.process_history(df.iloc[:-1])  # 除最后一天外的全部历史
+        engine.process_history(df.iloc[:-1])  # 除最后一天外的全部历史
 
     # 4. 评估最后一天
     last = df.iloc[-1]
@@ -377,20 +185,16 @@ def evaluate_stock(
     ma20_cur = float(df["close"].iloc[-20:].mean())
     ma20_prev = float(df["close"].iloc[-21:-1].mean()) if len(df) >= 21 else ma20_cur
 
-    result = evaluator.evaluate({
-        "close": close,
-        "ma20_cur": ma20_cur,
-        "ma20_prev": ma20_prev,
-    })
+    result = engine.update(close, ma20_cur, ma20_prev)
 
     result["symbol"] = symbol
     result["name"] = name
     result["date"] = str(last.get("date", ""))[:10]
     result["shares"] = shares
-    result["kalman_price"] = evaluator.kf.get_filtered_price()
+    result["kalman_price"] = engine.filtered_price
     result["error"] = None
 
-    # 4. 过滤：已有待执行订单 / 超仓 / 资金不足 → 不生成买入信号
+    # 5. 过滤：已有待执行订单 / 超仓 / 资金不足 → 不生成买入信号
     entry_date = str(last.get("date", ""))[:10]
     if result["signal"] in ("buy", "sell"):
         from orders import load_pending as _load_pending
@@ -403,15 +207,19 @@ def evaluate_stock(
                 pass
             else:
                 result["signal"] = "hold"
-                result["reason"] = "已有待执行订单，等待成交"  # 不重复生成卖出信号
+                result["reason"] = "已有待执行订单，等待成交"
         else:
             if result["signal"] == "buy":
                 max_pos = int(params.get("max_positions", 999))
                 asset_type = params.get("asset_type", "stock")
-                pool_positions = sum(1 for s in load_positions().keys()
-                                     if (s.startswith("5") or s.startswith("1")) == (asset_type == "etf"))
-                pool_pending = sum(1 for o in existing
-                                   if (o["symbol"].startswith("5") or o["symbol"].startswith("1")) == (asset_type == "etf"))
+                pool_positions = sum(
+                    1 for s in load_positions().keys()
+                    if (s.startswith("5") or s.startswith("1")) == (asset_type == "etf")
+                )
+                pool_pending = sum(
+                    1 for o in existing
+                    if (o["symbol"].startswith("5") or o["symbol"].startswith("1")) == (asset_type == "etf")
+                )
                 current_count = pool_positions + pool_pending
                 if max_pos > 0 and current_count >= max_pos:
                     buy_reason = result.get("reason", "")
@@ -422,7 +230,7 @@ def evaluate_stock(
                     log_skipped(symbol, name, entry_date, reason, buy_reason)
                     result["_skipped"] = True
 
-    # 5. 持久化：记录买卖操作
+    # 6. 持久化：记录买卖操作
     if result["signal"] == "buy" and result["target_pct"] > 0:
         cash = float(stock.get("cash", params.get("initial_cash", 100000)))
         max_pct = float(params.get("single_position_pct", 0.95))
@@ -432,8 +240,11 @@ def evaluate_stock(
         if buy_qty > 0:
             etf_pfx = ("51", "15", "58", "56")
             is_etf = (asset_type == "etf")
-            pool_pos = {s: p for s, p in load_positions().items()
-                        if (s.startswith(etf_pfx)) == is_etf}
+            pool_pos = {
+                s: p
+                for s, p in load_positions().items()
+                if (s.startswith(etf_pfx)) == is_etf
+            }
             used = sum(p["shares"] * p["avg_cost"] for p in pool_pos.values())
             remaining_cash = cash - used
             if buy_qty * result["close"] > remaining_cash * 1.05:
@@ -445,7 +256,11 @@ def evaluate_stock(
                 result["shares"] = buy_qty
         else:
             buy_reason = result.get("reason", "")
-            log_skipped(symbol, name, entry_date, f"资金不足(单只上限¥{cash*max_pct:,.0f}, 股价¥{result['close']:.2f})", buy_reason)
+            log_skipped(
+                symbol, name, entry_date,
+                f"资金不足(单只上限¥{cash * max_pct:,.0f}, 股价¥{result['close']:.2f})",
+                buy_reason,
+            )
     elif result["signal"] == "sell":
         # 卖出 → 待执行订单（次日开盘价成交）
         if has_pos and pos_info:
@@ -649,11 +464,20 @@ def main() -> None:
     # 显示被跳过的买入信号
     if skipped_buys and not args.quiet:
         print(f"\n  ⏸️ 被跳过 ({len(skipped_buys)} 笔，等仓位空出):")
-        skipped_buys.sort(key=lambda x: abs(float(x.get("kalman_price", 0)) - float(x.get("close", 0))) / float(x.get("close", 1)), reverse=True)
+        skipped_buys.sort(
+            key=lambda x: abs(
+                float(x.get("kalman_price", 0)) - float(x.get("close", 0))
+            ) / float(x.get("close", 1)),
+            reverse=True,
+        )
         for s in skipped_buys[:5]:
-            deviation = (float(s.get("close", 0)) / float(s.get("kalman_price", 1)) - 1) * 100
-            print(f"     {s['symbol']} {s.get('name',''):<6s} ¥{s.get('close',0):>8.2f}  "
-                  f"偏离{deviation:+.1f}%  趋势={s.get('trend','?')}")
+            deviation = (
+                float(s.get("close", 0)) / float(s.get("kalman_price", 1)) - 1
+            ) * 100
+            print(
+                f"     {s['symbol']} {s.get('name',''):<6s} ¥{s.get('close',0):>8.2f}  "
+                f"偏离{deviation:+.1f}%  趋势={s.get('trend','?')}"
+            )
 
     # 仓位空出时自动买入最强信号
     positions_now = len(load_positions())
@@ -663,7 +487,9 @@ def main() -> None:
         remaining_slots = int(stock_pool["max_positions"]) - positions_now
         if remaining_slots > 0:
             skipped_buys.sort(
-                key=lambda x: abs(float(x.get("close", 0)) / float(x.get("kalman_price", 1)) - 1),
+                key=lambda x: abs(
+                    float(x.get("close", 0)) / float(x.get("kalman_price", 1)) - 1
+                ),
                 reverse=True,
             )
             filled = 0
@@ -679,9 +505,16 @@ def main() -> None:
                         cached = pd.read_parquet(cache_path)
                         if len(cached) >= 1:
                             last_close = float(cached["close"].iloc[-1])
-                            limit_up = last_close * 1.20 if sym.startswith("688") or sym.startswith("300") or sym.startswith("301") else last_close * 1.10
+                            limit_up = (
+                                last_close * 1.20
+                                if sym.startswith("688") or sym.startswith("300") or sym.startswith("301")
+                                else last_close * 1.10
+                            )
                             if s["close"] >= limit_up * 0.999:
-                                print(f"  ⚠️ {sym} {s['name']} 涨停(收盘¥{s['close']:.2f}≥涨停¥{limit_up:.2f})，跳过")
+                                print(
+                                    f"  ⚠️ {sym} {s['name']} 涨停"
+                                    f"(收盘¥{s['close']:.2f}≥涨停¥{limit_up:.2f})，跳过"
+                                )
                                 blocked = True
                     except Exception:
                         pass
@@ -693,11 +526,19 @@ def main() -> None:
                 lot = 200 if str(s["symbol"]).startswith("688") else 100
                 buy_qty = int(cash * capped_pct / s["close"] / lot) * lot
                 if buy_qty > 0:
-                    add_pending_order(s["symbol"], s["name"], "buy", buy_qty, s["close"], s["date"], capped_pct)
-                    log_pending(s["symbol"], s["name"], "buy", capped_pct, buy_qty, s.get("reason", ""), s["date"])
-                    print(f"  🟢 自动补仓 {s['symbol']} {s['name']}: {buy_qty}股 "
-                          f"(仓位{positions_before}→{positions_now}, 空出{freed}个, "
-                          f"候选排名 #{filled+1})")
+                    add_pending_order(
+                        s["symbol"], s["name"], "buy", buy_qty,
+                        s["close"], s["date"], capped_pct,
+                    )
+                    log_pending(
+                        s["symbol"], s["name"], "buy", capped_pct,
+                        buy_qty, s.get("reason", ""), s["date"],
+                    )
+                    print(
+                        f"  🟢 自动补仓 {s['symbol']} {s['name']}: {buy_qty}股 "
+                        f"(仓位{positions_before}→{positions_now}, 空出{freed}个, "
+                        f"候选排名 #{filled + 1})"
+                    )
                     filled += 1
 
     # 校验结果
@@ -714,12 +555,19 @@ def main() -> None:
     if not args.no_save:
         save_validation_log(all_validation_issues)
 
-    # 持仓状态表
+    # 持仓状态表 + 实盘报告
     if not args.quiet:
         print_position_summary()
         print_check_result()
     save_snapshot()
-    save_snapshot()
+
+    # 生成实盘交易报告
+    try:
+        from live_report import build_live_report
+        build_live_report()
+    except Exception as e:
+        if not args.quiet:
+            print(f"  ⚠️ 实盘报告生成失败: {e}")
 
 
 def _check_data_freshness(watchlist: list, today: str) -> bool:
@@ -727,7 +575,6 @@ def _check_data_freshness(watchlist: list, today: str) -> bool:
 
     只有当日数据就绪时才认为数据新鲜，才能用当日开盘价执行待处理订单。
     """
-    from data_utils import download_stock_data
     sample = watchlist[:3]
     for stock in sample:
         sym = str(stock["symbol"]).zfill(6)
@@ -766,16 +613,36 @@ def _execute_today_pending(config: Dict[str, Any], today: str = "") -> List[Dict
             except Exception:
                 pass
 
-    pending = execute_pending_orders(today_open, prev_close, today_str=today)
+    # 读取人工实际成交价(优先于 open 假设,提升准确性)
+    from orders import load_actual_fills, save_actual_fills
+    actual_fills = load_actual_fills()
+    actual_prices = {
+        sym: float(fill["exec_price"])
+        for sym, fill in actual_fills.items()
+        if isinstance(fill, dict) and "exec_price" in fill
+    }
+
+    pending = execute_pending_orders(
+        today_open, prev_close, today_str=today, actual_prices=actual_prices or None
+    )
+    # 清理已使用的实际成交价记录
+    if actual_fills:
+        executed_syms = {order["symbol"] for order in pending}
+        remaining_fills = {
+            k: v for k, v in actual_fills.items() if k not in executed_syms
+        }
+        if remaining_fills != actual_fills:
+            save_actual_fills(remaining_fills)
     for order in pending:
         sym = order["symbol"]
         name = order.get("name", sym)
         exec_price = order["exec_price"]
         action = order.get("action", "buy")
         if action == "sell":
-            # 执行卖出：移除持仓，记录交易
+            # 执行卖出：移除持仓，记录交易(扣手续费)
             removed = remove_position(sym)
             if removed:
+                fee_sell = calc_fee(order["shares"], exec_price, "sell")
                 record_trade(
                     symbol=sym, name=name,
                     shares=order["shares"],
@@ -784,15 +651,19 @@ def _execute_today_pending(config: Dict[str, Any], today: str = "") -> List[Dict
                     entry_date=removed.get("first_buy_date", order["signal_date"]),
                     exit_date=today,
                     reason=order.get("signal_reason", ""),
+                    fee=fee_sell,
                 )
             log_executed(sym, order["signal_date"], exec_price, today)
             print(f"  ✅ 卖出 {sym} {name}: {order['shares']}股 @ ¥{exec_price:.2f} "
-                  f"(信号日 {order['signal_date']})")
+                  f"(手续费¥{fee_sell:.2f},信号日 {order['signal_date']})")
         else:
-            add_position(sym, name, order["shares"], exec_price, order["signal_date"])
+            # 执行买入:avg_cost 含手续费(佣金+过户费)
+            fee_buy = calc_fee(order["shares"], exec_price, "buy")
+            avg_cost = (order["shares"] * exec_price + fee_buy) / order["shares"]
+            add_position(sym, name, order["shares"], avg_cost, order["signal_date"])
             log_executed(sym, order["signal_date"], exec_price, today)
             print(f"  ✅ 买入 {sym} {name}: {order['shares']}股 @ ¥{exec_price:.2f} "
-                  f"(信号日 {order['signal_date']} 信号价 ¥{order['signal_price']:.2f})")
+                  f"(成本¥{avg_cost:.3f}含费¥{fee_buy:.2f},信号日 {order['signal_date']})")
         executed.append(order)
 
     from orders import load_pending
@@ -830,7 +701,7 @@ def print_position_summary() -> None:
         max_value = cash * max_pct
 
         print(f"\n{'=' * 80}")
-        print(f"  {'持仓总览 (上限 {max_pct*100:.0f}% = ¥{max_value:,.0f})':^72s}")
+        print(f"  {'持仓总览 (上限 ' + str(int(max_pct*100)) + '% = ¥' + f'{max_value:,.0f})':^72s}")
         print(f"{'=' * 80}")
         print(f"  {'代码':<8s} {'名称':<8s} {'股数':>6s} {'成本':>8s} {'市值':>10s} {'占比':>6s} {'浮动盈亏':>10s} {'收益率':>8s}")
         print(f"  {'-' * 72}")
@@ -857,8 +728,10 @@ def print_position_summary() -> None:
             total_value += value
             total_pnl += pnl
             flag = " ⚠️超标" if value > max_value * 1.01 else ""
-            print(f"  {sym:<8s} {pos['name']:<8s} {pos['shares']:>6d}  "
-                  f"{pos['avg_cost']:>8.2f} {value:>10.0f} {pct:>5.1f}% {pnl:>+10.0f} {pnl_pct:>+7.1f}%{flag}")
+            print(
+                f"  {sym:<8s} {pos['name']:<8s} {pos['shares']:>6d}  "
+                f"{pos['avg_cost']:>8.2f} {value:>10.0f} {pct:>5.1f}% {pnl:>+10.0f} {pnl_pct:>+7.1f}%{flag}"
+            )
 
         print(f"  {'-' * 72}")
         total_pct = total_value / cash * 100 if cash > 0 else 0

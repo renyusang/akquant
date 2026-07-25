@@ -1,0 +1,15 @@
+{
+  "source": "portfolio_backtest.py (legacy)",
+  "period": {
+    "start": "2020-03-20",
+    "end": "2026-07-24",
+    "days": 1539
+  },
+  "initial_cash": 300000.0,
+  "final_equity": 460810.51,
+  "total_return_pct": 53.6035,
+  "sharpe": 0.5129,
+  "max_drawdown_pct": -28.7992,
+  "trade_events": 3134,
+  "final_positions": 10
+}

@@ -7,11 +7,16 @@
 3. 添加技术指标列：MA5、MA20、布林带(20,2)
 """
 
-from typing import Optional
+import os
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
+from akquant.data import ParquetDataCatalog
 from akquant.utils import fetch_akshare_symbol
+
+TASK_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(TASK_DIR, ".cache")
 
 
 def download_stock_data(
@@ -314,3 +319,163 @@ def get_data_summary(df: pd.DataFrame) -> str:
         f"成交量:   {df['volume'].min():.0f} ~ {df['volume'].max():.0f}",
     ]
     return "\n".join(lines)
+
+
+# =============================================================================
+# 回测数据加载(共享 .cache,与实盘 daily_signal 数据同源,保证对账一致)
+# 注:存储沿用 .cache/{symbol}.parquet 扁平格式;ParquetDataCatalog 统一留待
+# 实盘迁移阶段(阶段8),此处优先数据一致性。
+# =============================================================================
+
+# ETF 代码前缀(上海 51/58/56,深圳 15)
+_ETF_PREFIXES = ("51", "15", "58", "56")
+
+
+def is_etf(symbol: str) -> bool:
+    """根据代码前缀判断是否为场内 ETF(51/15/58/56 开头)。"""
+    sym = str(symbol).zfill(6)
+    return sym.startswith(_ETF_PREFIXES)
+
+
+def get_catalog(root: Optional[str] = None) -> ParquetDataCatalog:
+    """获取回测专用 ParquetDataCatalog(默认 task/kalman/.catalog,与实盘 .cache 隔离)。"""
+    return ParquetDataCatalog(root or os.path.join(TASK_DIR, ".catalog"))
+
+
+def load_cached_data(
+    symbol: str,
+    start_date: str = "20200101",
+    end_date: str = "20261231",
+    asset_type: str = "stock",
+    cache_dir: Optional[str] = None,
+) -> pd.DataFrame:
+    """加载单标的数据,优先读回测 catalog(.catalog),缺失则下载全量并缓存。
+
+    返回 preprocess 后的 DataFrame,含 date/open/high/low/close/volume/symbol
+    及 ma5/ma20/bb_* 指标列,date 列为 datetime。
+
+    注:回测用独立 .catalog 目录存全量历史(如 2020 起),与实盘 daily_signal 的
+    .cache(近2年)隔离,互不影响;数据源同为 akshare/sina,与基线同源,对账公平。
+    """
+    catalog = get_catalog(cache_dir)
+    sym = str(symbol).zfill(6)
+    start_dt = pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date)
+
+    df = catalog.read(sym, start_time=start_dt, end_time=end_dt)
+    if df is None or df.empty:
+        # catalog 缺失 → 下载全量并写入
+        full_df = download_data(sym, asset_type=asset_type, start_date=start_date, end_date=end_date)
+        full_df = preprocess_data(full_df)
+        catalog.write(sym, full_df)
+        df = full_df.copy()
+    else:
+        # catalog.read 返回 DatetimeIndex,还原为 date 列格式(与 .cache 一致)
+        df = df.reset_index()
+        if "date" not in df.columns and "index" in df.columns:
+            df = df.rename(columns={"index": "date"})
+        if "symbol" not in df.columns:
+            df["symbol"] = sym
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df[(df["date"] >= start_dt) & (df["date"] <= end_dt)].reset_index(drop=True)
+    return df
+
+
+def load_data_map(
+    symbols: Union[str, List[str]],
+    start_date: str = "20200101",
+    end_date: str = "20261231",
+    asset_types: Optional[Dict[str, str]] = None,
+    cache_dir: Optional[str] = None,
+    quiet: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """批量加载多标的数据,返回 {symbol: DataFrame}。
+
+    供 run_backtest 多标的组合回测使用。数据源与实盘 daily_signal 共享 .cache,
+    保证回测对账与实盘数据一致。
+
+    参数:
+        symbols:      标的代码或代码列表
+        start_date:   起始日期 YYYYMMDD
+        end_date:     结束日期 YYYYMMDD
+        asset_types:  {symbol: "stock"|"etf"} 映射;None 则按代码前缀自动判断
+        cache_dir:    缓存目录(默认 task/kalman/.cache)
+        quiet:        是否静默(不打印进度)
+    返回:
+        Dict[str, pd.DataFrame],每个 df 含 date/open/high/low/close/volume/symbol 列
+    """
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    if asset_types is None:
+        asset_types = {}
+
+    data_map: Dict[str, pd.DataFrame] = {}
+    for i, sym in enumerate(symbols, 1):
+        sym = str(sym).zfill(6)
+        atype = asset_types.get(sym) or ("etf" if is_etf(sym) else "stock")
+        try:
+            df = load_cached_data(sym, start_date, end_date, asset_type=atype, cache_dir=cache_dir)
+            if not df.empty:
+                data_map[sym] = df
+                if not quiet:
+                    print(f"  [{i}/{len(symbols)}] {sym} ({atype}): {len(df)} bars")
+        except Exception as e:
+            if not quiet:
+                print(f"  [{i}/{len(symbols)}] {sym} ({atype}) 加载失败: {e}")
+    return data_map
+
+
+def load_watchlist_data(
+    config: dict,
+    start_date: str = "20200101",
+    end_date: str = "20261231",
+    cache_dir: Optional[str] = None,
+    quiet: bool = True,
+) -> tuple:
+    """从 stocks.yaml 配置加载 watchlist 数据,分股票/ETF 两池返回。
+
+    返回 (stock_map, etf_map, stock_items, etf_items):
+        stock_map/etf_map: {symbol: DataFrame}
+        stock_items/etf_items: watchlist 条目列表 [{symbol, name, ...}]
+    """
+    watchlist = config.get("watchlist", {})
+    if isinstance(watchlist, list):  # 兼容旧扁平格式
+        watchlist = {"stocks": watchlist, "etfs": []}
+    stock_items = watchlist.get("stocks", []) or []
+    etf_items = watchlist.get("etfs", []) or []
+
+    stock_syms = [str(s["symbol"]).zfill(6) for s in stock_items]
+    etf_syms = [str(s["symbol"]).zfill(6) for s in etf_items]
+
+    stock_map = load_data_map(
+        stock_syms, start_date, end_date,
+        asset_types={s: "stock" for s in stock_syms},
+        cache_dir=cache_dir, quiet=quiet,
+    ) if stock_syms else {}
+    etf_map = load_data_map(
+        etf_syms, start_date, end_date,
+        asset_types={s: "etf" for s in etf_syms},
+        cache_dir=cache_dir, quiet=quiet,
+    ) if etf_syms else {}
+
+    return stock_map, etf_map, stock_items, etf_items
+
+
+def fetch_hs300(start_date: str = "20200101", end_date: str = "20261231"):
+    """获取沪深300指数日线收盘价(用于回测/实盘基准对比)。
+
+    返回 pd.Series,index=date,dtype=float。
+    """
+    try:
+        import akshare as ak
+    except ImportError:
+        raise ImportError("akshare 未安装,无法获取沪深300数据")
+
+    df = ak.stock_zh_index_daily(symbol="sh000300")
+    df["date"] = pd.to_datetime(df["date"])
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date)
+    df = df[(df["date"] >= start) & (df["date"] <= end)].sort_values("date")
+    return df.set_index("date")["close"].astype(float)

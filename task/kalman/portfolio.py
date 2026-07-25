@@ -7,10 +7,25 @@ daily_signal.py 通过此模块管理真实持仓状态，替代从 signals.csv 
 
 import json
 import os
+import tempfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+
+
+def _atomic_write_json(path: str, data: Any) -> None:
+    """原子写入 JSON(临时文件 + os.replace,防中断损坏)。"""
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
 
 # ---- 路径 ----
 TASK_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,8 +35,30 @@ TRADES_FILE = os.path.join(TASK_DIR, "trades.csv")
 TRADES_COLUMNS = [
     "entry_date", "exit_date", "symbol", "name",
     "shares", "entry_price", "exit_price",
-    "pnl", "pnl_pct", "reason",
+    "pnl", "pnl_pct", "fee", "reason",
 ]
+
+
+def calc_fee(
+    shares: int,
+    price: float,
+    action: str,
+    commission_rate: float = 0.0003,
+    stamp_tax_rate: float = 0.001,
+    transfer_fee_rate: float = 0.00001,
+    min_commission: float = 5.0,
+) -> float:
+    """计算A股交易手续费(佣金 + 印花税 + 过户费)。
+
+    佣金:max(成交额×费率, 最低佣金),双边收取。
+    印花税:成交额×费率,仅卖出收取。
+    过户费:成交额×费率,双边收取。
+    """
+    amount = abs(shares) * price
+    commission = max(amount * commission_rate, min_commission)
+    stamp_tax = amount * stamp_tax_rate if action == "sell" else 0.0
+    transfer_fee = amount * transfer_fee_rate
+    return commission + stamp_tax + transfer_fee
 
 
 # =============================================================================
@@ -31,20 +68,25 @@ def load_positions() -> Dict[str, Dict[str, Any]]:
     """加载当前持仓。
 
     返回 {symbol: {name, shares, avg_cost, first_buy_date}} 字典。
+    损坏时告警并提示从备份恢复(不静默丢失)。
     """
     if not os.path.exists(POSITIONS_FILE):
         return {}
     try:
         with open(POSITIONS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
+            data = json.load(f)
+        if not isinstance(data, dict):
+            print(f"⚠️ {POSITIONS_FILE} 结构异常(非字典),已忽略。建议从备份恢复: python manage.py rollback")
+            return {}
+        return data
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"⚠️ {POSITIONS_FILE} 读取失败({e})。建议从备份恢复: python manage.py rollback")
         return {}
 
 
 def save_positions(positions: Dict[str, Dict[str, Any]]) -> None:
-    """保存持仓到 JSON 文件。"""
-    with open(POSITIONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(positions, f, ensure_ascii=False, indent=2)
+    """保存持仓到 JSON 文件(原子写入,防中断损坏)。"""
+    _atomic_write_json(POSITIONS_FILE, positions)
 
 
 def add_position(
@@ -115,8 +157,16 @@ def load_trades() -> pd.DataFrame:
 
 
 def save_trades(trades: pd.DataFrame) -> None:
-    """保存交易记录。"""
-    trades.to_csv(TRADES_FILE, index=False, encoding="utf-8")
+    """保存交易记录(原子写入)。"""
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(TRADES_FILE) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            trades.to_csv(f, index=False, encoding="utf-8")
+        os.replace(tmp_path, TRADES_FILE)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def record_trade(
@@ -128,16 +178,18 @@ def record_trade(
     entry_date: str,
     exit_date: Optional[str] = None,
     reason: str = "",
+    fee: float = 0.0,
 ) -> Dict[str, Any]:
     """记录一笔已完成交易。
 
+    :param fee: 出场手续费(佣金+印花税+过户费),从 pnl 扣除。
     返回交易记录字典。
     """
     if exit_date is None:
         exit_date = datetime.now().strftime("%Y-%m-%d")
 
-    pnl = (exit_price - entry_price) * shares
-    pnl_pct = (exit_price / entry_price - 1) * 100 if entry_price > 0 else 0
+    pnl = (exit_price - entry_price) * shares - fee
+    pnl_pct = ((exit_price - fee / shares) / entry_price - 1) * 100 if entry_price > 0 else 0
 
     trade = {
         "entry_date": entry_date,
@@ -149,6 +201,7 @@ def record_trade(
         "exit_price": exit_price,
         "pnl": round(pnl, 2),
         "pnl_pct": round(pnl_pct, 2),
+        "fee": round(fee, 2),
         "reason": reason,
     }
 

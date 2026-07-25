@@ -314,6 +314,11 @@ def parse_args() -> argparse.Namespace:
         help="下跌趋势中买入所需的价格偏离阈值（默认: 0.03 = 3%%。正常为 2%%）",
     )
 
+    parser.add_argument(
+        "--portfolio",
+        action="store_true",
+        help="运行全量组合回测(股票池+ETF池,用 stocks.yaml,替代单标的回测)",
+    )
     return parser.parse_args()
 
 
@@ -366,6 +371,19 @@ def _resolve_strategy_params(args: argparse.Namespace) -> Dict[str, Any]:
 def main() -> None:
     """主流程。"""
     args = parse_args()
+
+    # ---- 组合回测模式(用 AKQuant 引擎,替代 portfolio_backtest.py) ----
+    if args.portfolio:
+        from backtest import run_portfolio_backtest
+
+        run_portfolio_backtest(
+            start_date=args.start,
+            end_date=args.end,
+            show_progress=True,
+            save=True,
+            report=True,
+        )
+        return
 
     # ---- 打印运行配置 ----
     print("\n" + "=" * 60)

@@ -278,6 +278,26 @@ def cmd_add(symbol: str, name: str, shares: int, cost: float, date: str) -> None
     print(f"✅ 已添加 {symbol} {name}: {pos['shares']}股 @ ¥{pos['avg_cost']:.2f}")
 
 
+def cmd_fill(symbol: str, action: str, shares: int, price: float) -> None:
+    """记录人工实际成交价(供 daily_signal 执行时覆盖 open 假设)。
+
+    用法:人工按 pending_orders 实际下单后,用此命令记录实际成交价。
+    daily_signal 下次执行时优先用此价,使 avg_cost/pnl 反映真实成交。
+    """
+    from orders import add_actual_fill, load_actual_fills
+
+    action = action.lower()
+    if action not in ("buy", "sell"):
+        print(f"⚠️ action 必须是 buy 或 sell,收到 {action}")
+        return
+    add_actual_fill(symbol, action, shares, price)
+    fills = load_actual_fills()
+    print(f"✅ 已记录实际成交 {symbol} {action} {shares}股 @ ¥{price:.2f}")
+    print(f"   daily_signal 下次执行时将用此价(而非开盘价假设)")
+    if fills:
+        print(f"   当前待用实际成交记录: {len(fills)} 笔")
+
+
 def cmd_remove(symbol: str) -> None:
     """删除持仓。"""
     removed = remove_position(symbol)
@@ -370,11 +390,27 @@ def main() -> None:
     p_restore = sub.add_parser("restore", help="从交易记录恢复持仓")
     p_restore.add_argument("symbol", help="股票代码")
 
+    p_fill = sub.add_parser("fill", help="记录人工实际成交价(覆盖开盘价假设)")
+    p_fill.add_argument("symbol", help="股票代码")
+    p_fill.add_argument("action", help="buy 或 sell")
+    p_fill.add_argument("shares", type=int, help="股数")
+    p_fill.add_argument("price", type=float, help="实际成交价")
+
     p_backups = sub.add_parser("backups", help="列出所有备份")
     p_rollback = sub.add_parser("rollback", help="回滚到指定备份")
     p_rollback.add_argument("timestamp", nargs="?", default=None, help="备份时间戳 (默认最新)")
 
     args = parser.parse_args()
+
+    # 写操作前自动备份(影响持仓的操作;fill 只写 actual_fills,不备份)
+    if args.command in ("add", "remove", "adjust", "restore"):
+        try:
+            from backup import create_backup
+
+            tag = create_backup()
+            print(f"📦 操作前备份: {tag}")
+        except Exception as e:
+            print(f"⚠️ 操作前备份失败({e}),继续操作")
 
     if args.command == "show":
         cmd_show()
@@ -386,6 +422,8 @@ def main() -> None:
         cmd_adjust(args.symbol, args.shares, args.cost)
     elif args.command == "restore":
         cmd_restore(args.symbol)
+    elif args.command == "fill":
+        cmd_fill(args.symbol, args.action, args.shares, args.price)
     elif args.command == "backups":
         from backup import list_backups
         backups = list_backups()

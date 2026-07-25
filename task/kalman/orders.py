@@ -9,29 +9,84 @@
 
 import json
 import os
-from typing import Any, Dict, List
+import tempfile
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 TASK_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _atomic_write_json(path: str, data: Any) -> None:
+    """原子写入 JSON(临时文件 + os.replace,防中断损坏)。"""
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 PENDING_FILE = os.path.join(TASK_DIR, "pending_orders.json")
 
 
 def load_pending() -> List[Dict[str, Any]]:
-    """加载待执行订单列表。"""
+    """加载待执行订单列表。损坏时告警并提示从备份恢复。"""
     if not os.path.exists(PENDING_FILE):
         return []
     try:
         with open(PENDING_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
+            data = json.load(f)
+        if not isinstance(data, list):
+            print(f"⚠️ {PENDING_FILE} 结构异常(非列表),已忽略。建议从备份恢复: python manage.py rollback")
+            return []
+        return data
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"⚠️ {PENDING_FILE} 读取失败({e})。建议从备份恢复: python manage.py rollback")
         return []
 
 
 def save_pending(orders: List[Dict[str, Any]]) -> None:
-    """保存待执行订单。"""
-    with open(PENDING_FILE, "w", encoding="utf-8") as f:
-        json.dump(orders, f, ensure_ascii=False, indent=2)
+    """保存待执行订单(原子写入)。"""
+    _atomic_write_json(PENDING_FILE, orders)
+
+
+# 人工实际成交价记录(覆盖 open 假设,提升实盘准确性)
+ACTUAL_FILLS_FILE = os.path.join(TASK_DIR, "actual_fills.json")
+
+
+def load_actual_fills() -> Dict[str, Any]:
+    """加载人工实际成交价记录 {symbol: {action, shares, exec_price, date}}。"""
+    if not os.path.exists(ACTUAL_FILLS_FILE):
+        return {}
+    try:
+        with open(ACTUAL_FILLS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, FileNotFoundError):
+        return {}
+
+
+def save_actual_fills(fills: Dict[str, Any]) -> None:
+    """保存人工实际成交价记录(原子写入)。"""
+    _atomic_write_json(ACTUAL_FILLS_FILE, fills)
+
+
+def add_actual_fill(
+    symbol: str, action: str, shares: int, exec_price: float, date: str = ""
+) -> None:
+    """记录一笔人工实际成交(供 manage.py fill 命令使用)。"""
+    if not date:
+        date = pd.Timestamp.now().strftime("%Y-%m-%d")
+    fills = load_actual_fills()
+    fills[str(symbol).zfill(6)] = {
+        "action": action,
+        "shares": int(shares),
+        "exec_price": float(exec_price),
+        "date": date,
+    }
+    save_actual_fills(fills)
 
 
 def add_pending_order(
@@ -86,15 +141,20 @@ def execute_pending_orders(
     price_map: Dict[str, float],
     previous_close_map: Dict[str, float],
     today_str: str = "",
+    actual_prices: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     """执行待处理订单。
 
     仅执行信号日期 < 今日的订单（当天生成的信号等次日执行）。
     涨停时跳过，保留到下次。
+
+    :param actual_prices: 人工实际成交价 {symbol: price}，优先于 open 假设。
+           提供实际价表示人工已成交，跳过涨跌停检查；未提供则用开盘价假设并检查涨跌停。
     """
     if not today_str:
         today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
 
+    actual_prices = actual_prices or {}
     orders = load_pending()
     executed = []
     failed = []
@@ -108,15 +168,18 @@ def execute_pending_orders(
             continue
         sym = order["symbol"]
         open_price = price_map.get(sym)
-        prev_close = previous_close_map.get(sym)
+        actual_price = actual_prices.get(sym)
+        # 优先用人工实际成交价（已成交）；否则用开盘价（假设）
+        exec_price = actual_price if actual_price is not None else open_price
 
-        if open_price is None:
+        if exec_price is None:
             failed.append({**order, "reason": "无开盘价数据"})
             continue
 
-        # 涨跌停检查
+        # 涨跌停检查：仅对未提供实际价的订单（人工实际成交跳过）
         action = order.get("action", "buy")
-        if prev_close and prev_close > 0:
+        prev_close = previous_close_map.get(sym)
+        if actual_price is None and prev_close and prev_close > 0:
             is_kcb = sym.startswith("688") or sym.startswith("300") or sym.startswith("301")
             pct = 0.20 if is_kcb else 0.10
             limit_up = prev_close * (1 + pct)
@@ -131,7 +194,7 @@ def execute_pending_orders(
 
         executed.append({
             **order,
-            "exec_price": open_price,
+            "exec_price": exec_price,
             "exec_date": today_str or pd.Timestamp.now().strftime("%Y-%m-%d"),
         })
 

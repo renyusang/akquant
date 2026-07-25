@@ -2,6 +2,7 @@
 卡尔曼滤波辅助交易策略。
 
 基于 2 状态卡尔曼滤波器（价格 + 速度/趋势）生成买卖信号。
+信号评估逻辑委托给 signal_engine.SignalEngine。
 
 信号逻辑:
     买入:
@@ -17,7 +18,7 @@ from typing import Any, Dict
 
 from akquant import Bar, FloatParam, ParamModel, Strategy
 
-from kalman_filter import KalmanFilter2D
+from signal_engine import SignalEngine
 
 
 class KalmanParams(ParamModel):
@@ -50,6 +51,11 @@ class KalmanParams(ParamModel):
     trend_filter_confirm_bars: int = 3
     trend_bear_position_pct: float = 0.30
     downtrend_entry_threshold: float = 0.03
+    single_position_pct: float = FloatParam(
+        1.0, ge=0.0, le=1.0, title="单只仓位上限比例(组合回测用0.20)"
+    )
+    max_positions: int = 0
+    initial_cash: float = 100000.0
 
 
 class KalmanStrategy(Strategy):
@@ -68,8 +74,9 @@ class KalmanStrategy(Strategy):
 
     PARAM_MODEL = KalmanParams
 
-    # 预热期：给卡尔曼滤波器足够的收敛时间
-    warmup_period = 40
+    # 预热期:run_backtest 读 warmup_bars(非 warmup_period),前 N bar 不调 on_bar
+    warmup_bars = 40
+    warmup_period = 40  # 兼容(部分接口读 warmup_period)
 
     # ---- 可调参数（通过构造函数传入） ----
     kalman_q_price: float
@@ -84,6 +91,9 @@ class KalmanStrategy(Strategy):
     trend_filter_confirm_bars: int
     trend_bear_position_pct: float
     downtrend_entry_threshold: float
+    single_position_pct: float
+    max_positions: int
+    initial_cash: float
 
     def __init__(
         self,
@@ -99,6 +109,9 @@ class KalmanStrategy(Strategy):
         trend_filter_confirm_bars: int = 3,
         trend_bear_position_pct: float = 0.30,
         downtrend_entry_threshold: float = 0.03,
+        single_position_pct: float = 1.0,
+        max_positions: int = 0,
+        initial_cash: float = 100000.0,
     ) -> None:
         """初始化策略。"""
         super().__init__()
@@ -123,15 +136,18 @@ class KalmanStrategy(Strategy):
         self.trend_bear_position_pct = float(trend_bear_position_pct)
         self.downtrend_entry_threshold = float(downtrend_entry_threshold)
 
-        # ---- 状态存储 ----
-        self._kf_instances: Dict[str, KalmanFilter2D] = {}
-        self._prev_velocities: Dict[str, float] = {}
-        self._entry_prices: Dict[str, float] = {}
-        self._trade_count: int = 0
+        # ---- 组合回测仓位/只数控制 ----
+        self.single_position_pct = float(single_position_pct)
+        self.max_positions = int(max_positions)
+        self.initial_cash = float(initial_cash)
 
-        # 趋势过滤状态
-        self._trend_state: str = "up"       # "up" | "down"
-        self._trend_counter: int = 0         # 连续计数（确认用）
+        # ---- SignalEngine 实例（按 symbol 管理） ----
+        self._engines: Dict[str, SignalEngine] = {}
+        self._entry_prices: Dict[str, float] = {}
+        # 延迟下单:T日信号存 pending,T+1 on_bar 检查一字涨跌停后下单(CurrentOpen T+1 撮合)
+        self._pending_buys: Dict[str, tuple] = {}    # {symbol: (signal_close, target_pct)}
+        self._pending_sells: Dict[str, float] = {}   # {symbol: signal_close}
+        self._trade_count: int = 0
 
     # ------------------------------------------------------------------
     # 公开属性（回测后可通过 result.strategy 访问）
@@ -142,70 +158,123 @@ class KalmanStrategy(Strategy):
         return self._trade_count
 
     # ------------------------------------------------------------------
-    # 卡尔曼滤波器管理
+    # SignalEngine 管理
     # ------------------------------------------------------------------
-    def _get_kalman(self, symbol: str) -> KalmanFilter2D:
-        """获取或创建指定标的的卡尔曼滤波器实例。"""
-        if symbol not in self._kf_instances:
-            self._kf_instances[symbol] = KalmanFilter2D(
-                Q_price=self.kalman_q_price,
-                Q_vel=self.kalman_q_vel,
-                R=self.kalman_r,
+    def _get_engine(self, symbol: str) -> SignalEngine:
+        """获取或创建指定标的的 SignalEngine 实例。"""
+        if symbol not in self._engines:
+            self._engines[symbol] = SignalEngine(
+                kalman_q_price=self.kalman_q_price,
+                kalman_q_vel=self.kalman_q_vel,
+                kalman_r=self.kalman_r,
+                entry_threshold=self.entry_threshold,
+                exit_threshold=self.exit_threshold,
+                stop_loss_pct=self.stop_loss_pct,
+                use_price_signal=self.use_price_signal,
+                use_velocity_signal=self.use_velocity_signal,
+                trend_filter_enabled=self.trend_filter_enabled,
+                trend_confirm_bars=self.trend_filter_confirm_bars,
+                trend_bear_pct=self.trend_bear_position_pct,
+                downtrend_entry=self.downtrend_entry_threshold,
             )
-        return self._kf_instances[symbol]
+        return self._engines[symbol]
+
+    # ------------------------------------------------------------------
+    # 涨跌停判断(对齐实盘 orders.py,板块识别)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _limit_pct(symbol: str) -> float:
+        """涨跌幅:科创板/创业板 20%,主板 10%。"""
+        return 0.20 if symbol.startswith(("688", "300", "301")) else 0.10
+
+    def _get_prev_close(self, symbol: str, fallback: float) -> float:
+        """获取前一日收盘价(get_history(2) 的第一个元素)。"""
+        try:
+            hist = self.get_history(2, symbol, "close")
+            if len(hist) >= 2:
+                return float(hist[0])
+        except Exception:
+            pass
+        return fallback
 
     # ------------------------------------------------------------------
     # 核心策略逻辑
+    # 注:AKQuant 0.2.22 强制 fill_policy(open) → bar_offset=1(NextOpen),且 NextOpen
+    # pending 订单在 T+1 on_bar 无法 cancel(get_open_orders 查不到),无法精确拦截
+    # T+1 一字涨跌停。改用 T日 close 涨跌停近似(涨停不买/跌停不卖,避免追涨杀跌)。
     # ------------------------------------------------------------------
     def on_bar(self, bar: Bar) -> None:
         """处理每根 K 线。"""
         symbol: str = bar.symbol
         close_price: float = bar.close
 
-        # 1. 更新卡尔曼滤波器
-        kf = self._get_kalman(symbol)
-        filtered_price, velocity = kf.update(close_price)
+        engine = self._get_engine(symbol)
+        engine.set_position(
+            float(self.get_position(symbol)) > 0,
+            self._entry_prices.get(symbol, 0.0),
+        )
 
-        # 获取上一步速度（首次时为 0）
-        prev_velocity = self._prev_velocities.get(symbol, 0.0)
+        # 计算 MA20
+        ma20_cur, ma20_prev = self._calc_ma20(symbol, close_price)
 
-        # 2. 趋势过滤——决定仓位比例
-        target_pct = 0.95  # 默认满仓
-        if self.trend_filter_enabled:
-            self._update_trend(close_price, bar)
-            if self._trend_state == "down":
-                target_pct = self.trend_bear_position_pct  # 下跌趋势中减仓
+        # 评估信号
+        result = engine.update(close_price, ma20_cur, ma20_prev)
 
-        # 3. 获取当前持仓
+        # 交易执行
         pos = float(self.get_position(symbol))
 
-        # 4. 交易逻辑
+        # T日 close 涨跌停近似保护(涨停不买/跌停不卖)
+        prev_close = self._get_prev_close(symbol, close_price)
+        pct = self._limit_pct(symbol)
+        limit_up = prev_close * (1 + pct) if prev_close > 0 else 0
+        limit_down = prev_close * (1 - pct) if prev_close > 0 else 0
+
         if pos == 0:
-            should_buy = self._evaluate_entry(
-                close_price, filtered_price, velocity, prev_velocity,
-                in_downtrend=(self.trend_filter_enabled and self._trend_state == "down"),
-            )
-            if should_buy:
-                self.order_target_percent(symbol=symbol, target_percent=target_pct)
+            if result["signal"] == "buy":
+                if limit_up and close_price >= limit_up:
+                    self.log(
+                        f"[涨停跳过买入] {bar.timestamp_str} {symbol} "
+                        f"close¥{close_price:.2f}≥涨停¥{limit_up:.2f}"
+                    )
+                    return
+                if self.max_positions > 0:
+                    held = sum(
+                        1
+                        for s, v in self.get_positions().items()
+                        if s != symbol and abs(float(v)) > 0
+                    )
+                    if held >= self.max_positions:
+                        return
+                target_pct = result["target_pct"] * self.single_position_pct
+                # 按 initial_cash 固定金额下单(对齐 portfolio_backtest,无复利效应)
+                self.order_target_value(
+                    symbol=symbol,
+                    target_value=self.initial_cash * target_pct,
+                )
                 self._entry_prices[symbol] = close_price
                 self._trade_count += 1
                 self.log(
                     f"[买入] {bar.timestamp_str} | "
                     f"价格={close_price:.2f} | "
-                    f"卡尔曼估计={filtered_price:.2f} | "
-                    f"速度={velocity:.6f} | "
-                    f"偏离={(close_price / filtered_price - 1) * 100:.2f}%"
-                    + (f" | 仓位={target_pct*100:.0f}% 趋势={self._trend_state}"
-                       if self.trend_filter_enabled else "")
+                    f"卡尔曼估计={result['kalman_price']:.2f} | "
+                    f"速度={result['kalman_velocity']:.6f} | "
+                    f"偏离={(close_price / result['kalman_price'] - 1) * 100:.2f}%"
+                    + (
+                        f" | 仓位={target_pct * 100:.0f}% 趋势={result['trend']}"
+                        if self.trend_filter_enabled
+                        else ""
+                    )
                 )
 
         elif pos > 0:
-            entry_price = self._entry_prices.get(symbol, close_price)
-            should_sell = self._evaluate_exit(
-                close_price, filtered_price, velocity, prev_velocity,
-                entry_price, symbol
-            )
-            if should_sell:
+            if result["signal"] == "sell":
+                if limit_down and close_price <= limit_down:
+                    self.log(
+                        f"[跌停跳过卖出] {bar.timestamp_str} {symbol} "
+                        f"close¥{close_price:.2f}≤跌停¥{limit_down:.2f}"
+                    )
+                    return
+                entry_price = self._entry_prices.get(symbol, close_price)
                 self.close_position(symbol)
                 self._trade_count += 1
                 pnl_pct = (close_price / entry_price - 1) * 100
@@ -214,126 +283,28 @@ class KalmanStrategy(Strategy):
                     f"价格={close_price:.2f} | "
                     f"入场={entry_price:.2f} | "
                     f"收益={pnl_pct:.2f}% | "
-                    f"卡尔曼估计={filtered_price:.2f} | "
-                    f"速度={velocity:.6f}"
+                    f"卡尔曼估计={result['kalman_price']:.2f} | "
+                    f"速度={result['kalman_velocity']:.6f}"
                 )
                 self._entry_prices.pop(symbol, None)
 
-        # 6. 保存速度状态
-        self._prev_velocities[symbol] = velocity
-
     # ------------------------------------------------------------------
-    # 趋势检测
+    # MA20 计算
     # ------------------------------------------------------------------
-    def _update_trend(self, close: float, bar: Bar) -> None:
-        """基于 close vs MA20 + MA20方向 检测趋势。
+    def _calc_ma20(self, symbol: str, fallback: float) -> tuple:
+        """计算当前和前一天的 MA20。
 
-        规则:
-            下跌: close < MA20（连续 N 天确认）
-            上涨: close >= MA20 且 MA20 向上（立即切换）
-            MA20 向下时即使 close >= MA20 也不切换为上涨
+        返回 (ma20_cur, ma20_prev),如果数据不足则返回 (fallback, fallback)。
         """
         try:
-            ma20_vals = self.get_history(21, bar.symbol, "close")
-            if len(ma20_vals) < 21:
-                return
-            ma20_cur = float(ma20_vals[-20:].mean())
-            ma20_prev = float(ma20_vals[:20].mean())
+            ma20_vals = self.get_history(21, symbol, "close")
+            if len(ma20_vals) >= 21:
+                ma20_cur = float(ma20_vals[-20:].mean())
+                ma20_prev = float(ma20_vals[:20].mean())
+                return ma20_cur, ma20_prev
         except Exception:
-            return
-
-        is_bearish = close < ma20_cur
-        ma20_rising = ma20_cur > ma20_prev
-        confirm = self.trend_filter_confirm_bars
-
-        if is_bearish:
-            # 下跌信号：累计确认
-            self._trend_counter += 1
-            if self._trend_counter >= confirm and self._trend_state == "up":
-                self._trend_state = "down"
-                self.log(
-                    f"[趋势转跌] {bar.timestamp_str} | "
-                    f"收盘={close:.2f} | MA20={ma20_cur:.2f}"
-                    + (f"↓" if not ma20_rising else "") +
-                    f" | 连续{confirm}天确认"
-                )
-        else:
-            # 上涨信号
-            if ma20_rising:
-                # MA20 向上 + close >= MA20 → 确认上涨，立即切换
-                self._trend_counter = 0
-                if self._trend_state == "down":
-                    self._trend_state = "up"
-                    self.log(
-                        f"[趋势转涨] {bar.timestamp_str} | "
-                        f"收盘={close:.2f} | MA20={ma20_cur:.2f}↑ | "
-                        f"立即恢复"
-                    )
-            else:
-                # close >= MA20 但 MA20 仍向下 → 维持下跌状态
-                self._trend_counter = max(self._trend_counter, confirm)
-
-    # ------------------------------------------------------------------
-    # 信号评估
-    # ------------------------------------------------------------------
-    def _evaluate_entry(
-        self,
-        close: float,
-        filtered: float,
-        velocity: float,
-        prev_velocity: float,
-        in_downtrend: bool = False,
-    ) -> bool:
-        """评估买入信号。
-
-        上涨趋势: 使用正常 entry_threshold
-        下跌趋势: 使用更严格的 downtrend_entry_threshold。
-                  只有价格大幅偏离卡尔曼估计时才买入（预示反转），
-                  避免在下跌趋势中被普通反弹骗进去。
-        """
-        threshold = (
-            self.downtrend_entry_threshold if in_downtrend
-            else self.entry_threshold
-        )
-
-        if self.use_price_signal:
-            if close > filtered * (1.0 + threshold):
-                return True
-
-        if self.use_velocity_signal:
-            if velocity > 0.0 and prev_velocity <= 0.0:
-                return True
-
-        return False
-
-    def _evaluate_exit(
-        self,
-        close: float,
-        filtered: float,
-        velocity: float,
-        prev_velocity: float,
-        entry_price: float,
-        symbol: str,
-    ) -> bool:
-        """评估卖出信号。"""
-        # 止损
-        if entry_price > 0:
-            pnl_pct = close / entry_price - 1.0
-            if pnl_pct < -self.stop_loss_pct:
-                self.log(f"[止损] {symbol} 亏损={pnl_pct * 100:.2f}%")
-                return True
-
-        # 价格回归信号
-        if self.use_price_signal:
-            if close < filtered * (1.0 - self.exit_threshold):
-                return True
-
-        # 速度反转信号
-        if self.use_velocity_signal:
-            if velocity < 0.0 and prev_velocity >= 0.0:
-                return True
-
-        return False
+            pass
+        return fallback, fallback
 
 
 # ----------------------------------------------------------------------

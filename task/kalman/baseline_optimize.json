@@ -1,0 +1,15 @@
+{
+  "source": "optimize.py (legacy)",
+  "symbol": "002594",
+  "n_combinations": 403,
+  "best_sharpe": 1.823417222608883,
+  "best_total_return_pct": 11.8892776,
+  "best_params": {
+    "kalman_q_price": 0.001,
+    "kalman_q_vel": 1e-06,
+    "kalman_r": 0.01,
+    "entry_threshold": 0.03,
+    "exit_threshold": 0.005,
+    "stop_loss_pct": 0.03
+  }
+}

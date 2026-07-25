@@ -4,11 +4,14 @@
 封装 akquant.run_backtest 的参数配置，运行卡尔曼策略回测并输出指标。
 """
 
+import os
 from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
+import yaml
 from akquant import BacktestResult, run_backtest
+from akquant.backtest.engine import make_fill_policy
 
 from strategy import KalmanStrategy
 
@@ -19,6 +22,7 @@ def run_kalman_backtest(
     initial_cash: float = 100000.0,
     commission_rate: float = 0.0003,
     stamp_tax_rate: float = 0.001,
+    transfer_fee_rate: float = 0.00001,
     min_commission: float = 5.0,
     lot_size: int = 100,
     start_time: Optional[str] = None,
@@ -50,14 +54,20 @@ def run_kalman_backtest(
     # 打印策略参数
     _print_strategy_params(strategy_params)
 
-    # 创建策略实例（显式传参）
-    strategy = KalmanStrategy(**strategy_params) if strategy_params else KalmanStrategy()
+    # 创建策略实例（显式传参,传入 initial_cash 供 order_target_value 使用）
+    params = dict(strategy_params) if strategy_params else {}
+    params.setdefault("initial_cash", initial_cash)
+    strategy = KalmanStrategy(**params)
 
     # 数据准备：确保 date 列和 symbol 列存在
     backtest_df = df.copy()
     if "date" in backtest_df.columns:
         backtest_df["date"] = pd.to_datetime(backtest_df["date"])
 
+    # NextOpen:T日 on_bar 下单 → T+1 开盘价撮合(与实盘次日开盘成交一致)
+    fill_policy = make_fill_policy(
+        price_basis="open", temporal="next_event", bar_offset=1
+    )
     # 运行回测
     result: BacktestResult = run_backtest(
         data=backtest_df,
@@ -66,8 +76,11 @@ def run_kalman_backtest(
         initial_cash=initial_cash,
         commission_rate=commission_rate,
         stamp_tax_rate=stamp_tax_rate,
+        transfer_fee_rate=transfer_fee_rate,
         min_commission=min_commission,
         lot_size=lot_size,
+        t_plus_one=True,
+        fill_policy=fill_policy,
         start_time=start_time,
         end_time=end_time,
         show_progress=show_progress,
@@ -390,3 +403,413 @@ def run_walk_forward(
         avg_return = np.mean([w["total_return_pct"] for w in window_results])
         avg_sharpe = np.mean([w["sharpe"] for w in window_results])
         print(f"  平均收益: {avg_return:.2f}% | 平均夏普: {avg_sharpe:.2f}")
+
+
+# =============================================================================
+# 组合回测(替代 portfolio_backtest.py,用 AKQuant 引擎)
+# =============================================================================
+
+# stocks.yaml 参数名 → KalmanStrategy 构造参数名映射
+_PARAM_MAP = {
+    "trend_confirm_bars": "trend_filter_confirm_bars",
+    "trend_bear_pct": "trend_bear_position_pct",
+    "downtrend_entry": "downtrend_entry_threshold",
+}
+
+
+def _map_strategy_params(yaml_params: Dict[str, Any]) -> Dict[str, Any]:
+    """将 stocks.yaml 的策略参数名映射到 KalmanStrategy 构造参数名。"""
+    return {_PARAM_MAP.get(k, k): v for k, v in yaml_params.items()}
+
+
+def _lot_size_map(symbols: list) -> Dict[str, int]:
+    """按标的生成 lot_size(科创板688→200,其余100)。"""
+    return {s: (200 if str(s).startswith("688") else 100) for s in symbols}
+
+
+def _run_pool(
+    data_map: Dict[str, pd.DataFrame],
+    symbols: list,
+    initial_cash: float,
+    strategy_params: Dict[str, Any],
+    show_progress: bool = False,
+) -> Optional[BacktestResult]:
+    """单池回测:T+1 开盘价执行,手续费置零(对齐旧基线)。"""
+    if not data_map or not symbols:
+        return None
+    # NextOpen:T日 on_bar 下单 → T+1 开盘价撮合(与实盘次日开盘成交一致)
+    fill_policy = make_fill_policy(
+        price_basis="open", temporal="next_event", bar_offset=1
+    )
+    strategy = KalmanStrategy(**strategy_params)
+    return run_backtest(
+        data=data_map,
+        strategy=strategy,
+        symbols=symbols,
+        initial_cash=initial_cash,
+        t_plus_one=True,
+        fill_policy=fill_policy,
+        lot_size=_lot_size_map(symbols),
+        commission_rate=0.0003,      # 佣金万3(双边,最低5元)
+        stamp_tax_rate=0.001,        # 印花税千1(仅卖出)
+        transfer_fee_rate=0.00001,   # 过户费万0.1(双边)
+        min_commission=5.0,          # 最低佣金5元
+        show_progress=show_progress,
+    )
+
+
+def _combine_equity(
+    stock_result: Optional[BacktestResult],
+    etf_result: Optional[BacktestResult],
+    stock_cash: float,
+    etf_cash: float,
+) -> pd.Series:
+    """合并两池权益曲线(逐日相加,起始前用各池初始资金填充)。"""
+    parts = {}
+    if stock_result is not None:
+        parts["stock"] = stock_result.equity_curve.copy()
+    if etf_result is not None:
+        parts["etf"] = etf_result.equity_curve.copy()
+    df = pd.DataFrame(parts)
+    if "stock" in df.columns:
+        df["stock"] = df["stock"].ffill().fillna(stock_cash)
+    if "etf" in df.columns:
+        df["etf"] = df["etf"].ffill().fillna(etf_cash)
+    combined = df.sum(axis=1)
+    combined.name = "equity"
+    return combined
+
+
+def build_combined_report(
+    combined_equity: pd.Series,
+    combined_trades: pd.DataFrame,
+    metrics: Dict[str, Any],
+    stock_cash: float,
+    etf_cash: float,
+    filename: str,
+    benchmark: Optional[pd.Series] = None,
+) -> None:
+    """生成组合汇总 HTML 报告(股票池+ETF池 合并权益/指标/交易)。
+
+    两池各自有 result.report(report_stock.html/report_etf.html,含K线复盘);
+    本报告汇总两池合并的组合权益曲线、回撤、月度/年度收益、指标、交易明细。
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    eq = combined_equity.copy()
+    eq.index = pd.to_datetime(eq.index)
+    if getattr(eq.index, "tz", None) is not None:
+        eq.index = eq.index.tz_convert("Asia/Shanghai")
+
+    # 回撤
+    dd = (eq - eq.cummax()) / eq.cummax() * 100
+
+    # 年度收益
+    yearly_ret = eq.resample("YE").last().pct_change() * 100
+
+    # 月度收益(热力图)
+    monthly_ret = eq.resample("ME").last().pct_change() * 100
+
+    # ---- 主图:权益 + 回撤 + 年度收益 ----
+    fig = make_subplots(
+        rows=3, cols=1,
+        subplot_titles=("组合权益曲线(股票池+ETF池)", "回撤(%)", "年度收益(%)"),
+        row_heights=[0.5, 0.25, 0.25], vertical_spacing=0.10,
+    )
+    fig.add_trace(
+        go.Scatter(x=eq.index, y=eq.values, name="权益",
+                   line=dict(color="#2c7fb8", width=1.5)),
+        row=1, col=1,
+    )
+    # 沪深300基准(归一化到初始权益,便于对比)
+    if benchmark is not None:
+        # 统一 index(eq 可能 tz-aware,benchmark naive)
+        eq_naive = eq.index.tz_localize(None) if hasattr(eq.index, "tz") and eq.index.tz else eq.index
+        bench_naive = (
+            benchmark.index.tz_localize(None)
+            if hasattr(benchmark.index, "tz") and benchmark.index.tz
+            else benchmark.index
+        )
+        bench = pd.Series(benchmark.values, index=bench_naive).reindex(eq_naive).ffill()
+        if len(bench.dropna()) > 0:
+            bench_norm = bench / bench.iloc[0] * eq.iloc[0]
+            fig.add_trace(
+                go.Scatter(x=eq_naive, y=bench_norm.values, name="沪深300",
+                           line=dict(color="#ff7f0e", dash="dash", width=1.2)),
+                row=1, col=1,
+            )
+    fig.add_trace(
+        go.Scatter(x=dd.index, y=dd.values, name="回撤", fill="tozeroy",
+                   line=dict(color="#d62728", width=1)),
+        row=2, col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=[d.year for d in yearly_ret.index],
+            y=yearly_ret.values, name="年度收益",
+            marker_color=["#2ca02c" if v >= 0 else "#d62728" for v in yearly_ret.values],
+        ),
+        row=3, col=1,
+    )
+    fig.update_layout(
+        title=(f"组合汇总报告 | 总收益 {metrics['total_return_pct']:+.1f}% | "
+               f"Sharpe {metrics['sharpe']:.2f} | 最大回撤 {metrics['max_drawdown_pct']:.1f}%"),
+        height=900, showlegend=False, template="plotly_white",
+    )
+    fig.update_yaxes(title_text="权益(¥)", row=1, col=1)
+    fig.update_yaxes(title_text="回撤(%)", row=2, col=1)
+    fig.update_yaxes(title_text="收益(%)", row=3, col=1)
+
+    # ---- 月度热力图 ----
+    heat_html = ""
+    if len(monthly_ret) > 0:
+        mdf = monthly_ret.to_frame("ret")
+        mdf["year"] = mdf.index.year
+        mdf["month"] = mdf.index.month
+        pivot = mdf.pivot_table(index="year", columns="month", values="ret")
+        heat = go.Figure(data=go.Heatmap(
+            z=pivot.values,
+            x=[f"{m}月" for m in pivot.columns],
+            y=[str(y) for y in pivot.index],
+            colorscale="RdYlGn", zmid=0,
+            text=[[f"{v:.1f}%" if pd.notna(v) else "" for v in row] for row in pivot.values],
+            texttemplate="%{text}", hovertemplate="%{y}年 %{x}: %{z:.1f}%<extra></extra>",
+        ))
+        heat.update_layout(title="月度收益热力图(%)", height=400, template="plotly_white")
+        heat_html = heat.to_html(full_html=False, include_plotlyjs=False)
+
+    # ---- 指标表 ----
+    m = metrics
+    metrics_html = f"""
+    <table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse;font-size:14px;margin:10px 0'>
+      <tr><th>指标</th><th>值</th></tr>
+      <tr><td>回测区间</td><td>{m['period_start']} ~ {m['period_end']} ({m['days']}天)</td></tr>
+      <tr><td>初始资金</td><td>¥{m['initial_cash']:,.0f} (股票池¥{stock_cash:,.0f} + ETF池¥{etf_cash:,.0f})</td></tr>
+      <tr><td>最终权益</td><td>¥{m['final_equity']:,.0f}</td></tr>
+      <tr><td>总收益率</td><td>{m['total_return_pct']:+.1f}%</td></tr>
+      <tr><td>夏普比率</td><td>{m['sharpe']:.2f}</td></tr>
+      <tr><td>最大回撤</td><td>{m['max_drawdown_pct']:.1f}%</td></tr>
+      <tr><td>总交易数</td><td>{m['trade_count']}</td></tr>
+    </table>"""
+
+    # ---- 交易明细(前20笔)----
+    trades_html = "<h3>交易明细(前20笔)</h3>"
+    if not combined_trades.empty:
+        show_cols = [c for c in [
+            "entry_time", "exit_time", "symbol", "side",
+            "entry_price", "exit_price", "quantity", "pnl", "pool",
+        ] if c in combined_trades.columns]
+        tdisp = combined_trades[show_cols].head(20).copy()
+        for c in tdisp.select_dtypes(include=["float"]).columns:
+            tdisp[c] = tdisp[c].round(2)
+        trades_html += tdisp.to_html(index=False, border=1)
+
+    full = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>卡尔曼组合汇总报告</title>
+<script src='https://cdn.plot.ly/plotly-2.35.2.min.js'></script>
+<style>body{{font-family:sans-serif;margin:20px;}} h1{{color:#2c3e50;}} table{{font-size:13px;}}</style>
+</head><body>
+<h1>卡尔曼组合汇总报告</h1>
+{metrics_html}
+{fig.to_html(full_html=False, include_plotlyjs=False)}
+{heat_html}
+{trades_html}
+</body></html>"""
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(full)
+
+
+def run_portfolio_backtest(
+    config_path: Optional[str] = None,
+    start_date: str = "20200101",
+    end_date: str = "20261231",
+    show_progress: bool = False,
+    save: bool = True,
+    report: bool = True,
+) -> Dict[str, Any]:
+    """全量投资组合回测:股票池+ETF池各跑一次 run_backtest,合并结果。
+
+    替代旧 portfolio_backtest.py。用 AKQuant 引擎,T+1 开盘价执行,
+    分池资金管理(股票20万/ETF10万),手续费置零对齐旧基线。
+
+    返回 dict: stock_result, etf_result, combined_equity, combined_trades, metrics。
+    """
+    from data_utils import load_watchlist_data
+
+    task_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = config_path or os.path.join(task_dir, "stocks.yaml")
+    with open(config_path, encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    stock_map, etf_map, _stock_items, _etf_items = load_watchlist_data(
+        config, start_date, end_date, quiet=not show_progress
+    )
+    stock_syms = list(stock_map.keys())
+    etf_syms = list(etf_map.keys())
+
+    base_params = _map_strategy_params(config.get("strategy", {}))
+    stock_pool = config.get("stock", {})
+    etf_pool = config.get("etf", {})
+    stock_cash = float(stock_pool.get("initial_cash", 200000))
+    etf_cash = float(etf_pool.get("initial_cash", 100000))
+    stock_max = int(stock_pool.get("max_positions", 5))
+    etf_max = int(etf_pool.get("max_positions", 5))
+    stock_pct = float(stock_pool.get("single_position_pct", 0.20))
+    etf_pct = float(etf_pool.get("single_position_pct", 0.20))
+    total_cash = stock_cash + etf_cash
+
+    print(
+        f"\n组合回测 {start_date}~{end_date}: "
+        f"股票 {len(stock_syms)} 只(¥{stock_cash:,.0f}) + "
+        f"ETF {len(etf_syms)} 只(¥{etf_cash:,.0f})"
+    )
+
+    stock_result = (
+        _run_pool(
+            stock_map, stock_syms, stock_cash,
+            {**base_params, "single_position_pct": stock_pct, "max_positions": stock_max, "initial_cash": stock_cash},
+            show_progress,
+        )
+        if stock_syms
+        else None
+    )
+    etf_result = (
+        _run_pool(
+            etf_map, etf_syms, etf_cash,
+            {**base_params, "single_position_pct": etf_pct, "max_positions": etf_max, "initial_cash": etf_cash},
+            show_progress,
+        )
+        if etf_syms
+        else None
+    )
+
+    combined = _combine_equity(stock_result, etf_result, stock_cash, etf_cash)
+
+    # 合并 trades
+    trades_parts = []
+    if stock_result is not None:
+        t = stock_result.trades_df.copy()
+        t["pool"] = "stock"
+        trades_parts.append(t)
+    if etf_result is not None:
+        t = etf_result.trades_df.copy()
+        t["pool"] = "etf"
+        trades_parts.append(t)
+    combined_trades = (
+        pd.concat(trades_parts, ignore_index=True) if trades_parts else pd.DataFrame()
+    )
+
+    # 组合指标(口径与旧 portfolio_backtest 一致)
+    final_equity = float(combined.iloc[-1])
+    total_return = (final_equity / total_cash - 1) * 100
+    dr = combined.pct_change().dropna()
+    sharpe = (
+        float(dr.mean() / dr.std() * np.sqrt(252))
+        if len(dr) > 1 and dr.std() > 0
+        else 0.0
+    )
+    max_dd = float(((combined - combined.cummax()) / combined.cummax()).min() * 100)
+
+    print(f"\n{'='*60}")
+    print(f"  组合回测结果(AKQuant 引擎)")
+    print(f"{'='*60}")
+    print(f"  回测区间: {combined.index[0]} ~ {combined.index[-1]} ({len(combined)} 天)")
+    print(f"  初始资金: ¥{total_cash:,.0f}")
+    print(f"  最终权益: ¥{final_equity:,.0f}")
+    print(f"  总收益率: {total_return:+.1f}%")
+    print(f"  夏普比率: {sharpe:.2f}")
+    print(f"  最大回撤: {max_dd:.1f}%")
+    print(f"  总交易数: {len(combined_trades)}")
+
+    result = {
+        "stock_result": stock_result,
+        "etf_result": etf_result,
+        "combined_equity": combined,
+        "combined_trades": combined_trades,
+        "metrics": {
+            "total_return_pct": total_return,
+            "sharpe": sharpe,
+            "max_drawdown_pct": max_dd,
+            "final_equity": final_equity,
+            "initial_cash": total_cash,
+            "trade_count": len(combined_trades),
+            "period_start": str(combined.index[0]),
+            "period_end": str(combined.index[-1]),
+            "days": int(len(combined)),
+        },
+    }
+
+    if save:
+        idx = pd.to_datetime(combined.index)
+        if hasattr(idx, "tz") and idx.tz is not None:
+            idx = idx.tz_convert("Asia/Shanghai")
+        eq_df = pd.DataFrame(
+            {"date": idx.strftime("%Y-%m-%d"), "equity": combined.values}
+        )
+        eq_df.to_csv(
+            os.path.join(task_dir, "portfolio_equity.csv"),
+            index=False, encoding="utf-8-sig",
+        )
+        combined_trades.to_csv(
+            os.path.join(task_dir, "portfolio_trades.csv"),
+            index=False, encoding="utf-8-sig",
+        )
+        print(f"  已保存 portfolio_equity.csv / portfolio_trades.csv")
+
+    if report:
+        try:
+            # 沪深300基准(收益序列给 result.report,价格序列给 build_combined_report)
+            hs300_price = None
+            hs300_returns = None
+            try:
+                from data_utils import fetch_hs300
+
+                hs300_price = fetch_hs300(start_date, end_date)
+                hs300_returns = hs300_price.pct_change().dropna()
+                hs300_returns.name = "沪深300"
+                # result.to_quantstats() returns 为 naive datetime(00:00:00),保持 naive 对齐
+            except Exception as e:
+                print(f"  ⚠️ 沪深300数据获取失败({e}),报告无基准对比")
+
+            # BacktestResult.report(含K线买卖点复盘、拒单原因、完整指标、沪深300基准)
+            if stock_result is not None:
+                stock_plot = (
+                    "002594" if "002594" in stock_map
+                    else (stock_syms[0] if stock_syms else None)
+                )
+                stock_result.report(
+                    title=f"卡尔曼组合回测 - 股票池({len(stock_syms)}只)",
+                    filename=os.path.join(task_dir, "report_stock.html"),
+                    market_data=stock_map,
+                    plot_symbol=stock_plot,
+                    include_trade_kline=True,
+                    benchmark=hs300_returns,
+                    show=False,
+                )
+            if etf_result is not None:
+                etf_plot = (
+                    "510050" if "510050" in etf_map
+                    else (etf_syms[0] if etf_syms else None)
+                )
+                etf_result.report(
+                    title=f"卡尔曼组合回测 - ETF池({len(etf_syms)}只)",
+                    filename=os.path.join(task_dir, "report_etf.html"),
+                    market_data=etf_map,
+                    plot_symbol=etf_plot,
+                    include_trade_kline=True,
+                    benchmark=hs300_returns,
+                    show=False,
+                )
+            # 组合汇总报告(股票池+ETF池合并权益/指标/交易,含沪深300基准)
+            build_combined_report(
+                combined, combined_trades, result["metrics"],
+                stock_cash, etf_cash,
+                os.path.join(task_dir, "report_portfolio.html"),
+                benchmark=hs300_price,
+            )
+            print(f"  已生成 report_stock.html / report_etf.html(含K线复盘+沪深300) + report_portfolio.html(组合汇总)")
+        except Exception as e:
+            print(f"  ⚠️ 报告生成失败: {e}")
+
+    return result

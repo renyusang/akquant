@@ -6,12 +6,19 @@ kline_*.html
 kline_*.png
 report_*.html
 trades_*.csv
+portfolio_*.csv
+portfolio_*.html
+live_report.html
+
+# plotly.js 离线副本（从 python plotly 包复制）
+plotly.min.js
 
 # Python 缓存
 __pycache__/
 *.pyc
 signals.csv
 .cache/
+.catalog/
 logs/
 signals.csv
 grid_search_*.csv
