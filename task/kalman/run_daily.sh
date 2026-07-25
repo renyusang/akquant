@@ -13,7 +13,7 @@ set -euo pipefail
 
 # ---- 路径配置 ----
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONDA_ENV="akquant_test"
+CONDA_ENV="akquant_032"
 LOG_DIR="${SCRIPT_DIR}/logs"
 LOG_FILE="${LOG_DIR}/daily_$(date +%Y%m%d).log"
 MAX_LOG_DAYS=30
