@@ -12,6 +12,7 @@ import pandas as pd
 import yaml
 from akquant import BacktestResult, run_backtest
 from akquant.backtest.engine import make_fill_policy
+from akquant.plot import plot_report
 
 from strategy import KalmanStrategy
 
@@ -778,7 +779,8 @@ def run_portfolio_backtest(
                     "002594" if "002594" in stock_map
                     else (stock_syms[0] if stock_syms else None)
                 )
-                stock_result.report(
+                plot_report(
+                    stock_result,
                     title=f"卡尔曼组合回测 - 股票池({len(stock_syms)}只)",
                     filename=os.path.join(task_dir, "report_stock.html"),
                     market_data=stock_map,
@@ -792,7 +794,8 @@ def run_portfolio_backtest(
                     "510050" if "510050" in etf_map
                     else (etf_syms[0] if etf_syms else None)
                 )
-                etf_result.report(
+                plot_report(
+                    etf_result,
                     title=f"卡尔曼组合回测 - ETF池({len(etf_syms)}只)",
                     filename=os.path.join(task_dir, "report_etf.html"),
                     market_data=etf_map,

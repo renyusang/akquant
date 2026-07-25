@@ -458,7 +458,9 @@ def main() -> None:
             # 生成 HTML 报告
             report_file = args.save_report or f"report_{args.symbol}.html"
             try:
-                result.report(
+                from akquant.plot import plot_report
+                plot_report(
+                    result,
                     title=f"卡尔曼滤波策略 - {args.symbol}",
                     filename=report_file,
                     show=args.save_report is None,

@@ -16,46 +16,9 @@
 
 from typing import Any, Dict
 
-from akquant import Bar, FloatParam, ParamModel, Strategy
+from akquant import Bar, BoolParam, FloatParam, IntParam, Strategy
 
 from signal_engine import SignalEngine
-
-
-class KalmanParams(ParamModel):
-    """卡尔曼策略参数模型。
-
-    用于 run_grid_search 参数校验和策略实例化。
-    """
-
-    kalman_q_price: float = FloatParam(
-        1e-4, ge=1e-6, le=1.0, title="价格过程噪声"
-    )
-    kalman_q_vel: float = FloatParam(
-        1e-5, ge=1e-7, le=1.0, title="速度过程噪声"
-    )
-    kalman_r: float = FloatParam(
-        1e-2, ge=1e-5, le=1.0, title="观测噪声"
-    )
-    entry_threshold: float = FloatParam(
-        0.02, ge=0.001, le=0.20, title="买入价格偏离阈值"
-    )
-    exit_threshold: float = FloatParam(
-        0.005, ge=0.0, le=0.10, title="卖出价格偏离阈值"
-    )
-    stop_loss_pct: float = FloatParam(
-        0.05, ge=0.01, le=0.30, title="止损比例"
-    )
-    use_price_signal: bool = True
-    use_velocity_signal: bool = True
-    trend_filter_enabled: bool = False
-    trend_filter_confirm_bars: int = 3
-    trend_bear_position_pct: float = 0.30
-    downtrend_entry_threshold: float = 0.03
-    single_position_pct: float = FloatParam(
-        1.0, ge=0.0, le=1.0, title="单只仓位上限比例(组合回测用0.20)"
-    )
-    max_positions: int = 0
-    initial_cash: float = 100000.0
 
 
 class KalmanStrategy(Strategy):
@@ -72,74 +35,58 @@ class KalmanStrategy(Strategy):
         use_velocity_signal: 是否使用速度反转信号 (默认 True)
     """
 
-    PARAM_MODEL = KalmanParams
-
     # 预热期:run_backtest 读 warmup_bars(非 warmup_period),前 N bar 不调 on_bar
     warmup_bars = 40
     warmup_period = 40  # 兼容(部分接口读 warmup_period)
 
-    # ---- 可调参数（通过构造函数传入） ----
-    kalman_q_price: float
-    kalman_q_vel: float
-    kalman_r: float
-    entry_threshold: float
-    exit_threshold: float
-    stop_loss_pct: float
-    use_price_signal: bool
-    use_velocity_signal: bool
-    trend_filter_enabled: bool
-    trend_filter_confirm_bars: int
-    trend_bear_position_pct: float
-    downtrend_entry_threshold: float
-    single_position_pct: float
-    max_positions: int
-    initial_cash: float
+    # === 内联参数声明(0.3.20:替代 PARAM_MODEL + __init__ 参数) ===
+    kalman_q_price = FloatParam(1e-4, ge=1e-6, le=1.0, title="价格过程噪声")
+    kalman_q_vel = FloatParam(1e-5, ge=1e-7, le=1.0, title="速度过程噪声")
+    kalman_r = FloatParam(1e-2, ge=1e-5, le=1.0, title="观测噪声")
+    entry_threshold = FloatParam(0.02, ge=0.001, le=0.20, title="买入价格偏离阈值")
+    exit_threshold = FloatParam(0.005, ge=0.0, le=0.10, title="卖出价格偏离阈值")
+    stop_loss_pct = FloatParam(0.05, ge=0.01, le=0.30, title="止损比例")
+    use_price_signal = BoolParam(True, title="是否使用价格偏离信号")
+    use_velocity_signal = BoolParam(True, title="是否使用速度反转信号")
+    trend_filter_enabled = BoolParam(False, title="是否启用趋势过滤")
+    trend_filter_confirm_bars = IntParam(3, ge=1, le=20, title="趋势确认天数")
+    trend_bear_position_pct = FloatParam(
+        0.30, ge=0.0, le=1.0, title="下跌仓位比例"
+    )
+    downtrend_entry_threshold = FloatParam(
+        0.03, ge=0.0, le=0.20, title="下跌买入阈值"
+    )
+    single_position_pct = FloatParam(
+        1.0, ge=0.0, le=1.0, title="单只仓位上限比例(组合回测用0.20)"
+    )
+    max_positions = IntParam(0, ge=0, le=100, title="池内最多持仓数(0=不限)")
+    initial_cash = FloatParam(100000.0, ge=0, title="初始资金")
 
-    def __init__(
-        self,
-        kalman_q_price: float = 1e-4,
-        kalman_q_vel: float = 1e-5,
-        kalman_r: float = 1e-2,
-        entry_threshold: float = 0.02,
-        exit_threshold: float = 0.005,
-        stop_loss_pct: float = 0.05,
-        use_price_signal: bool = True,
-        use_velocity_signal: bool = True,
-        trend_filter_enabled: bool = False,
-        trend_filter_confirm_bars: int = 3,
-        trend_bear_position_pct: float = 0.30,
-        downtrend_entry_threshold: float = 0.03,
-        single_position_pct: float = 1.0,
-        max_positions: int = 0,
-        initial_cash: float = 100000.0,
-    ) -> None:
-        """初始化策略。"""
+    # 0.3.20 引擎要求的方法(Python 基类缺失,需子类提供空实现)
+    def _flush_pending_order_events(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    def __init__(self, **kwargs: Any) -> None:
+        """初始化策略(参数由内联字段自动注入,kwargs 接收覆盖值)。"""
         super().__init__()
 
-        # ---- 卡尔曼滤波器参数 ----
-        self.kalman_q_price = float(kalman_q_price)
-        self.kalman_q_vel = float(kalman_q_vel)
-        self.kalman_r = float(kalman_r)
-
-        # ---- 信号阈值 ----
-        self.entry_threshold = float(entry_threshold)
-        self.exit_threshold = float(exit_threshold)
-        self.stop_loss_pct = float(stop_loss_pct)
-
-        # ---- 信号开关 ----
-        self.use_price_signal = bool(use_price_signal)
-        self.use_velocity_signal = bool(use_velocity_signal)
-
-        # ---- 趋势过滤 ----
-        self.trend_filter_enabled = bool(trend_filter_enabled)
-        self.trend_filter_confirm_bars = max(1, int(trend_filter_confirm_bars))
-        self.trend_bear_position_pct = float(trend_bear_position_pct)
-        self.downtrend_entry_threshold = float(downtrend_entry_threshold)
-
-        # ---- 组合回测仓位/只数控制 ----
-        self.single_position_pct = float(single_position_pct)
-        self.max_positions = int(max_positions)
-        self.initial_cash = float(initial_cash)
+        # 从 kwargs 或类体内联字段 default 获取参数值(覆盖类体 descriptor)
+        p = lambda n: kwargs.get(n, getattr(type(self), n).default)
+        self.kalman_q_price = float(p("kalman_q_price"))
+        self.kalman_q_vel = float(p("kalman_q_vel"))
+        self.kalman_r = float(p("kalman_r"))
+        self.entry_threshold = float(p("entry_threshold"))
+        self.exit_threshold = float(p("exit_threshold"))
+        self.stop_loss_pct = float(p("stop_loss_pct"))
+        self.use_price_signal = bool(p("use_price_signal"))
+        self.use_velocity_signal = bool(p("use_velocity_signal"))
+        self.trend_filter_enabled = bool(p("trend_filter_enabled"))
+        self.trend_filter_confirm_bars = max(1, int(p("trend_filter_confirm_bars")))
+        self.trend_bear_position_pct = float(p("trend_bear_position_pct"))
+        self.downtrend_entry_threshold = float(p("downtrend_entry_threshold"))
+        self.single_position_pct = float(p("single_position_pct"))
+        self.max_positions = int(p("max_positions"))
+        self.initial_cash = float(p("initial_cash"))
 
         # ---- SignalEngine 实例（按 symbol 管理） ----
         self._engines: Dict[str, SignalEngine] = {}
@@ -233,7 +180,7 @@ class KalmanStrategy(Strategy):
             if result["signal"] == "buy":
                 if limit_up and close_price >= limit_up:
                     self.log(
-                        f"[涨停跳过买入] {bar.timestamp_str} {symbol} "
+                        f"[涨停跳过买入] {bar.timestamp_iso} {symbol} "
                         f"close¥{close_price:.2f}≥涨停¥{limit_up:.2f}"
                     )
                     return
@@ -254,7 +201,7 @@ class KalmanStrategy(Strategy):
                 self._entry_prices[symbol] = close_price
                 self._trade_count += 1
                 self.log(
-                    f"[买入] {bar.timestamp_str} | "
+                    f"[买入] {bar.timestamp_iso} | "
                     f"价格={close_price:.2f} | "
                     f"卡尔曼估计={result['kalman_price']:.2f} | "
                     f"速度={result['kalman_velocity']:.6f} | "
@@ -270,7 +217,7 @@ class KalmanStrategy(Strategy):
             if result["signal"] == "sell":
                 if limit_down and close_price <= limit_down:
                     self.log(
-                        f"[跌停跳过卖出] {bar.timestamp_str} {symbol} "
+                        f"[跌停跳过卖出] {bar.timestamp_iso} {symbol} "
                         f"close¥{close_price:.2f}≤跌停¥{limit_down:.2f}"
                     )
                     return
@@ -279,7 +226,7 @@ class KalmanStrategy(Strategy):
                 self._trade_count += 1
                 pnl_pct = (close_price / entry_price - 1) * 100
                 self.log(
-                    f"[卖出] {bar.timestamp_str} | "
+                    f"[卖出] {bar.timestamp_iso} | "
                     f"价格={close_price:.2f} | "
                     f"入场={entry_price:.2f} | "
                     f"收益={pnl_pct:.2f}% | "
