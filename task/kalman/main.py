@@ -319,6 +319,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="运行全量组合回测(股票池+ETF池,用 stocks.yaml,替代单标的回测)",
     )
+    parser.add_argument(
+        "--deploy",
+        action="store_true",
+        help="回测完成后自动部署报告到服务器",
+    )
     return parser.parse_args()
 
 
@@ -472,7 +477,34 @@ def main() -> None:
             except Exception as e:
                 print(f"[报告] 生成失败: {e}")
 
+    # ---- 5. 部署报告到服务器 ----
+    if args.deploy:
+        _deploy_reports()
+
     print("\n完成！")
+
+
+def _deploy_reports() -> None:
+    """调用 deploy.sh 将回测报告部署到服务器。"""
+    import subprocess
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    deploy_script = os.path.join(script_dir, "deploy.sh")
+    if not os.path.exists(deploy_script):
+        print("[部署] deploy.sh 不存在，跳过")
+        return
+    print("\n[部署] 上传报告到服务器...")
+    try:
+        result = subprocess.run(
+            ["bash", deploy_script],
+            capture_output=True, text=True, timeout=120,
+            cwd=script_dir,
+        )
+        if result.returncode == 0:
+            print("[部署] ✅ 报告已部署")
+        else:
+            print(f"[部署] ⚠️ 失败: {result.stderr.strip()}")
+    except Exception as e:
+        print(f"[部署] ⚠️ 异常: {e}")
 
 
 if __name__ == "__main__":

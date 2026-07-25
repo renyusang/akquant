@@ -29,3 +29,6 @@ execution_log.csv
 backups/
 backups/*
 validation_log.csv
+
+# 部署敏感信息（含服务器密码）
+report_deploy.md

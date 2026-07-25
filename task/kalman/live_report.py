@@ -176,6 +176,7 @@ def build_live_report():
     trades_html = _trades_table(trades, name_map)
     details_html = _trade_details(buys_log, trades, name_map)
     monthly_table = _monthly_heatmap(eq, trades)
+    pending_html = _pending_orders_html(name_map, stock_cash, etf_cash)
 
     # ---- 指标卡片 ----
     stock_used = sum(p["value"] for p in stock_pos)
@@ -214,6 +215,14 @@ def build_live_report():
 <head><meta charset='utf-8'><title>实盘交易报告</title>{css}
 <script src='https://cdn.plot.ly/plotly-2.35.2.min.js'></script></head>
 <body>
+<div style="background:#fff5f5;border:3px solid #e74c3c;border-radius:8px;padding:20px 24px;margin-bottom:24px;font-size:16px;color:#721c24;line-height:1.8;text-align:center">
+<div style="font-size:24px;margin-bottom:8px">⚠️</div>
+<strong style="font-size:18px">免责声明</strong><br>
+本报告仅为<u>个人量化策略研究记录</u>，<strong>不构成任何投资建议</strong>。<br>
+信号和回测基于<strong>历史数据</strong>，过往表现<strong>不代表未来收益</strong>。<br>
+股市有风险，投资需谨慎。使用者应<strong>独立判断并承担全部投资风险</strong>，<br>
+作者不对因使用本报告信息产生的任何直接或间接损失承担责任。
+</div>
 <h1>实盘交易报告</h1>
 <p style='color:#666;font-size:14px'>交易区间: {start_date} ~ {end_date} | 初始资金: ¥{initial_cash:,.0f} | 生成时间: {now}</p>
 <details open><summary><h2>核心指标</h2></summary>{metrics}</details>
@@ -221,6 +230,7 @@ def build_live_report():
 <details open><summary><h2>月度收益</h2></summary>{chart2}{monthly_table}</details>
 <details open><summary><h2>当前持仓</h2></summary>
 <div class='col2'><div><h3>股票</h3>{pos_stock_html}</div><div><h3>ETF</h3>{pos_etf_html}</div></div></details>
+<details open><summary><h2>待执行订单</h2></summary>{pending_html}</details>
 <details open><summary><h2>已完成交易</h2></summary>
 <div style='max-height:600px;overflow-y:auto;'>{trades_html}</div></details>
 <details open><summary><h2>交易明细</h2></summary>
@@ -439,6 +449,183 @@ def _trade_details(buys_log, trades, name_map):
         return "<p>暂无交易记录</p>"
     df = pd.DataFrame(rows).sort_values("日期", ascending=False)
     return df.to_html(index=False, classes="data-table", border=0, justify="right", escape=False)
+
+
+def _pending_orders_html(name_map, stock_cash, etf_cash):
+    """生成待执行订单表格（对齐 manage.py show 输出）。
+
+    包含: 待买入/待卖出 + 被跳过的买入信号（仓位满/资金不足）。
+    """
+    import pandas as pd
+    from orders import load_pending
+
+    pending = load_pending()
+    is_etf = lambda s: str(s).startswith(("51", "15", "58", "56"))
+
+    # 待卖出
+    sells = [o for o in pending if o.get("action") == "sell"]
+
+    # 待买入（pending 中的 buy 订单）
+    buys = [o for o in pending if o.get("action") != "sell"]
+
+    # 被跳过的买入信号（从 execution_log + signals 提取，同 manage.py show）
+    skipped = _get_skipped_buys(pending, name_map)
+
+    html_parts = ['<div class="col2">']
+
+    # ---- 待卖出 ----
+    html_parts.append('<div><h3>🔴 待卖出</h3>')
+    if not sells:
+        html_parts.append('<p style="color:#888">暂无</p>')
+    else:
+        _build_pending_table(html_parts, sells, name_map, "sell")
+    html_parts.append('</div>')
+
+    # ---- 待买入（合并 pending buys + skipped buys） ----
+    html_parts.append('<div><h3>🟢 待买入</h3>')
+    if not buys and not skipped:
+        html_parts.append('<p style="color:#888">暂无待买入信号</p>')
+    else:
+        # 先显示 pending 订单
+        if buys:
+            _build_pending_table(html_parts, buys, name_map, "buy")
+        # 再显示跳过的信号
+        if skipped:
+            _build_skipped_table(html_parts, skipped, name_map)
+    html_parts.append('</div>')
+
+    html_parts.append('</div>')  # close col2
+
+    return "\n".join(html_parts)
+
+
+def _get_skipped_buys(pending, name_map):
+    """从 execution_log.csv + signals.csv 提取被跳过的买入信号。
+
+    逻辑对齐 manage.py cmd_show:
+    - execution_log 中 status=skipped, action=buy
+    - 排除已持仓或已有 pending 订单的标的
+    - 从 signals.csv 获取最新信号信息（close, kalman_price, trend）
+    """
+    import pandas as pd
+
+    elog_path = os.path.join(TASK_DIR, "execution_log.csv")
+    sig_path = os.path.join(TASK_DIR, "signals.csv")
+    pos_path = os.path.join(TASK_DIR, "positions.json")
+
+    if not os.path.exists(elog_path) or not os.path.exists(sig_path):
+        return []
+
+    elog = pd.read_csv(elog_path, dtype={"symbol": str})
+    elog["symbol"] = elog["symbol"].str.zfill(6)
+    sig_df = pd.read_csv(sig_path, dtype={"symbol": str})
+    sig_df["symbol"] = sig_df["symbol"].str.zfill(6)
+
+    # 最新信号快照
+    latest = sig_df.sort_values("date").groupby("symbol").last()
+
+    # 当前持仓
+    pos_set = set()
+    if os.path.exists(pos_path):
+        import json
+        with open(pos_path) as f:
+            pos_set = set(json.load(f).keys())
+
+    pend_set = {o["symbol"] for o in pending}
+    seen = set()
+    skipped = []
+
+    for _, r in elog.iterrows():
+        sym = r["symbol"]
+        if r.get("status") != "skipped" or r.get("action") != "buy":
+            continue
+        if sym in pos_set or sym in pend_set or sym in seen:
+            continue
+        seen.add(sym)
+        if sym in latest.index:
+            row = latest.loc[sym]
+            c = float(row.get("close", 0))
+            k = float(row.get("kalman_price", c))
+            dev = abs((c / k - 1) * 100) if k > 0 else 0
+            skipped.append({
+                "symbol": sym,
+                "name": row.get("name", sym),
+                "close": c,
+                "deviation": dev,
+                "trend": row.get("trend", "?"),
+                "target_pct": float(row.get("target_pct", 0.95)),
+                "signal_date": str(row.get("date", ""))[:10],
+            })
+
+    # 按偏离度降序
+    skipped.sort(key=lambda x: x["deviation"], reverse=True)
+    return skipped
+
+
+def _build_skipped_table(html_parts, skipped, name_map):
+    """构建被跳过买入信号表格。"""
+    import pandas as pd
+
+    rows = []
+    for s in skipped:
+        sym = str(s["symbol"]).zfill(6)
+        name = name_map.get(sym, s["name"])
+        dev = s["deviation"]
+        rows.append({
+            "代码": sym,
+            "名称": name,
+            "现价": f'{s["close"]:.2f}',
+            "偏离": f'{s["deviation"]:+.1f}%',
+            "趋势": s["trend"],
+            "信号日": s["signal_date"],
+        })
+
+    df = pd.DataFrame(rows)
+    html_parts.append(
+        f'<p style="margin-top:16px;color:#e67e22;font-weight:bold">'
+        f'⏸️ 被跳过 ({len(skipped)} 笔，仓位满/资金不足)</p>'
+    )
+    html_parts.append(
+        df.to_html(index=False, classes="data-table", border=0,
+                   justify="center", escape=False)
+    )
+
+
+def _build_pending_table(html_parts, orders, name_map, action,
+                         stock_cash=0, etf_cash=0):
+    """构建单个待执行订单表格。"""
+    import pandas as pd
+
+    rows = []
+    for o in sorted(orders, key=lambda x: x.get("signal_date", ""), reverse=True):
+        sym = str(o["symbol"]).zfill(6)
+        name = name_map.get(sym, o.get("name", sym))
+        pct = float(o.get("target_pct", 0)) * 100
+        rows.append({
+            "代码": sym,
+            "名称": name,
+            "股数": int(o["shares"]),
+            "信号价": f'{float(o["signal_price"]):.2f}',
+            "仓位": f"{pct:.0f}%" if action == "buy" else "—",
+            "信号日": o.get("signal_date", ""),
+        })
+
+    if not rows:
+        html_parts.append(f'<p style="color:#888">暂无待{action=="buy" and "买入" or "卖出"}订单</p>')
+        return
+
+    df = pd.DataFrame(rows)
+    table = df.to_html(index=False, classes="data-table", border=0, justify="center", escape=False)
+
+    # 汇总
+    total_val = sum(
+        int(o["shares"]) * float(o["signal_price"]) for o in orders
+    )
+    html_parts.append(
+        f'<div class="summary-text">{action=="buy" and "待买入" or "待卖出"}: '
+        f'{len(orders)} 笔 | 预估金额 ¥{total_val:,.0f}</div>'
+    )
+    html_parts.append(table)
 
 
 def _monthly_heatmap(eq, trades):

@@ -471,6 +471,63 @@ python manage.py rollback    # 一键恢复到最新备份
 
 ---
 
+## 报告部署
+
+### 服务器
+
+腾讯云 `119.29.88.84:8888`，Nginx 静态文件服务。
+
+| 页面 | URL |
+|------|-----|
+| 报告导航 | `http://119.29.88.84:8888/` |
+| 实盘报告 | `http://119.29.88.84:8888/live/live_report.html` |
+| 组合汇总 | `http://119.29.88.84:8888/backtest/portfolio/report_portfolio.html` |
+| 股票池 | `http://119.29.88.84:8888/backtest/portfolio/report_stock.html` |
+| ETF 池 | `http://119.29.88.84:8888/backtest/portfolio/report_etf.html` |
+
+所有页面顶部有醒目的红色免责声明。
+
+### 部署命令
+
+```bash
+# 一键服务器初始化（仅首次）
+python setup_server.py         # SSH 密钥 + Nginx + 目录
+
+# 手动部署
+bash deploy.sh                 # 同步全部报告
+bash deploy.sh --live-only     # 仅实盘报告
+bash deploy.sh --backtest-only # 仅回测报告
+
+# 自动部署（已集成）
+python daily_signal.py --deploy   # 日频扫描后自动部署实盘报告
+python main.py --portfolio --deploy  # 组合回测后自动部署
+bash run_daily.sh                  # crontab 已默认开启 --deploy
+```
+
+### 页面内容
+
+**导航页 (index.html)**：实盘报告 + 组合回测报告链接。
+
+**实盘报告 (live_report.html)**：每次 `daily_signal.py` 运行后自动生成，包含：
+- 核心指标卡片（总收益率、已实现/浮动盈亏、胜率等）
+- 权益曲线 + 沪深300 对比 + 买卖点标记
+- 月度收益柱状图
+- 当前持仓（股票/ETF 分池）
+- **待执行订单**（待买入/待卖出/被跳过信号，对齐 `manage.py show`）
+- 已完成交易 + 交易明细
+
+**组合回测报告 (report_portfolio.html)**：`main.py --portfolio` 生成，包含权益曲线 + 回撤 + 年度收益 + 月度热力图。
+
+### 部署相关文件
+
+| 文件 | 说明 |
+|------|------|
+| `deploy.sh` | rsync 同步脚本，含导航页自动生成 |
+| `setup_server.py` | 一键服务器初始化（SSH + Nginx + 目录） |
+| `nginx-kalman-reports.conf` | Nginx 配置模板（8888 端口 + autoindex） |
+
+---
+
 ## 注意事项
 
 1. 买入信号在当日收盘后生成，**次交易日开盘价成交**，涨停时跳过

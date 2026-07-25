@@ -611,6 +611,13 @@ def build_combined_report(
 <script src='https://cdn.plot.ly/plotly-2.35.2.min.js'></script>
 <style>body{{font-family:sans-serif;margin:20px;}} h1{{color:#2c3e50;}} table{{font-size:13px;}}</style>
 </head><body>
+<div style="background:#fff5f5;border:3px solid #e74c3c;border-radius:8px;padding:20px 24px;margin-bottom:24px;font-size:16px;color:#721c24;line-height:1.8;text-align:center">
+<div style="font-size:24px;margin-bottom:8px">⚠️</div>
+<strong style="font-size:18px">免责声明</strong><br>
+本报告仅为<u>个人量化策略研究记录</u>，<strong>不构成任何投资建议</strong>。<br>
+回测基于<strong>历史数据</strong>，过往表现<strong>不代表未来收益</strong>。<br>
+股市有风险，投资需谨慎。
+</div>
 <h1>卡尔曼组合汇总报告</h1>
 {metrics_html}
 {fig.to_html(full_html=False, include_plotlyjs=False)}

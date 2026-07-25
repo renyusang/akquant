@@ -9,6 +9,7 @@
     python daily_signal.py                 # 扫描全部股票
     python daily_signal.py --quiet         # 仅输出 CSV，不打印详情
     python daily_signal.py --no-save       # 不保存到 signals.csv
+    python daily_signal.py --deploy        # 扫描后自动部署报告到服务器
 
 输出格式:
     🟢 买入  002594 比亚迪    ¥115.50  仓位 95%  理由: 速度反转+趋势上涨
@@ -376,7 +377,43 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="不保存到 signals.csv",
     )
+    parser.add_argument(
+        "--deploy",
+        action="store_true",
+        help="扫描完成后自动部署报告到服务器 (需先配置 SSH 免密登录)",
+    )
     return parser.parse_args()
+
+
+def _auto_deploy(quiet: bool = False) -> None:
+    """调用 deploy.sh --live-only 将实盘报告部署到服务器。"""
+    deploy_script = os.path.join(TASK_DIR, "deploy.sh")
+    if not os.path.exists(deploy_script):
+        if not quiet:
+            print("  ⚠️ deploy.sh 不存在，跳过自动部署")
+        return
+
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["bash", deploy_script, "--live-only"],
+            capture_output=True, text=True, timeout=60,
+            cwd=TASK_DIR,
+        )
+        if result.returncode == 0:
+            if not quiet:
+                print("  ✅ 报告已部署到服务器")
+        else:
+            if not quiet:
+                # 不显示完整错误，避免干扰主流程
+                err_line = result.stderr.strip().split("\n")[-1] if result.stderr else ""
+                print(f"  ⚠️ 部署失败: {err_line or result.stdout.strip()}")
+    except FileNotFoundError:
+        if not quiet:
+            print("  ⚠️ rsync/ssh 不可用，跳过部署")
+    except Exception as e:
+        if not quiet:
+            print(f"  ⚠️ 部署异常: {e}")
 
 
 def main() -> None:
@@ -568,6 +605,10 @@ def main() -> None:
     except Exception as e:
         if not args.quiet:
             print(f"  ⚠️ 实盘报告生成失败: {e}")
+
+    # 自动部署到服务器
+    if hasattr(args, "deploy") and args.deploy:
+        _auto_deploy(args.quiet)
 
 
 def _check_data_freshness(watchlist: list, today: str) -> bool:

@@ -39,7 +39,8 @@ echo "  每日信号扫描  $(date '+%Y-%m-%d %H:%M:%S')" | tee -a "${LOG_FILE}"
 echo "============================================================" | tee -a "${LOG_FILE}"
 
 cd "${SCRIPT_DIR}"
-python daily_signal.py "$@" 2>&1 | tee -a "${LOG_FILE}"
+# --deploy: 扫描完成后自动部署实盘报告到服务器 (需先配置 SSH 免密登录)
+python daily_signal.py --deploy "$@" 2>&1 | tee -a "${LOG_FILE}"
 
 EXIT_CODE=$?
 
