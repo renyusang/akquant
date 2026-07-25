@@ -197,7 +197,7 @@ T日 20:00
 ### 用法
 
 ```bash
-conda activate akquant_test
+conda activate akquant_032
 cd /home/renyu/project/opensrc/akquant/task/kalman
 
 # 扫描全部股票
@@ -402,7 +402,7 @@ result = engine.update(close, ma20_cur, ma20_prev)
 ### 运行测试
 
 ```bash
-conda activate akquant_test
+conda activate akquant_032
 
 # 全部测试
 python -m pytest task/kalman/tests/ -v
@@ -479,16 +479,19 @@ python manage.py rollback    # 一键恢复到最新备份
 4. 股票和 ETF 资金独立，不会跨池串用
 5. ETF 使用 Sina 数据源，代码以 `51 / 15 / 58 / 56` 开头
 6. 科创板（688）最低买入单位 200 股
-7. 环境：`conda activate akquant_test`
+7. 环境：`conda activate akquant_032`
 8. 定时任务：`crontab -l` 查看，`crontab -r` 取消
-9. **回测涨跌停保护(A 方案)**：KalmanStrategy 在 T日 on_bar 生成信号时检查 T日 close 涨跌停,涨停不买/跌停不卖(近似一字涨跌停,严格 close≥前收×1.1)。实盘 `orders.py` 检查 T+1 open 涨停(精确,prev_close=昨日收盘)。注:精确拦 T+1 一字涨跌停在 0.2.22 不可行(open 强制 NextOpen + NextOpen pending 在 T+1 on_bar 无法 cancel),故用 T日 close 近似;A 方案改变回测(跳过涨停日,改变交易时序,需重新对账)。
+9. **回测涨跌停保护(A 方案)**：KalmanStrategy 在 T日 on_bar 生成信号时检查 T日 close 涨跌停,涨停不买/跌停不卖(近似一字涨跌停,严格 close≥前收×1.1)。实盘 `orders.py` 检查 T+1 open 涨停(精确,prev_close=昨日收盘)。注:精确拦 T+1 一字涨跌停在 0.3.20 仍受限(open 强制 NextOpen + NextOpen pending 在 T+1 on_bar 无法 cancel),故用 T日 close 近似;A 方案改变回测(跳过涨停日,改变交易时序)。
 10. **真实成交价回填**：人工实际下单后,用 `manage.py fill <symbol> <buy|sell> <shares> <price>` 记录实际价,`daily_signal` 下次执行时优先用此价(而非开盘价假设),使 `avg_cost`/`pnl` 反映真实成交。
-11. **warmup 预热限制**：`warmup_period` 不被 run_backtest 识别(读 `warmup_bars`),已改用 `warmup_bars=40`;但 0.2.22 的 warmup 机制似乎不完全生效(前40 bar 仍 on_bar),作为已知限制。
+11. **warmup 预热**：已设 `warmup_bars=40`,0.3.20 的 warmup 机制已完善,前40 bar 不调 on_bar。
 12. **手续费**:回测(`run_backtest` 传 commission_rate=0.0003 / stamp_tax_rate=0.001 / transfer_fee_rate=0.00001 / min_commission=5.0)+ 实盘(`portfolio.calc_fee` 计算,`daily_signal` 买入 avg_cost 含费 / 卖出 pnl 减费)。A股:佣金万3双边最低5元、印花税千1仅卖出、过户费万0.1双边。
 
 ---
 
 ## 已修复问题
+
+### 升级到 akquant 0.3.20 (2026-07-25)
+**升级**: task/kalman 从 akquant 0.2.22→0.3.20。策略参数声明从 `PARAM_MODEL` + `__init__` 改为类体内联字段(`FloatParam`/`IntParam`/`BoolParam`),兼容 `run_grid_search`。报告 API 从 `result.report()` 改为 `plot_report()`。`Bar.timestamp_str` 改为 `timestamp_iso`。加 `_flush_pending_order_events` 空实现(0.3.20 引擎要求)。实盘 `daily_signal` 同步升级(信号验证一致)。环境从 `akquant_test`(0.2.22)切换到 `akquant_032`(0.3.20,独立 conda 环境,与回退环境隔离)。78 单测全绿。
 
 ### 实盘 JSON 状态机增强 (2026-07-25)
 **准确性**: 新增 `actual_fills.json` + `manage.py fill` 命令,人工实际成交价可回填,覆盖"按开盘价假设"记账。`orders.execute_pending_orders` 加 `actual_prices` 参数,优先用实际价(提供时跳过涨跌停检查,因人工已实际成交)。`daily_signal` 执行时读 `actual_fills.json`,执行后清理已用条目。向后兼容(无 actual_fills 时用 open,如现状)。
