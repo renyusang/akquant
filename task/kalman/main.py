@@ -388,6 +388,8 @@ def main() -> None:
             save=True,
             report=True,
         )
+        if args.deploy:
+            _deploy_reports()
         return
 
     # ---- 打印运行配置 ----
