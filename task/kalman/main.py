@@ -320,6 +320,11 @@ def parse_args() -> argparse.Namespace:
         help="运行全量组合回测(股票池+ETF池,用 stocks.yaml,替代单标的回测)",
     )
     parser.add_argument(
+        "--config",
+        default=None,
+        help="配置文件路径（默认 stocks.yaml,仅 --portfolio 模式下生效）",
+    )
+    parser.add_argument(
         "--deploy",
         action="store_true",
         help="回测完成后自动部署报告到服务器",
@@ -382,6 +387,7 @@ def main() -> None:
         from backtest import run_portfolio_backtest
 
         run_portfolio_backtest(
+            config_path=args.config,
             start_date=args.start,
             end_date=args.end,
             show_progress=True,
