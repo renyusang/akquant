@@ -220,6 +220,7 @@ def evaluate_stock(
                 pool_pending = sum(
                     1 for o in existing
                     if (o["symbol"].startswith("5") or o["symbol"].startswith("1")) == (asset_type == "etf")
+                    and o.get("action") != "sell"  # 待卖出释放仓位,不占用上限
                 )
                 current_count = pool_positions + pool_pending
                 if max_pos > 0 and current_count >= max_pos:
