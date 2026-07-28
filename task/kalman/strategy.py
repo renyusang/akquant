@@ -188,7 +188,7 @@ class KalmanStrategy(Strategy):
                     held = sum(
                         1
                         for s, v in self.get_positions().items()
-                        if s != symbol and abs(float(v)) > 0
+                        if abs(float(v)) > 0
                     )
                     if held >= self.max_positions:
                         return
