@@ -154,8 +154,12 @@ def evaluate_stock(
     stock: Dict[str, Any],
     config: Dict[str, Any],
     data_years: int,
+    allocated_cash: Dict[str, float] | None = None,
 ) -> Dict[str, Any]:
-    """对单只股票执行信号评估。"""
+    """对单只股票执行信号评估。
+
+    allocated_cash: 本轮已承诺但未成交的资金 {pool: amount},用于防止同次扫描超额下单。
+    """
     symbol = stock["symbol"]
     name = stock.get("name", symbol)
     params = get_stock_params(stock, config)
@@ -248,7 +252,8 @@ def evaluate_stock(
                 if (s.startswith(etf_pfx)) == is_etf
             }
             used = sum(p["shares"] * p["avg_cost"] for p in pool_pos.values())
-            remaining_cash = cash - used
+            committed = allocated_cash.get(asset_type, 0.0) if allocated_cash else 0.0
+            remaining_cash = cash - used - committed
             if buy_qty * result["close"] > remaining_cash * 1.05:
                 reason = f"资金不足(需¥{buy_qty * result['close']:,.0f}>可用¥{remaining_cash:,.0f})"
                 log_skipped(symbol, name, entry_date, reason, result.get("reason", ""))
@@ -256,6 +261,9 @@ def evaluate_stock(
                 add_pending_order(symbol, name, "buy", buy_qty, result["close"], entry_date, capped_pct)
                 log_pending(symbol, name, "buy", capped_pct, buy_qty, result["reason"], entry_date)
                 result["shares"] = buy_qty
+                # 记录已承诺资金，防止后续标的超额下单
+                if allocated_cash is not None:
+                    allocated_cash[asset_type] = allocated_cash.get(asset_type, 0.0) + buy_qty * result["close"]
         else:
             buy_reason = result.get("reason", "")
             log_skipped(
@@ -453,6 +461,7 @@ def main() -> None:
     positions_before = len(load_positions())
     results = []
     skipped_buys: List[Dict[str, Any]] = []  # 被跳过的买入信号（等仓位空出）
+    allocated_cash: Dict[str, float] = {}  # 本轮已承诺资金 {pool: amount}
     for i, stock in enumerate(all_watchlist, 1):
         symbol = stock["symbol"]
         name = stock.get("name", symbol)
@@ -460,7 +469,7 @@ def main() -> None:
             print(f"\n[{i}/{len(all_watchlist)}] {symbol} {name} ...")
 
         try:
-            result = evaluate_stock(stock, config, data_years)
+            result = evaluate_stock(stock, config, data_years, allocated_cash)
             results.append(result)
             if result.get("_skipped"):
                 skipped_buys.append(result)
@@ -517,67 +526,17 @@ def main() -> None:
                 f"偏离{deviation:+.1f}%  趋势={s.get('trend','?')}"
             )
 
-    # 仓位空出时自动买入最强信号
-    positions_now = len(load_positions())
+    # 仓位空出时自动买入最强信号（分池独立处理）
+    positions_now_all = load_positions()
+    positions_now = len(positions_now_all)
     freed = positions_before - positions_now
     if freed > 0 and skipped_buys:
-        stock_pool = _pool_config(config, "stock")
-        remaining_slots = int(stock_pool["max_positions"]) - positions_now
-        if remaining_slots > 0:
-            skipped_buys.sort(
-                key=lambda x: abs(
-                    float(x.get("close", 0)) / float(x.get("kalman_price", 1)) - 1
-                ),
-                reverse=True,
+        etf_pfx = ("51", "15", "58", "56")
+        for pool_name, pool_cfg_key in [("股票", "stock"), ("ETF", "etf")]:
+            _auto_fill_pool(
+                skipped_buys, positions_before, positions_now_all,
+                config, pool_cfg_key, pool_name, etf_pfx, quiet=args.quiet,
             )
-            filled = 0
-            for s in skipped_buys:
-                if filled >= remaining_slots:
-                    break
-                sym = str(s["symbol"]).zfill(6)
-                # 检查涨停
-                cache_path = os.path.join(CACHE_DIR, f"{sym}.parquet")
-                blocked = False
-                if os.path.exists(cache_path):
-                    try:
-                        cached = pd.read_parquet(cache_path)
-                        if len(cached) >= 1:
-                            last_close = float(cached["close"].iloc[-1])
-                            limit_up = (
-                                last_close * 1.20
-                                if sym.startswith("688") or sym.startswith("300") or sym.startswith("301")
-                                else last_close * 1.10
-                            )
-                            if s["close"] >= limit_up * 0.999:
-                                print(
-                                    f"  ⚠️ {sym} {s['name']} 涨停"
-                                    f"(收盘¥{s['close']:.2f}≥涨停¥{limit_up:.2f})，跳过"
-                                )
-                                blocked = True
-                    except Exception:
-                        pass
-                if blocked:
-                    continue
-                cash = float(stock_pool["initial_cash"])
-                max_pct = float(stock_pool["single_position_pct"])
-                capped_pct = round(float(s.get("target_pct", 0.95)) * max_pct, 4)
-                lot = 200 if str(s["symbol"]).startswith("688") else 100
-                buy_qty = int(cash * capped_pct / s["close"] / lot) * lot
-                if buy_qty > 0:
-                    add_pending_order(
-                        s["symbol"], s["name"], "buy", buy_qty,
-                        s["close"], s["date"], capped_pct,
-                    )
-                    log_pending(
-                        s["symbol"], s["name"], "buy", capped_pct,
-                        buy_qty, s.get("reason", ""), s["date"],
-                    )
-                    print(
-                        f"  🟢 自动补仓 {s['symbol']} {s['name']}: {buy_qty}股 "
-                        f"(仓位{positions_before}→{positions_now}, 空出{freed}个, "
-                        f"候选排名 #{filled + 1})"
-                    )
-                    filled += 1
 
     # 校验结果
     if all_validation_issues:
@@ -610,6 +569,127 @@ def main() -> None:
     # 自动部署到服务器
     if hasattr(args, "deploy") and args.deploy:
         _auto_deploy(args.quiet)
+
+
+def _auto_fill_pool(
+    skipped_buys: List[Dict[str, Any]],
+    positions_before: int,
+    positions_now_all: Dict[str, Any],
+    config: Dict[str, Any],
+    pool_key: str,
+    pool_name: str,
+    etf_pfx: tuple,
+    quiet: bool = False,
+) -> int:
+    """单一资金池的自动补仓逻辑。
+
+    参数:
+        skipped_buys: 本轮被跳过的买入信号列表
+        positions_before: 执行订单前的总持仓数
+        positions_now_all: 当前全部持仓 dict
+        pool_key: 配置键("stock"|"etf")
+        pool_name: 显示名称("股票"|"ETF")
+        etf_pfx: ETF 代码前缀元组
+        quiet: 是否静默
+
+    返回补仓数量。
+    """
+    pool = _pool_config(config, pool_key)
+    is_etf = (pool_key == "etf")
+    max_pos = int(pool["max_positions"])
+    cash = float(pool["initial_cash"])
+    max_pct = float(pool["single_position_pct"])
+
+    # 分池统计: 当前池内持仓数 + 待买入订单数
+    from orders import load_pending as _lp
+    pending = _lp()
+    pool_pos_count = sum(
+        1 for s in positions_now_all
+        if (s.startswith(etf_pfx)) == is_etf
+    )
+    pool_pending_count = sum(
+        1 for o in pending
+        if (o["symbol"].startswith(etf_pfx)) == is_etf
+        and o.get("action") != "sell"
+    )
+    remaining_slots = max_pos - pool_pos_count - pool_pending_count
+    if remaining_slots <= 0:
+        return 0
+
+    # 计算池内可用资金
+    pool_used = sum(
+        p["shares"] * p["avg_cost"]
+        for s, p in positions_now_all.items()
+        if (s.startswith(etf_pfx)) == is_etf
+    )
+    pool_committed = sum(
+        o["shares"] * o["signal_price"]
+        for o in pending
+        if (o["symbol"].startswith(etf_pfx)) == is_etf
+        and o.get("action") != "sell"
+    )
+    remaining_cash = cash - pool_used - pool_committed
+
+    # 筛选该池标的，按偏离度排序
+    pool_skipped = [s for s in skipped_buys
+                    if (str(s["symbol"]).startswith(etf_pfx)) == is_etf]
+    pool_skipped.sort(
+        key=lambda x: abs(
+            float(x.get("close", 0)) / float(x.get("kalman_price", 1)) - 1
+        ),
+        reverse=True,
+    )
+
+    filled = 0
+    for s in pool_skipped:
+        if filled >= remaining_slots:
+            break
+
+        sym = str(s["symbol"]).zfill(6)
+        # 涨停检查
+        cache_path = os.path.join(CACHE_DIR, f"{sym}.parquet")
+        blocked = False
+        if os.path.exists(cache_path):
+            try:
+                cached = pd.read_parquet(cache_path)
+                if len(cached) >= 1:
+                    last_close = float(cached["close"].iloc[-1])
+                    pct_limit = 0.20 if sym.startswith(("688", "300", "301")) else 0.10
+                    limit_up = last_close * (1 + pct_limit)
+                    if s["close"] >= limit_up * 0.999:
+                        if not quiet:
+                            print(f"  ⚠️ {sym} {s['name']} 涨停,跳过")
+                        blocked = True
+            except Exception:
+                pass
+        if blocked:
+            continue
+
+        capped_pct = round(float(s.get("target_pct", 0.95)) * max_pct, 4)
+        lot = 200 if sym.startswith("688") else 100
+        buy_qty = int(cash * capped_pct / s["close"] / lot) * lot
+        if buy_qty <= 0:
+            continue
+        buy_amount = buy_qty * s["close"]
+
+        if buy_amount > remaining_cash * 1.05:
+            if not quiet:
+                print(f"  ⚠️ {sym} {s['name']} 资金不足"
+                      f"(需¥{buy_amount:,.0f}>可用¥{remaining_cash:,.0f})，跳过")
+            continue
+
+        add_pending_order(sym, s["name"], "buy", buy_qty,
+                          s["close"], s["date"], capped_pct)
+        log_pending(sym, s["name"], "buy", capped_pct,
+                    buy_qty, s.get("reason", ""), s["date"])
+        remaining_cash -= buy_amount
+        filled += 1
+        if not quiet:
+            print(f"  🟢 自动补仓[{pool_name}] {sym} {s['name']}: {buy_qty}股 "
+                  f"(空位{remaining_slots}→{remaining_slots - filled}, "
+                  f"候选排名 #{filled})")
+
+    return filled
 
 
 def _check_data_freshness(watchlist: list, today: str) -> bool:
