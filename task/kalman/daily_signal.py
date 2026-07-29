@@ -280,6 +280,39 @@ def evaluate_stock(
             _lp(symbol, name, "sell", 0, sell_shares, result["reason"], entry_date, result["reason"])
             result["shares"] = sell_shares
 
+    # 7. 趋势翻转补仓: 持仓标的从下跌趋势→上涨,目标仓位从30%→95%
+    if has_pos and result["signal"] == "hold" and result["target_pct"] > 0:
+        cash = float(stock.get("cash", params.get("initial_cash", 100000)))
+        max_pct = float(params.get("single_position_pct", 0.95))
+        target_value = cash * result["target_pct"] * max_pct
+        current_value = pos_info["shares"] * avg_price if pos_info else 0
+        if target_value > current_value * 1.05:
+            add_value = target_value - current_value
+            capped_pct = round(result["target_pct"] * max_pct, 4)
+            lot = 200 if str(symbol).startswith("688") else 100
+            add_qty = int(add_value / result["close"] / lot) * lot
+            if add_qty > 0:
+                etf_pfx = ("51", "15", "58", "56")
+                is_etf_pool = (asset_type == "etf")
+                pool_pos = {
+                    s: p for s, p in load_positions().items()
+                    if (s.startswith(etf_pfx)) == is_etf_pool
+                }
+                used = sum(p["shares"] * p["avg_cost"] for p in pool_pos.values())
+                committed = allocated_cash.get(asset_type, 0.0) if allocated_cash else 0.0
+                remaining_cash = cash - used - committed
+                if add_qty * result["close"] <= remaining_cash * 1.05:
+                    add_pending_order(symbol, name, "buy", add_qty,
+                                      result["close"], entry_date, capped_pct)
+                    log_pending(symbol, name, "buy", capped_pct, add_qty,
+                                f"趋势翻转补仓: {result['reason']}", entry_date)
+                    result["signal"] = "buy"
+                    result["shares"] = add_qty
+                    result["reason"] = f"趋势翻转补仓: {result['reason']}"
+                    if allocated_cash is not None:
+                        allocated_cash[asset_type] = (
+                            allocated_cash.get(asset_type, 0.0) + add_qty * result["close"])
+
     return result
 
 

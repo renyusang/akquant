@@ -234,6 +234,21 @@ class KalmanStrategy(Strategy):
                     f"速度={result['kalman_velocity']:.6f}"
                 )
                 self._entry_prices.pop(symbol, None)
+            else:
+                # 趋势翻转补仓: 下跌→上涨,目标仓位从30%→95%
+                target_pct = result["target_pct"] * self.single_position_pct
+                target_value = self.initial_cash * target_pct
+                current_value = pos * close_price
+                if target_value > current_value * 1.05:
+                    self.order_target_value(symbol=symbol, target_value=target_value)
+                    self._entry_prices[symbol] = close_price
+                    self._trade_count += 1
+                    self.log(
+                        f"[加仓] {bar.timestamp_iso} | "
+                        f"当前¥{current_value:,.0f}→目标¥{target_value:,.0f} | "
+                        f"趋势→{result['trend']} | "
+                        f"卡尔曼估计={result['kalman_price']:.2f}"
+                    )
 
     # ------------------------------------------------------------------
     # MA20 计算
