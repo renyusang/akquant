@@ -1,0 +1,655 @@
+strategy:
+  kalman_q_price: 0.0001
+  kalman_q_vel: 1.0e-05
+  kalman_r: 0.01
+  entry_threshold: 0.02
+  exit_threshold: 0.005
+  stop_loss_pct: 0.05
+  use_price_signal: true
+  use_velocity_signal: true
+  trend_filter_enabled: true
+  trend_confirm_bars: 1
+  trend_bear_pct: 0.3
+  downtrend_entry: 0.03
+stock:
+  initial_cash: 500000
+  max_positions: 10
+  single_position_pct: 0.1
+etf:
+  initial_cash: 100000
+  max_positions: 5
+  single_position_pct: 0.2
+data_years: 2
+watchlist:
+  stocks:
+  - symbol: '600118'
+    name: 中国卫星
+  - symbol: '002532'
+    name: 天山铝业
+  - symbol: '000988'
+    name: 华工科技
+  - symbol: '000657'
+    name: 中钨高新
+  - symbol: '301308'
+    name: 江波龙
+  - symbol: '688072'
+    name: 拓荆科技
+  - symbol: '002202'
+    name: 金风科技
+  - symbol: '301165'
+    name: 锐捷网络
+  - symbol: '002558'
+    name: 巨人网络
+  - symbol: '688183'
+    name: 生益电子
+  - symbol: '600221'
+    name: 海航控股
+  - symbol: '002602'
+    name: 世纪华通
+  - symbol: '002837'
+    name: 英维克
+  - symbol: '600549'
+    name: 厦门钨业
+  - symbol: '688521'
+    name: 芯原股份
+  - symbol: '300450'
+    name: 先导智能
+  - symbol: '001280'
+    name: 中国铀业
+  - symbol: '002353'
+    name: 杰瑞股份
+  - symbol: '601727'
+    name: 上海电气
+  - symbol: '600930'
+    name: 华电新能
+  - symbol: '603893'
+    name: 瑞芯微
+  - symbol: '300476'
+    name: 胜宏科技
+  - symbol: '600522'
+    name: 中天科技
+  - symbol: '300803'
+    name: 指南针
+  - symbol: '300251'
+    name: 光线传媒
+  - symbol: '601456'
+    name: 国联民生
+  - symbol: '300866'
+    name: 安克创新
+  - symbol: '002625'
+    name: 光启技术
+  - symbol: '601018'
+    name: 宁波港
+  - symbol: '002384'
+    name: 东山精密
+  - symbol: '001391'
+    name: 国货航
+  - symbol: '002600'
+    name: 领益智造
+  - symbol: '301236'
+    name: 软通动力
+  - symbol: '302132'
+    name: 中航成飞
+  - symbol: '601825'
+    name: 沪农商行
+  - symbol: '601077'
+    name: 渝农商行
+  - symbol: '688047'
+    name: 龙芯中科
+  - symbol: '601058'
+    name: 赛轮轮胎
+  - symbol: '600160'
+    name: 巨化股份
+  - symbol: '600482'
+    name: 中国动力
+  - symbol: '601136'
+    name: 首创证券
+  - symbol: '002028'
+    name: 思源电气
+  - symbol: '002463'
+    name: 沪电股份
+  - symbol: '600066'
+    name: 宇通客车
+  - symbol: '000630'
+    name: 铜陵有色
+  - symbol: '688506'
+    name: 百利天恒
+  - symbol: '000975'
+    name: 山金国际
+  - symbol: '600482'
+    name: 中国动力
+  - symbol: '300502'
+    name: 新易盛
+  - symbol: '600160'
+    name: 巨化股份
+  - symbol: '002422'
+    name: 科伦药业
+  - symbol: '300394'
+    name: 天孚通信
+  - symbol: '300418'
+    name: 昆仑万维
+  - symbol: '600026'
+    name: 中远海能
+  - symbol: '000807'
+    name: 云铝股份
+  - symbol: '001965'
+    name: 招商公路
+  - symbol: '300442'
+    name: 润泽科技
+  - symbol: '688009'
+    name: 中国通号
+  - symbol: '600027'
+    name: 华电国际
+  - symbol: '688082'
+    name: 盛美上海
+  - symbol: '600415'
+    name: 小商品城
+  - symbol: '300832'
+    name: 新产业
+  - symbol: '603296'
+    name: 华勤技术
+  - symbol: '688256'
+    name: 寒武纪
+  - symbol: '688271'
+    name: 联影医疗
+  - symbol: '688041'
+    name: 海光信息
+  - symbol: '601916'
+    name: 浙商银行
+  - symbol: '600515'
+    name: 海南机场
+  - symbol: '600938'
+    name: 中国海油
+  - symbol: '601059'
+    name: 信达证券
+  - symbol: '600372'
+    name: 中航机载
+  - symbol: '301269'
+    name: 华大九天
+  - symbol: '600023'
+    name: 浙能电力
+  - symbol: '300308'
+    name: 中际旭创
+  - symbol: '000999'
+    name: 华润三九
+  - symbol: '600489'
+    name: 中金黄金
+  - symbol: '600875'
+    name: 东方电气
+  - symbol: '000617'
+    name: 中油资本
+  - symbol: '688223'
+    name: 晶科能源
+  - symbol: '601872'
+    name: 招商轮船
+  - symbol: '000617'
+    name: 中油资本
+  - symbol: '600233'
+    name: 圆通速递
+  - symbol: '601689'
+    name: 拓普集团
+  - symbol: '600674'
+    name: 川投能源
+  - symbol: '688303'
+    name: 大全能源
+  - symbol: '605117'
+    name: 德业股份
+  - symbol: '600039'
+    name: 四川路桥
+  - symbol: '600803'
+    name: 新奥股份
+  - symbol: '002074'
+    name: 国轩高科
+  - symbol: '600460'
+    name: 士兰微
+  - symbol: '600941'
+    name: 中国移动
+  - symbol: '002648'
+    name: 卫星化学
+  - symbol: '601117'
+    name: 中国化学
+  - symbol: '300661'
+    name: 圣邦股份
+  - symbol: '002920'
+    name: 德赛西威
+  - symbol: '000792'
+    name: 盐湖股份
+  - symbol: '600219'
+    name: 南山铝业
+  - symbol: '600188'
+    name: 兖矿能源
+  - symbol: '000408'
+    name: 藏格矿业
+  - symbol: '600089'
+    name: 特变电工
+  - symbol: '603260'
+    name: 合盛硅业
+  - symbol: '300999'
+    name: 金龙鱼
+  - symbol: '300896'
+    name: 爱美客
+  - symbol: '688981'
+    name: 中芯国际
+  - symbol: '002466'
+    name: 天齐锂业
+  - symbol: '601898'
+    name: 中煤能源
+  - symbol: '000301'
+    name: 东方盛虹
+  - symbol: '600905'
+    name: 三峡能源
+  - symbol: '601728'
+    name: 中国电信
+  - symbol: '300316'
+    name: 晶盛机电
+  - symbol: '300760'
+    name: 迈瑞医疗
+  - symbol: '601868'
+    name: 中国能建
+  - symbol: '300750'
+    name: 宁德时代
+  - symbol: '002709'
+    name: 天赐材料
+  - symbol: '605499'
+    name: 东鹏饮料
+  - symbol: '688396'
+    name: 华润微
+  - symbol: '688126'
+    name: 沪硅产业
+  - symbol: '688111'
+    name: 金山办公
+  - symbol: '601995'
+    name: 中金公司
+  - symbol: '600426'
+    name: 华鲁恒升
+  - symbol: '600426'
+    name: 华鲁恒升
+  - symbol: '688008'
+    name: 澜起科技
+  - symbol: '600600'
+    name: 青岛啤酒
+  - symbol: '688012'
+    name: 中微公司
+  - symbol: '002049'
+    name: 紫光国微
+  - symbol: '600150'
+    name: 中国船舶
+  - symbol: '603392'
+    name: 万泰生物
+  - symbol: '688036'
+    name: 传音控股
+  - symbol: '600584'
+    name: 长电科技
+  - symbol: '600845'
+    name: 宝信软件
+  - symbol: '600918'
+    name: 中泰证券
+  - symbol: '603369'
+    name: 今世缘
+  - symbol: '601100'
+    name: 恒立液压
+  - symbol: '000708'
+    name: 中信特钢
+  - symbol: '002371'
+    name: 北方华创
+  - symbol: '003816'
+    name: 中国广核
+  - symbol: '300014'
+    name: 亿纬锂能
+  - symbol: '300628'
+    name: 亿联网络
+  - symbol: '601658'
+    name: 邮储银行
+  - symbol: '000977'
+    name: 浪潮信息
+  - symbol: '601816'
+    name: 京沪高铁
+  - symbol: '002916'
+    name: 深南电路
+  - symbol: '600183'
+    name: 生益科技
+  - symbol: '600989'
+    name: 宝丰能源
+  - symbol: '601698'
+    name: 中国卫通
+  - symbol: '603501'
+    name: 韦尔股份
+  - symbol: '000596'
+    name: 古井贡酒
+  - symbol: '002938'
+    name: 鹏鼎控股
+  - symbol: '300413'
+    name: 芒果超媒
+  - symbol: '300498'
+    name: 温氏股份
+  - symbol: '601319'
+    name: 中国人保
+  - symbol: '603019'
+    name: 中科曙光
+  - symbol: '603986'
+    name: 兆易创新
+  - symbol: '002179'
+    name: 中航光电
+  - symbol: '002001'
+    name: 新和成
+  - symbol: '601138'
+    name: 工业富联
+  - symbol: '002311'
+    name: 海大集团
+  - symbol: '600760'
+    name: 中航沈飞
+  - symbol: '601066'
+    name: 中信建投
+  - symbol: '603259'
+    name: 药明康德
+  - symbol: '002050'
+    name: 三花智控
+  - symbol: '300433'
+    name: 蓝思科技
+  - symbol: '002493'
+    name: 荣盛石化
+  - symbol: '300408'
+    name: 三环集团
+  - symbol: '600176'
+    name: 中国巨石
+  - symbol: '600438'
+    name: 通威股份
+  - symbol: '600809'
+    name: 山西汾酒
+  - symbol: '601360'
+    name: 三六零
+  - symbol: '600025'
+    name: 华能水电
+  - symbol: '600346'
+    name: 恒力股份
+  - symbol: '603288'
+    name: 海天味业
+  - symbol: '601238'
+    name: 广汽集团
+  - symbol: '601838'
+    name: 成都银行
+  - symbol: '601012'
+    name: 隆基股份
+  - symbol: '603799'
+    name: 华友钴业
+  - symbol: '600011'
+    name: 华能国际
+  - symbol: '002460'
+    name: 赣锋锂业
+  - symbol: '601878'
+    name: 浙商证券
+  - symbol: '300122'
+    name: 智飞生物
+  - symbol: '300015'
+    name: 爱尔眼科
+  - symbol: '002352'
+    name: 顺丰控股
+  - symbol: '600436'
+    name: 片仔癀
+  - symbol: '600919'
+    name: 江苏银行
+  - symbol: '600926'
+    name: 杭州银行
+  - symbol: '601229'
+    name: 上海银行
+  - symbol: '601881'
+    name: 中国银河
+  - symbol: '002714'
+    name: 牧原股份
+  - symbol: '300033'
+    name: 同花顺
+  - symbol: '601877'
+    name: 正泰电器
+  - symbol: '000938'
+    name: 紫光股份
+  - symbol: '002027'
+    name: 分众传媒
+  - symbol: '600061'
+    name: 国投安信
+  - symbol: '001979'
+    name: 招商蛇口
+  - symbol: '601211'
+    name: 国泰君安
+  - symbol: '601985'
+    name: 中国核电
+  - symbol: '002736'
+    name: 国信证券
+  - symbol: '300059'
+    name: 东方财富
+  - symbol: '600958'
+    name: 东方证券
+  - symbol: '601021'
+    name: 春秋航空
+  - symbol: '601788'
+    name: 光大证券
+  - symbol: '601919'
+    name: 中国远洋
+  - symbol: '000166'
+    name: 申万宏源
+  - symbol: '600570'
+    name: 恒生电子
+  - symbol: '300124'
+    name: 汇川技术
+  - symbol: '601225'
+    name: 陕西煤业
+  - symbol: '002475'
+    name: 立讯精密
+  - symbol: '600018'
+    name: 上港集团
+  - symbol: '002230'
+    name: 科大讯飞
+  - symbol: '000333'
+    name: 美的集团
+  - symbol: '000963'
+    name: 华东医药
+  - symbol: '603993'
+    name: 洛阳钼业
+  - symbol: '002236'
+    name: 大华股份
+  - symbol: '600886'
+    name: 国投电力
+  - symbol: '601800'
+    name: 中国交建
+  - symbol: '000725'
+    name: 京东方A
+  - symbol: '002241'
+    name: 歌尔声学
+  - symbol: '601336'
+    name: 新华保险
+  - symbol: '601633'
+    name: 长城汽车
+  - symbol: '601669'
+    name: 中国水电
+  - symbol: '601901'
+    name: 方正证券
+  - symbol: '002594'
+    name: 比亚迪
+  - symbol: '601377'
+    name: 兴业证券
+  - symbol: '000776'
+    name: 广发证券
+  - symbol: '002415'
+    name: 海康威视
+  - symbol: '600115'
+    name: 东方航空
+  - symbol: '600276'
+    name: 恒瑞医药
+  - symbol: '600406'
+    name: 国电南瑞
+  - symbol: '600887'
+    name: 伊利股份
+  - symbol: '600893'
+    name: 航空动力
+  - symbol: '601818'
+    name: 光大银行
+  - symbol: '601288'
+    name: 农业银行
+  - symbol: '002304'
+    name: 洋河股份
+  - symbol: '600999'
+    name: 招商证券
+  - symbol: '601688'
+    name: 华泰证券
+  - symbol: '601888'
+    name: 中国国旅
+  - symbol: '601618'
+    name: 中国中冶
+  - symbol: '601668'
+    name: 中国建筑
+  - symbol: '601766'
+    name: 中国南车
+  - symbol: '600588'
+    name: 用友软件
+  - symbol: '601186'
+    name: 中国铁建
+  - symbol: '601186'
+    name: 中国铁建
+  - symbol: '601899'
+    name: 紫金矿业
+  - symbol: '601390'
+    name: 中国中铁
+  - symbol: '601601'
+    name: 中国太保
+  - symbol: '601939'
+    name: 建设银行
+  - symbol: '000338'
+    name: 潍柴动力
+  - symbol: '000895'
+    name: 双汇发展
+  - symbol: '002142'
+    name: 宁波银行
+  - symbol: '600111'
+    name: 包钢稀土
+  - symbol: '601009'
+    name: 南京银行
+  - symbol: '601169'
+    name: 北京银行
+  - symbol: '601857'
+    name: 中国石油
+  - symbol: '601088'
+    name: 中国神华
+  - symbol: '601328'
+    name: 交通银行
+  - symbol: '601998'
+    name: 中信银行
+  - symbol: '601600'
+    name: 中国铝业
+  - symbol: '601318'
+    name: 中国平安
+  - symbol: '601166'
+    name: 兴业银行
+  - symbol: '601628'
+    name: 中国人寿
+  - symbol: '600547'
+    name: 山东黄金
+  - symbol: '601111'
+    name: 中国国航
+  - symbol: '600048'
+    name: 保利地产
+  - symbol: '601398'
+    name: 工商银行
+  - symbol: '601006'
+    name: 大秦铁路
+  - symbol: '601988'
+    name: 中国银行
+  - symbol: '000768'
+    name: 西飞国际
+  - symbol: '000538'
+    name: 云南白药
+  - symbol: '600690'
+    name: 青岛海尔
+  - symbol: '600660'
+    name: 福耀玻璃
+  - symbol: '600585'
+    name: 海螺水泥
+  - symbol: '600519'
+    name: 贵州茅台
+  - symbol: '600362'
+    name: 江西铜业
+  - symbol: '600309'
+    name: 烟台万华
+  - symbol: '000625'
+    name: 长安汽车
+  - symbol: '000651'
+    name: 格力电器
+  - symbol: '000568'
+    name: 泸州老窖
+  - symbol: '000425'
+    name: 徐工科技
+  - symbol: '000157'
+    name: 中联重科
+  - symbol: '000063'
+    name: 中兴通讯
+  - symbol: '000001'
+    name: 深发展A
+  - symbol: '600009'
+    name: 上海机场
+  - symbol: '600010'
+    name: 包钢股份
+  - symbol: '600015'
+    name: 华夏银行
+  - symbol: '600016'
+    name: 民生银行
+  - symbol: '600019'
+    name: 宝钢股份
+  - symbol: '600028'
+    name: 中国石化
+  - symbol: '600029'
+    name: 南方航空
+  - symbol: '600030'
+    name: 中信证券
+  - symbol: '600031'
+    name: 三一重工
+  - symbol: '600036'
+    name: 招商银行
+  - symbol: '600050'
+    name: 中国联通
+  - symbol: '000858'
+    name: 五粮液
+  - symbol: '000625'
+    name: 长安汽车
+  - symbol: '000651'
+    name: 格力电器
+  - symbol: '000568'
+    name: 泸州老窖
+  - symbol: '000425'
+    name: 徐工科技
+  - symbol: '000157'
+    name: 中联重科
+  - symbol: '000063'
+    name: 中兴通讯
+  - symbol: '000001'
+    name: 深发展A
+  - symbol: '000002'
+    name: 万科A
+  etfs:
+  - symbol: '510050'
+    name: 上证50ETF
+    type: etf
+  - symbol: '510300'
+    name: 沪深300ETF
+    type: etf
+  - symbol: '510500'
+    name: 中证500ETF
+    type: etf
+  - symbol: '159845'
+    name: 中证1000ETF
+    type: etf
+  - symbol: '159915'
+    name: 创业板ETF
+    type: etf
+  - symbol: '588000'
+    name: 科创板50ETF
+    type: etf
+  - symbol: '510880'
+    name: 红利ETF
+    type: etf
+  - symbol: '518880'
+    name: 黄金ETF
+    type: etf
+  - symbol: '513100'
+    name: 纳斯达克ETF
+    type: etf
+  - symbol: '513180'
+    name: 恒生科技ETF
+    type: etf

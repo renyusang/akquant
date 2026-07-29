@@ -481,6 +481,76 @@ def _combine_equity(
     return combined
 
 
+def _get_open_positions(result, data_map: dict) -> pd.DataFrame:
+    """从 BacktestResult 提取最终未平仓持仓。
+
+    使用 result.positions (日度持仓快照) + get_positions_dict (引擎计算的市值/浮盈)。
+    """
+    if result is None:
+        return pd.DataFrame()
+
+    pos_df = result.positions
+    if pos_df is None or pos_df.empty:
+        return pd.DataFrame()
+
+    # 最后一天有持仓的标的
+    last_row = pos_df.iloc[-1]
+    open_syms = last_row[last_row > 0]
+    if len(open_syms) == 0:
+        return pd.DataFrame()
+
+    # 从 get_positions_dict 提取引擎计算的最终数据(市值+浮盈准确)
+    pos_dict = result.get_positions_dict()
+    final_data = {}
+    if pos_dict and "symbol" in pos_dict:
+        n = len(pos_dict["symbol"])
+        for i in range(n):
+            sym = str(pos_dict["symbol"][i]).zfill(6)
+            shares = float(pos_dict["long_shares"][i])
+            if shares > 0:
+                final_data[sym] = {
+                    "shares": shares,
+                    "entry_price": float(pos_dict["entry_price"][i]),
+                    "close": float(pos_dict["close"][i]),
+                    "market_value": float(pos_dict["market_value"][i]),
+                    "unrealized_pnl": float(pos_dict["unrealized_pnl"][i]),
+                }
+
+    rows = []
+    for sym, shares in open_syms.items():
+        sym = str(sym).zfill(6)
+        shares = float(shares)
+        if shares <= 0:
+            continue
+        fd = final_data.get(sym, {})
+        entry_price = fd.get("entry_price", 0)
+        market_value = fd.get("market_value", 0)
+        unrealized_pnl = fd.get("unrealized_pnl", 0)
+        last_close = fd.get("close", 0)
+        cost_value = market_value - unrealized_pnl
+        pnl_pct = (unrealized_pnl / cost_value * 100) if cost_value > 0 else 0
+
+        # 用 data_map 的最后收盘价覆盖(更精确)
+        if sym in data_map:
+            last_close = float(data_map[sym].iloc[-1]["close"])
+            market_value = shares * last_close
+            unrealized_pnl = market_value - cost_value
+            pnl_pct = (unrealized_pnl / cost_value * 100) if cost_value > 0 else 0
+
+        rows.append({
+            "symbol": sym,
+            "shares": shares,
+            "avg_entry": round(entry_price, 3),
+            "last_close": round(last_close, 3),
+            "cost_value": round(cost_value, 2),
+            "market_value": round(market_value, 2),
+            "unrealized_pnl": round(unrealized_pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+        })
+
+    return pd.DataFrame(rows).sort_values("unrealized_pnl", ascending=False)
+
+
 def build_combined_report(
     combined_equity: pd.Series,
     combined_trades: pd.DataFrame,
@@ -489,6 +559,7 @@ def build_combined_report(
     etf_cash: float,
     filename: str,
     benchmark: Optional[pd.Series] = None,
+    open_positions: Optional[pd.DataFrame] = None,
 ) -> None:
     """生成组合汇总 HTML 报告(股票池+ETF池 合并权益/指标/交易)。
 
@@ -594,6 +665,28 @@ def build_combined_report(
       <tr><td>总交易数</td><td>{m['trade_count']}</td></tr>
     </table>"""
 
+    # ---- 未平仓持仓 ----
+    positions_html = ""
+    if open_positions is not None and not open_positions.empty:
+        pos = open_positions.copy()
+        total_upnl = pos["unrealized_pnl"].sum()
+        upnl_cls = "positive" if total_upnl > 0 else "negative"
+        pos_html = "<h3>未平仓持仓明细</h3>"
+        pos_html += f'<div class="summary-text">共 {len(pos)} 只 | 总浮盈 <span class="{upnl_cls}">¥{total_upnl:+,.0f}</span></div>'
+        pos_disp = pos[["symbol", "shares", "avg_entry", "last_close", "cost_value", "market_value", "unrealized_pnl", "pnl_pct"]].copy()
+        pos_disp.columns = ["代码", "股数", "均成本", "现价", "成本额", "市值", "浮盈", "收益率%"]
+        pos_disp["股数"] = pos_disp["股数"].apply(lambda x: f"{int(x):,}")
+        pos_disp["均成本"] = pos_disp["均成本"].apply(lambda x: f"{float(x):.2f}")
+        pos_disp["现价"] = pos_disp["现价"].apply(lambda x: f"{float(x):.2f}")
+        pos_disp["成本额"] = pos_disp["成本额"].apply(lambda x: f"{float(x):,.0f}")
+        pos_disp["市值"] = pos_disp["市值"].apply(lambda x: f"{float(x):,.0f}")
+        pos_disp["浮盈"] = pos_disp["浮盈"].apply(
+            lambda x: f"<span class='{'positive' if float(x)>0 else 'negative'}'>{float(x):+,.0f}</span>")
+        pos_disp["收益率%"] = pos_disp["收益率%"].apply(
+            lambda x: f"<span class='{'positive' if float(x)>0 else 'negative'}'>{float(x):+.1f}%</span>")
+        pos_html += pos_disp.to_html(index=False, classes="data-table", border=0, justify="center", escape=False)
+        positions_html = pos_html
+
     # ---- 交易明细(前20笔)----
     trades_html = "<h3>交易明细(前20笔)</h3>"
     if not combined_trades.empty:
@@ -620,6 +713,7 @@ def build_combined_report(
 </div>
 <h1>卡尔曼组合汇总报告</h1>
 {metrics_html}
+{positions_html}
 {fig.to_html(full_html=False, include_plotlyjs=False)}
 {heat_html}
 {trades_html}
@@ -765,6 +859,15 @@ def run_portfolio_backtest(
         )
         print(f"  已保存 portfolio_equity.csv / portfolio_trades.csv")
 
+        # 导出未平仓持仓
+        stock_positions = _get_open_positions(stock_result, stock_map) if stock_result else pd.DataFrame()
+        etf_positions = _get_open_positions(etf_result, etf_map) if etf_result else pd.DataFrame()
+        all_positions = pd.concat([stock_positions, etf_positions], ignore_index=True)
+        if not all_positions.empty:
+            pos_path = os.path.join(task_dir, "portfolio_positions.csv")
+            all_positions.to_csv(pos_path, index=False, encoding="utf-8-sig")
+            print(f"  已保存 portfolio_positions.csv ({len(all_positions)} 只未平仓)")
+
     if report:
         try:
             # 沪深300基准(收益序列给 result.report,价格序列给 build_combined_report)
@@ -817,6 +920,7 @@ def run_portfolio_backtest(
                 stock_cash, etf_cash,
                 os.path.join(task_dir, "report_portfolio.html"),
                 benchmark=hs300_price,
+                open_positions=all_positions,
             )
             print(f"  已生成 report_stock.html / report_etf.html(含K线复盘+沪深300) + report_portfolio.html(组合汇总)")
         except Exception as e:
