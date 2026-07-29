@@ -546,7 +546,9 @@ def _get_skipped_buys(pending, name_map):
             row = latest.loc[sym]
             c = float(row.get("close", 0))
             k = float(row.get("kalman_price", c))
-            dev = abs((c / k - 1) * 100) if k > 0 else 0
+            dev = (c / k - 1) * 100 if k > 0 else 0
+            if dev <= 0:
+                continue  # 负偏离=卖出信号,不列入待买入
             skipped.append({
                 "symbol": sym,
                 "name": row.get("name", sym),

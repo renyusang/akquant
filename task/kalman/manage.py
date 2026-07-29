@@ -205,7 +205,10 @@ def cmd_show() -> None:
                 row = latest.loc[sym]
                 c = float(row.get("close", 0))
                 k = float(row.get("kalman_price", c))
-                dev = abs((c / k - 1) * 100) if k > 0 else 0
+                dev = (c / k - 1) * 100 if k > 0 else 0
+                # 仅正偏离(实际价>滤波价)才是买入候选; 负偏离应卖出
+                if dev <= 0:
+                    continue
                 target_pct = float(row.get("target_pct", 0.95))
                 skipped.append({"symbol": sym, "name": row.get("name", sym), "close": c, "deviation": dev, "trend": row.get("trend", "?"), "target_pct": target_pct})
         skipped.sort(key=lambda x: x["deviation"], reverse=True)
