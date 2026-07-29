@@ -791,7 +791,10 @@ def _execute_today_pending(config: Dict[str, Any], today: str = "") -> List[Dict
     from orders import load_pending
     remaining = load_pending()
     for order in remaining:
-        log_failed(order["symbol"], order["signal_date"], order.get("reason", "等待数据"))
+        # 仅对因涨停/缺价等原因真正失败的订单标 failed; T+1等待的不标
+        if order.get("signal_date", "") < today:
+            log_failed(order["symbol"], order["signal_date"],
+                       order.get("reason", "未能成交"))
     if remaining:
         print(f"  ⚠️ 未成交 {len(remaining)} 笔:")
         for order in remaining:

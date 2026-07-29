@@ -62,10 +62,10 @@ def log_pending(
 
 
 def log_executed(symbol: str, signal_date: str, exec_price: float, exec_date: str) -> None:
-    """标记为已成交。"""
+    """标记为已成交。支持覆盖 pending/failed 状态（此前可能被误标）。"""
     df = _load()
     sym = str(symbol).zfill(6)
-    mask = (df["symbol"] == sym) & (df["signal_date"] == signal_date) & (df["status"] == "pending")
+    mask = (df["symbol"] == sym) & (df["signal_date"] == signal_date) & (df["status"].isin(["pending", "failed"]))
     if mask.any():
         idx = df[mask].index[-1]
         df.at[idx, "exec_price"] = exec_price
