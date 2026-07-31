@@ -64,6 +64,85 @@ class TestPendingOrders:
             assert len(pending) == 1
             assert pending[0]["action"] == "sell"
 
+
+class TestSellOrderUpdate:
+    """卖出同向订单应更新 price/shares/name, 保留 signal_date(不推迟执行)。"""
+
+    def test_sell_duplicate_updates_shares_and_price(self, monkeypatch):
+        """再次触发卖出(股数/价格变化)应更新订单的 shares 和 signal_price。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            monkeypatch.setattr(orders, "PENDING_FILE",
+                                os.path.join(tmp, "pending.json"))
+
+            orders.add_pending_order("000001", "测试", "sell", 6400, 3.02,
+                                     "2026-07-28", 0.0)
+            # 持仓被 adjust 调整后, 新卖出信号股数变化
+            orders.add_pending_order("000001", "测试", "sell", 5000, 3.05,
+                                     "2026-07-29", 0.0)
+            pending = orders.load_pending()
+            assert len(pending) == 1
+            assert pending[0]["shares"] == 5000   # 股数同步更新
+            assert pending[0]["signal_price"] == 3.05  # 价格同步更新
+
+    def test_sell_duplicate_keeps_signal_date(self, monkeypatch):
+        """再次触发卖出不应推迟 signal_date(否则 T+1 无限延迟)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            monkeypatch.setattr(orders, "PENDING_FILE",
+                                os.path.join(tmp, "pending.json"))
+
+            orders.add_pending_order("000001", "测试", "sell", 6400, 3.02,
+                                     "2026-07-28", 0.0)
+            orders.add_pending_order("000001", "测试", "sell", 6400, 3.01,
+                                     "2026-07-29", 0.0)
+            orders.add_pending_order("000001", "测试", "sell", 6400, 3.00,
+                                     "2026-07-30", 0.0)
+            pending = orders.load_pending()
+            assert len(pending) == 1
+            assert pending[0]["signal_date"] == "2026-07-28"  # 最早日期保留
+
+    def test_sell_duplicate_updates_name(self, monkeypatch):
+        """再次触发卖出应同步更新 name。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            monkeypatch.setattr(orders, "PENDING_FILE",
+                                os.path.join(tmp, "pending.json"))
+
+            orders.add_pending_order("000001", "旧名", "sell", 100, 10.0,
+                                     "2026-07-28", 0.0)
+            orders.add_pending_order("000001", "新名", "sell", 100, 10.5,
+                                     "2026-07-29", 0.0)
+            pending = orders.load_pending()
+            assert pending[0]["name"] == "新名"
+
+    def test_buy_duplicate_still_keeps_original(self, monkeypatch):
+        """回归: 买入同向仍保留最早 signal_date 和 shares(不更新)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            monkeypatch.setattr(orders, "PENDING_FILE",
+                                os.path.join(tmp, "pending.json"))
+
+            orders.add_pending_order("000001", "测试", "buy", 100, 10.5,
+                                     "2026-07-28", 0.95)
+            orders.add_pending_order("000001", "测试", "buy", 200, 11.0,
+                                     "2026-07-29", 0.95)
+            pending = orders.load_pending()
+            assert len(pending) == 1
+            assert pending[0]["shares"] == 100
+            assert pending[0]["signal_date"] == "2026-07-28"
+            assert pending[0]["signal_price"] == 10.5
+
+    def test_sell_after_buy_replaces(self, monkeypatch):
+        """回归: 已有买入订单时卖出信号应替换(卖出优先级最高)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            monkeypatch.setattr(orders, "PENDING_FILE",
+                                os.path.join(tmp, "pending.json"))
+
+            orders.add_pending_order("000001", "测试", "buy", 100, 10.5,
+                                     "2026-07-28", 0.95)
+            orders.add_pending_order("000001", "测试", "sell", 100, 12.0,
+                                     "2026-07-29", 0.0)
+            pending = orders.load_pending()
+            assert len(pending) == 1
+            assert pending[0]["action"] == "sell"
+
     def test_remove_order(self, monkeypatch):
         with tempfile.TemporaryDirectory() as tmp:
             monkeypatch.setattr(orders, "PENDING_FILE",

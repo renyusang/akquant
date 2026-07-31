@@ -110,8 +110,10 @@ def add_pending_order(
         if action == "buy":
             # 买入保留最早信号日期,不推迟T+1执行
             return
-        # 卖出: 只更新 signal_price, 保留原 signal_date(不推迟执行)
+        # 卖出: 更新 price/shares/name, 保留原 signal_date(不推迟执行)
         existing["signal_price"] = signal_price
+        existing["shares"] = shares
+        existing["name"] = name
         save_pending(orders)
         return
     orders = [o for o in orders if o["symbol"] != key]

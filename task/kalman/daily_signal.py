@@ -285,7 +285,8 @@ def evaluate_stock(
         cash = float(stock.get("cash", params.get("initial_cash", 100000)))
         max_pct = float(params.get("single_position_pct", 0.95))
         target_value = cash * result["target_pct"] * max_pct
-        current_value = pos_info["shares"] * avg_price if pos_info else 0
+        # 当前市值按市价计算(对齐回测 strategy.py),避免浮盈被低估导致补仓过量
+        current_value = pos_info["shares"] * close if pos_info else 0
         if target_value > current_value * 1.05:
             add_value = target_value - current_value
             capped_pct = round(result["target_pct"] * max_pct, 4)
