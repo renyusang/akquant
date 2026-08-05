@@ -1,5 +1,5 @@
 # 研究产物(回测结果 CSV/生成配置, 脚本可重新生成)
-adx_validation_*.csv
+adx_validation*.csv
 oscillation_signals.csv
 volume_signals.csv
 stocks_hs300_*.yaml
