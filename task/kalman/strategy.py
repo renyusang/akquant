@@ -61,6 +61,35 @@ class KalmanStrategy(Strategy):
     )
     max_positions = IntParam(0, ge=0, le=100, title="池内最多持仓数(0=不限)")
     initial_cash = FloatParam(100000.0, ge=0, title="初始资金")
+    adx_filter_enabled = BoolParam(False, title="是否启用ADX趋势状态过滤")
+    adx_filter_threshold = FloatParam(
+        20.0, ge=1.0, le=60.0, title="ADX趋势阈值(低于视为震荡锁定方向)"
+    )
+    adx_filter_period = IntParam(14, ge=2, le=60, title="ADX周期")
+    min_hold_bars = IntParam(
+        0, ge=0, le=60, title="最小持仓K线数(0=禁用。买入后N根内抑制"
+        "价格回归/速度反转卖出,仅止损可卖出,避免震荡期高频磨损)"
+    )
+    rsi_filter_enabled = BoolParam(False, title="RSI追高过滤(超买抑制买入)")
+    rsi_overbought = FloatParam(70.0, ge=50.0, le=95.0, title="RSI超买阈值")
+    bbands_squeeze_enabled = BoolParam(False, title="布林带挤压过滤(蓄势期不买)")
+    bb_squeeze_ratio = FloatParam(
+        0.50, ge=0.10, le=1.00, title="带宽挤压阈值=历史均值×该比值(低于视为蓄势)"
+    )
+    atr_adaptive_exit_enabled = BoolParam(
+        False, title="NATR自适应退出宽度(高波动期放宽回归阈值避免被洗出)"
+    )
+    exit_atr_factor = FloatParam(
+        0.50, ge=0.1, le=3.0, title="退出NATR缩放系数"
+    )
+    sar_exit_enabled = BoolParam(False, title="SAR跟踪止损(持仓期跌破SAR卖出)")
+    sar_af_step = FloatParam(0.02, ge=0.005, le=0.1, title="SAR加速因子步长")
+    sar_af_max = FloatParam(0.20, ge=0.05, le=1.0, title="SAR加速因子上限")
+    mfi_filter_enabled = BoolParam(
+        False, title="MFI超买过滤(量价确认: 资金超买追高抑制买入)"
+    )
+    mfi_overbought = FloatParam(70.0, ge=50.0, le=95.0, title="MFI超买阈值")
+    mfi_period = IntParam(14, ge=5, le=30, title="MFI周期")
 
     # 0.3.20 引擎要求的方法(Python 基类缺失,需子类提供空实现)
     def _flush_pending_order_events(self, *_args: Any, **_kwargs: Any) -> None:
@@ -87,6 +116,22 @@ class KalmanStrategy(Strategy):
         self.single_position_pct = float(p("single_position_pct"))
         self.max_positions = int(p("max_positions"))
         self.initial_cash = float(p("initial_cash"))
+        self.adx_filter_enabled = bool(p("adx_filter_enabled"))
+        self.adx_filter_threshold = float(p("adx_filter_threshold"))
+        self.adx_filter_period = max(2, int(p("adx_filter_period")))
+        self.min_hold_bars = max(0, int(p("min_hold_bars")))
+        self.rsi_filter_enabled = bool(p("rsi_filter_enabled"))
+        self.rsi_overbought = float(p("rsi_overbought"))
+        self.bbands_squeeze_enabled = bool(p("bbands_squeeze_enabled"))
+        self.bb_squeeze_ratio = float(p("bb_squeeze_ratio"))
+        self.atr_adaptive_exit_enabled = bool(p("atr_adaptive_exit_enabled"))
+        self.exit_atr_factor = float(p("exit_atr_factor"))
+        self.sar_exit_enabled = bool(p("sar_exit_enabled"))
+        self.sar_af_step = float(p("sar_af_step"))
+        self.sar_af_max = float(p("sar_af_max"))
+        self.mfi_filter_enabled = bool(p("mfi_filter_enabled"))
+        self.mfi_overbought = float(p("mfi_overbought"))
+        self.mfi_period = max(5, int(p("mfi_period")))
 
         # ---- SignalEngine 实例（按 symbol 管理） ----
         self._engines: Dict[str, SignalEngine] = {}
@@ -95,6 +140,9 @@ class KalmanStrategy(Strategy):
         self._pending_buys: Dict[str, tuple] = {}    # {symbol: (signal_close, target_pct)}
         self._pending_sells: Dict[str, float] = {}   # {symbol: signal_close}
         self._trade_count: int = 0
+        # 最小持仓周期: 记录每标的的入场 bar 序号(加仓不重置)
+        self._bar_count: int = 0
+        self._entry_bars: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # 公开属性（回测后可通过 result.strategy 访问）
@@ -110,7 +158,7 @@ class KalmanStrategy(Strategy):
     def _get_engine(self, symbol: str) -> SignalEngine:
         """获取或创建指定标的的 SignalEngine 实例。"""
         if symbol not in self._engines:
-            self._engines[symbol] = SignalEngine(
+            engine = SignalEngine(
                 kalman_q_price=self.kalman_q_price,
                 kalman_q_vel=self.kalman_q_vel,
                 kalman_r=self.kalman_r,
@@ -123,8 +171,54 @@ class KalmanStrategy(Strategy):
                 trend_confirm_bars=self.trend_filter_confirm_bars,
                 trend_bear_pct=self.trend_bear_position_pct,
                 downtrend_entry=self.downtrend_entry_threshold,
+                adx_filter_enabled=self.adx_filter_enabled,
+                adx_filter_threshold=self.adx_filter_threshold,
+                adx_filter_period=self.adx_filter_period,
+                rsi_filter_enabled=self.rsi_filter_enabled,
+                rsi_overbought=self.rsi_overbought,
+                bbands_squeeze_enabled=self.bbands_squeeze_enabled,
+                bb_squeeze_ratio=self.bb_squeeze_ratio,
+                atr_adaptive_exit_enabled=self.atr_adaptive_exit_enabled,
+                exit_atr_factor=self.exit_atr_factor,
+                sar_exit_enabled=self.sar_exit_enabled,
+                sar_af_step=self.sar_af_step,
+                sar_af_max=self.sar_af_max,
+                mfi_filter_enabled=self.mfi_filter_enabled,
+                mfi_overbought=self.mfi_overbought,
+                mfi_period=self.mfi_period,
             )
+            # 用历史数据预热指标窗口(不含当前 bar,当前 bar 由 update 增量喂入)
+            if (
+                self.adx_filter_enabled
+                or self.rsi_filter_enabled
+                or self.bbands_squeeze_enabled
+                or self.mfi_filter_enabled
+            ):
+                self._warmup_adx(symbol, engine)
+            self._engines[symbol] = engine
         return self._engines[symbol]
+
+    def _warmup_adx(self, symbol: str, engine: SignalEngine) -> None:
+        """用 get_history 预热 ADX 窗口(回测首根 on_bar 即获得正确 ADX)。"""
+        try:
+            n = self.adx_filter_period * 2 + 2
+            hist_h = self.get_history(n + 1, symbol, "high")
+            hist_l = self.get_history(n + 1, symbol, "low")
+            hist_c = self.get_history(n + 1, symbol, "close")
+            # 排除最后一根(当前 bar,由 update 增量喂入)
+            if len(hist_h) >= 2 and len(hist_l) >= 2 and len(hist_c) >= 2:
+                hist_v = None
+                if self.mfi_filter_enabled:
+                    try:
+                        hist_v = self.get_history(n + 1, symbol, "volume")
+                    except Exception:
+                        hist_v = None
+                engine.feed_adx_history(
+                    hist_h[:-1], hist_l[:-1], hist_c[:-1],
+                    volume=hist_v[:-1] if hist_v is not None else None,
+                )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 涨跌停判断(对齐实盘 orders.py,板块识别)
@@ -154,6 +248,7 @@ class KalmanStrategy(Strategy):
         """处理每根 K 线。"""
         symbol: str = bar.symbol
         close_price: float = bar.close
+        self._bar_count += 1
 
         engine = self._get_engine(symbol)
         engine.set_position(
@@ -164,8 +259,11 @@ class KalmanStrategy(Strategy):
         # 计算 MA20
         ma20_cur, ma20_prev = self._calc_ma20(symbol, close_price)
 
-        # 评估信号
-        result = engine.update(close_price, ma20_cur, ma20_prev)
+        # 评估信号(传 high/low 供 ADX 计算)
+        result = engine.update(
+            close_price, ma20_cur, ma20_prev, high=bar.high, low=bar.low,
+            volume=getattr(bar, "volume", None),
+        )
 
         # 交易执行
         pos = float(self.get_position(symbol))
@@ -199,6 +297,7 @@ class KalmanStrategy(Strategy):
                     target_value=self.initial_cash * target_pct,
                 )
                 self._entry_prices[symbol] = close_price
+                self._entry_bars[symbol] = self._bar_count
                 self._trade_count += 1
                 self.log(
                     f"[买入] {bar.timestamp_iso} | "
@@ -221,6 +320,20 @@ class KalmanStrategy(Strategy):
                         f"close¥{close_price:.2f}≤跌停¥{limit_down:.2f}"
                     )
                     return
+                # 最小持仓周期: 买入后 N 根内抑制价格回归/速度反转卖出,
+                # 仅止损可卖出(止损优先级最高,防止小回撤被洗出形成高频磨损)
+                if self.min_hold_bars > 0:
+                    held = self._bar_count - self._entry_bars.get(
+                        symbol, self._bar_count
+                    )
+                    is_stop_loss = "止损" in str(result["reason"])
+                    if held < self.min_hold_bars and not is_stop_loss:
+                        self.log(
+                            f"[持仓保护] {bar.timestamp_iso} {symbol} "
+                            f"持仓{held}根<{self.min_hold_bars}根, 抑制卖出"
+                            f"({result['reason']})"
+                        )
+                        return
                 entry_price = self._entry_prices.get(symbol, close_price)
                 self.close_position(symbol)
                 self._trade_count += 1

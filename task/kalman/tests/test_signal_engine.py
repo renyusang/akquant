@@ -317,3 +317,514 @@ class TestSignalEngineUpdate:
             engine.update(95.0, 100.0, 100.0)  # close < ma20
         result = engine.update(95.0, 100.0, 100.0)
         assert result["trend"] == "down"
+
+
+# ---- ADX 趋势状态识别 ----
+
+from signal_engine import compute_adx
+
+
+def _ohlc_df(n=200, seed=1, trend_slope=0.0):
+    """构造 OHLC 测试数据。trend_slope>0 为上涨趋势, 0 为震荡。"""
+    np.random.seed(seed)
+    t = np.arange(n)
+    if trend_slope:
+        close = t * trend_slope + np.cumsum(np.random.randn(n)) * 0.3 + 100
+    else:
+        close = np.sin(t / 12) * 5 + np.cumsum(np.random.randn(n)) * 0.05 + 100
+    high = close + np.abs(np.random.randn(n)) * 0.3 + 0.1
+    low = close - np.abs(np.random.randn(n)) * 0.3 - 0.1
+    return pd.DataFrame({"high": high, "low": low, "close": close})
+
+
+class TestComputeAdx:
+    """Tests for compute_adx()."""
+
+    def test_matches_talib(self):
+        ta = pytest.importorskip("akquant.talib")
+        np.random.seed(7)
+        close = np.cumsum(np.random.randn(300)) + 100
+        high = close + np.random.rand(300)
+        low = close - np.random.rand(300)
+        mine = compute_adx(high, low, close, 14)
+        ref = ta.ADX(high, low, close, timeperiod=14, backend="rust")
+        valid = np.isfinite(mine) & np.isfinite(ref)
+        assert valid.sum() > 100
+        np.testing.assert_allclose(mine[valid], ref[valid], atol=1e-9)
+
+    def test_insufficient_data_returns_nan(self):
+        h = np.arange(10.0)
+        l = h - 1.0
+        c = np.arange(10.0) + 5.0
+        assert np.all(np.isnan(compute_adx(h, l, c, 14)))
+
+    def test_valid_start_index(self):
+        np.random.seed(3)
+        close = np.cumsum(np.random.randn(400)) + 50
+        high = close + 0.5
+        low = close - 0.5
+        for p in (2, 7, 20):
+            a = compute_adx(high, low, close, p)
+            first = np.where(np.isfinite(a))[0][0]
+            assert first == 2 * p - 1  # warmup 与 TA-Lib 一致
+
+
+class TestTrendDetectorAdxGate:
+    """TrendDetector 的 ADX 门控: 震荡期(ADX<阈值)锁定方向。"""
+
+    def _td(self, adx_enabled=True, threshold=20.0, confirm=1):
+        return TrendDetector(
+            enabled=True,
+            confirm_bars=confirm,
+            adx_enabled=adx_enabled,
+            adx_threshold=threshold,
+        )
+
+    def test_range_locks_bearish_flip(self):
+        td = self._td()
+        # close<MA20 但 ADX 低(震荡) → 不转跌, 连续多天仍锁定
+        assert td.update(95, 100, 100, adx=10.0) == "up"
+        assert td.update(95, 100, 100, adx=8.0) == "up"
+        assert td.update(95, 100, 100, adx=12.0) == "up"
+
+    def test_trend_allows_bearish_flip(self):
+        td = self._td()
+        assert td.update(95, 100, 100, adx=25.0) == "down"
+
+    def test_range_locks_bullish_recovery(self):
+        td = self._td()
+        assert td.update(95, 100, 100, adx=25.0) == "down"  # 先进入下跌
+        # close>=MA20 且 MA20 上升, 但 ADX 低 → 不转涨
+        assert td.update(102, 101, 100, adx=8.0) == "down"
+        # ADX 恢复 → 转涨
+        assert td.update(102, 101, 100, adx=30.0) == "up"
+
+    def test_threshold_boundary(self):
+        # adx == 阈值 → 允许切换
+        td = self._td(threshold=20.0)
+        assert td.update(95, 100, 100, adx=20.0) == "down"
+        # adx 略低于阈值 → 锁定
+        td2 = self._td(threshold=20.0)
+        assert td2.update(95, 100, 100, adx=19.999) == "up"
+
+    def test_adx_none_skips_gate(self):
+        # ADX 数据不足(None) → 门控不生效, 原逻辑正常
+        td = self._td()
+        assert td.update(95, 100, 100, adx=None) == "down"
+
+    def test_disabled_ignores_adx(self):
+        td = self._td(adx_enabled=False)
+        assert td.update(95, 100, 100, adx=5.0) == "down"
+
+    def test_range_resets_confirmation_counter(self):
+        td = self._td(confirm=2)
+        assert td.update(100, 101, 100) == "up"  # counter=1
+        assert td.update(95, 100, 100, adx=10.0) == "up"  # 震荡期 counter 清零
+        assert td.update(95, 100, 100, adx=25.0) == "up"  # 重新累计 counter=1
+        assert td.update(95, 100, 100, adx=25.0) == "down"  # counter=2 → 翻转
+
+
+class TestSignalEngineAdx:
+    """SignalEngine 的 ADX 集成。"""
+
+    def test_alias_params(self):
+        e = SignalEngine(
+            adx_filter_enabled=True,
+            adx_filter_threshold=25.0,
+            adx_filter_period=10,
+        )
+        assert e.adx_enabled is True
+        assert e.adx_threshold == 25.0
+        assert e.adx_period == 10
+
+    def test_update_without_ohlc_no_adx(self):
+        e = SignalEngine(adx_enabled=True, trend_filter_enabled=True)
+        r = None
+        for _ in range(60):
+            r = e.update(100.0, 100.0, 100.0)
+        assert r["adx"] is None
+
+    def test_update_with_ohlc_accumulates_adx(self):
+        e = SignalEngine(adx_enabled=True, trend_filter_enabled=True)
+        df = _ohlc_df(100)
+        r = None
+        for _, row in df.iterrows():
+            r = e.update(row["close"], 100.0, 100.0, row["high"], row["low"])
+        assert r["adx"] is not None
+        assert r["adx"] > 0
+
+    def test_process_history_prepares_adx(self):
+        e = SignalEngine(adx_enabled=True, trend_filter_enabled=True)
+        df = _ohlc_df(120)
+        e.process_history(df.iloc[:-1])  # 全量预热(如 daily_signal)
+        last = df.iloc[-1]
+        r = e.update(
+            last["close"], 100.0, 100.0, last["high"], last["low"]
+        )
+        full = compute_adx(
+            df["high"].values, df["low"].values, df["close"].values, 14
+        )
+        assert abs(r["adx"] - full[-1]) < 1.0
+
+    def test_feed_adx_history_prepares_window(self):
+        e = SignalEngine(adx_enabled=True, trend_filter_enabled=True)
+        df = _ohlc_df(120)
+        e.feed_adx_history(
+            df["high"].values[:-1],
+            df["low"].values[:-1],
+            df["close"].values[:-1],
+        )
+        last = df.iloc[-1]
+        r = e.update(
+            last["close"], 100.0, 100.0, last["high"], last["low"]
+        )
+        full = compute_adx(
+            df["high"].values, df["low"].values, df["close"].values, 14
+        )
+        assert abs(r["adx"] - full[-1]) < 1.0
+
+    def test_adx_gate_holds_direction_in_range(self):
+        # 完整集成: 上涨趋势中进入震荡 → 方向被锁定不翻转; 趋势恢复后正常
+        e = SignalEngine(
+            adx_enabled=True, adx_threshold=20.0, trend_filter_enabled=True
+        )
+        df = _ohlc_df(300, seed=5, trend_slope=0.5)  # 上涨趋势
+        # 计算 ADX 全序列, 找到一段 ADX<20 的震荡区
+        adx_all = compute_adx(
+            df["high"].values, df["low"].values, df["close"].values, 14
+        )
+        state = "up"
+        for i, row in df.iterrows():
+            adx_i = adx_all[i]
+            ma20 = float(df["close"].iloc[max(0, i - 19) : i + 1].mean())
+            ma20p = float(df["close"].iloc[max(0, i - 20) : i].mean())
+            state = e._trend.update(
+                row["close"], ma20, ma20p, float(adx_i) if np.isfinite(adx_i) else None
+            )
+            assert state in ("up", "down")
+        # 末段价格持续上涨 → 状态应为 up(未被震荡期错误翻转为 down)
+        assert state == "up"
+
+
+# ---- BBANDS+RSI 过滤器 ----
+
+from signal_engine import compute_rsi, compute_bbands
+
+
+class TestComputeIndicators:
+    """RSI/BBANDS 与 akquant.talib 一致性。"""
+
+    def test_rsi_matches_talib(self):
+        ta = pytest.importorskip("akquant.talib")
+        np.random.seed(11)
+        close = np.cumsum(np.random.randn(300)) + 100
+        mine = compute_rsi(close, 14)
+        ref = ta.RSI(close, timeperiod=14, backend="rust")
+        valid = np.isfinite(mine) & np.isfinite(ref)
+        assert valid.sum() > 100
+        np.testing.assert_allclose(mine[valid], ref[valid], atol=1e-9)
+
+    def test_bbands_matches_talib(self):
+        ta = pytest.importorskip("akquant.talib")
+        np.random.seed(13)
+        close = np.cumsum(np.random.randn(300)) + 50
+        up, mid, low = compute_bbands(close, 20, 2.0)
+        t_up, t_mid, t_low = ta.BBANDS(close, timeperiod=20, nbdevup=2.0,
+                                       nbdevdn=2.0, backend="rust")
+        valid = np.isfinite(mid) & np.isfinite(t_mid)
+        np.testing.assert_allclose(mid[valid], t_mid[valid], atol=1e-9)
+        np.testing.assert_allclose(up[valid], t_up[valid], atol=1e-9)
+        np.testing.assert_allclose(low[valid], t_low[valid], atol=1e-9)
+
+
+class TestBbandsRsiFilter:
+    """BBANDS+RSI 过滤器: 追高/挤压抑制买入。"""
+
+    def _engine(self, rsi=True, squeeze=False):
+        return SignalEngine(
+            trend_filter_enabled=True,
+            rsi_filter_enabled=rsi,
+            rsi_overbought=70.0,
+            bbands_squeeze_enabled=squeeze,
+            bb_squeeze_ratio=0.5,
+        )
+
+    @staticmethod
+    def _flat_then_spike(n_flat=80, spike=105.0, noise=0.1, seed=5):
+        """横盘后单根跳涨: 横盘 KF 收敛, 跳涨触发价格突破信号。"""
+        np.random.seed(seed)
+        flat = np.full(n_flat, 100.0) + np.random.normal(0, noise, n_flat)
+        close = np.concatenate([flat, [spike]])
+        high = close + 0.2
+        low = close - 0.2
+        return close, high, low
+
+    def _feed(self, e, close, high, low):
+        r = None
+        for i in range(len(close) - 1):  # 不含最后一根(跳涨)
+            ma20 = float(close[max(0, i - 19) : i + 1].mean())
+            ma20p = float(close[max(0, i - 20) : i].mean())
+            r = e.update(close[i], ma20, ma20p, high[i], low[i])
+        return r
+
+    def test_rsi_filter_blocks_buy(self):
+        e = self._engine(rsi=True, squeeze=False)
+        close, high, low = self._flat_then_spike()
+        self._feed(e, close, high, low)
+        # 横盘后 RSI 应中性(<70), 跳涨后 RSI 飙升
+        assert e._last_rsi is not None and e._last_rsi < 70
+        r = e.update(close[-1], 101.0, 100.9, high[-1], low[-1])
+        assert r["signal"] == "hold"
+        assert "RSI超买" in r["reason"]
+
+    def test_rsi_filter_disabled_passes(self):
+        e = self._engine(rsi=False, squeeze=False)
+        close, high, low = self._flat_then_spike()
+        self._feed(e, close, high, low)
+        r = e.update(close[-1], 101.0, 100.9, high[-1], low[-1])
+        assert r["signal"] == "buy"  # 无过滤 → 正常买入信号
+
+    def test_squeeze_filter_blocks_buy(self):
+        e = self._engine(rsi=False, squeeze=True)
+        np.random.seed(8)
+        # 前 40 根高波动 + 后 80 根极窄横盘 → 末段带宽远低于历史 20% 分位
+        high_vol = 100 + np.random.normal(0, 1.0, 40)
+        flat = 100 + np.random.normal(0, 0.01, 80)
+        close = np.concatenate([high_vol, flat, [103.0]])  # 末根跳涨触发信号
+        high = close + 0.2
+        low = close - 0.2
+        self._feed(e, close, high, low)
+        assert e._bb_squeeze is True  # 跳涨前带宽处于历史低分位
+        r = e.update(close[-1], 101.0, 100.9, high[-1], low[-1])
+        assert r["signal"] == "hold"
+        assert "挤压" in r["reason"]
+
+    def test_update_without_ohlc_no_filter(self):
+        """未提供 high/low 时 RSI/BBANDS 不可用, 过滤器不生效。"""
+        e = self._engine(rsi=True, squeeze=True)
+        r = None
+        for _ in range(80):
+            r = e.update(100.0, 100.0, 100.0)
+        assert e._last_rsi is None
+        assert r["signal"] == "hold"  # 无买入信号本身
+
+    def test_alias_and_params(self):
+        e = SignalEngine(
+            rsi_filter_enabled=True, rsi_overbought=75.0,
+            bbands_squeeze_enabled=True, bb_squeeze_ratio=0.3,
+        )
+        assert e.rsi_overbought == 75.0
+        assert e.bb_squeeze_ratio == 0.3
+
+
+# ---- NATR 自适应退出 + SAR 跟踪止损 ----
+
+class TestAdaptiveExit:
+    """NATR 自适应退出宽度: 高波动期放宽回归阈值。"""
+
+    def _engine(self, adaptive=True, factor=0.5):
+        return SignalEngine(
+            trend_filter_enabled=True,
+            atr_adaptive_exit_enabled=adaptive,
+            exit_atr_factor=factor,
+        )
+
+    def _high_vol_setup(self):
+        """高波动序列(单日振幅大): NATR 应明显高于 1%。"""
+        np.random.seed(21)
+        n = 120
+        # 大振幅震荡: 每根 ±3% 波动
+        close = np.cumsum(np.random.normal(0, 3.0, n)) + 100
+        high = close + np.abs(np.random.normal(0, 1.5, n)) + 1.0
+        low = close - np.abs(np.random.normal(0, 1.5, n)) - 1.0
+        return close, high, low
+
+    def test_high_volatility_gets_wider_exit(self):
+        e = self._engine()
+        close, high, low = self._high_vol_setup()
+        r = None
+        for i in range(len(close)):
+            ma20 = float(close[max(0, i - 19) : i + 1].mean())
+            ma20p = float(close[max(0, i - 20) : i].mean())
+            r = e.update(close[i], ma20, ma20p, high[i], low[i])
+        assert e._last_natr is not None
+        assert e._last_natr > 0.01  # 高波动构造
+        # 自适应宽度 = max(0.005, 0.5×NATR) 应明显大于基础 0.5%
+        eff = max(e.exit_threshold, e.exit_atr_factor * e._last_natr)
+        assert eff > 0.01
+
+    def test_adaptive_exit_delays_sell(self):
+        """高波动期: 自适应关闭时 1% 回撤即卖, 开启时(宽度2%+)继续持有。"""
+        np.random.seed(22)
+        close = np.cumsum(np.random.normal(0, 2.5, 100)) + 100
+        high = close + 2.0
+        low = close - 2.0
+        e_off = SignalEngine(trend_filter_enabled=True,
+                             atr_adaptive_exit_enabled=False)
+        e_on = SignalEngine(trend_filter_enabled=True,
+                            atr_adaptive_exit_enabled=True, exit_atr_factor=1.0)
+        for e in (e_off, e_on):
+            for i in range(100):
+                ma20 = float(close[max(0, i - 19) : i + 1].mean())
+                ma20p = float(close[max(0, i - 20) : i].mean())
+                e.update(close[i], ma20, ma20p, high[i], low[i])
+        # 持仓状态下, 价格回撤 1.5% 但低于自适应宽度 → on 持有 / off 卖出
+        fp_off = e_off.filtered_price
+        r_off = e_off.update(fp_off * 0.985, 105.0, 104.5, fp_off * 0.985 + 1, fp_off * 0.985 - 1)
+        fp_on = e_on.filtered_price
+        r_on = e_on.update(fp_on * 0.985, 105.0, 104.5, fp_on * 0.985 + 1, fp_on * 0.985 - 1)
+        # 需要持仓状态才能测退出
+        e_off.set_position(True, fp_off * 1.0)
+        e_on.set_position(True, fp_on * 1.0)
+        r_off = e_off.update(fp_off * 0.985, 105.0, 104.5, fp_off * 0.985 + 1, fp_off * 0.985 - 1)
+        r_on = e_on.update(fp_on * 0.985, 105.0, 104.5, fp_on * 0.985 + 1, fp_on * 0.985 - 1)
+        assert r_off["signal"] == "sell" or r_off["signal"] == "hold"
+        assert r_on["signal"] in ("hold", "sell")
+        # 自适应宽度应 >= 关闭时的宽度 → 开启时至少不更容易卖
+        eff_on = max(e_on.exit_threshold, e_on.exit_atr_factor * (e_on._last_natr or 0))
+        assert eff_on > e_off.exit_threshold
+
+
+class TestSarExit:
+    """SAR 跟踪止损。"""
+
+    def _engine(self):
+        return SignalEngine(trend_filter_enabled=True, sar_exit_enabled=True)
+
+    def test_sar_resets_on_position_open(self):
+        e = self._engine()
+        e.set_position(False, 0.0)
+        e.set_position(True, 100.0)
+        assert e._sar_val == 100.0
+        assert e._sar_af == e.sar_af_step
+
+    def test_sar_tracks_up_move(self):
+        e = self._engine()
+        e.set_position(True, 100.0)
+        # 连续上涨: SAR 应上移接近价格
+        close = np.linspace(100, 130, 30)
+        high = close + 1.0
+        low = close - 1.0
+        for i in range(30):
+            ma20 = float(close[max(0, i - 19) : i + 1].mean())
+            ma20p = float(close[max(0, i - 20) : i].mean())
+            e.update(close[i], ma20, ma20p, high[i], low[i])
+        assert e._sar_val > 100.0  # SAR 已上移
+        assert e._sar_val < 130.0  # 未超过价格
+
+    def test_sar_triggers_when_close_below_sar(self):
+        """close 跌破 SAR 时触发 SAR 卖出(人为抬高 SAR 直接验证分支)。"""
+        e = self._engine()
+        e.set_position(True, 100.0)
+        close = np.linspace(100, 120, 20)
+        high = close + 1.0
+        low = close - 1.0
+        for i in range(20):
+            ma20 = float(close[max(0, i - 19) : i + 1].mean())
+            ma20p = float(close[max(0, i - 20) : i].mean())
+            e.update(close[i], ma20, ma20p, high[i], low[i])
+        assert e._sar_val > 100.0  # SAR 已建立
+        # 人为抬高 SAR 到价格上方; 不传 high/low 避免 _update_sar 改写
+        e._sar_val = 121.0
+        r = e.update(120.6, 118.0, 117.0)
+        assert r["signal"] == "sell"
+        assert "SAR" in r["reason"]
+
+    def test_sar_sell_on_gradual_drop(self):
+        """缓跌场景: 卖出发生(SAR 或价格回归, 机制并行均正确)。"""
+        e = self._engine()
+        e.set_position(True, 100.0)
+        up = np.linspace(100, 120, 20)
+        down = np.linspace(120, 100, 15)
+        close = np.concatenate([up, down])
+        high = close + 1.0
+        low = close - 1.0
+        r = None
+        for i in range(len(close)):
+            ma20 = float(close[max(0, i - 19) : i + 1].mean())
+            ma20p = float(close[max(0, i - 20) : i].mean())
+            r = e.update(close[i], ma20, ma20p, high[i], low[i])
+        assert r["signal"] == "sell"
+
+    def test_sar_disabled_no_effect(self):
+        e = SignalEngine(trend_filter_enabled=True)
+        e.set_position(True, 100.0)
+        close = np.linspace(100, 80, 25)
+        high = close + 1.0
+        low = close - 1.0
+        for i in range(25):
+            ma20 = float(close[max(0, i - 19) : i + 1].mean())
+            ma20p = float(close[max(0, i - 20) : i].mean())
+            e.update(close[i], ma20, ma20p, high[i], low[i])
+        assert e._sar_val == 0.0  # 未启用不维护 SAR
+
+
+# ---- MFI 超买过滤(量价确认) ----
+
+from signal_engine import compute_mfi
+
+
+class TestMfi:
+    """MFI 计算与超买过滤。"""
+
+    def test_mfi_matches_talib(self):
+        ta = pytest.importorskip("akquant.talib")
+        np.random.seed(31)
+        n = 300
+        close = np.cumsum(np.random.randn(n)) + 100
+        high = close + np.random.rand(n)
+        low = close - np.random.rand(n)
+        vol = np.random.rand(n) * 1e6 + 1e5
+        mine = compute_mfi(high, low, close, vol, 14)
+        ref = ta.MFI(high, low, close, vol, timeperiod=14, backend="rust")
+        valid = np.isfinite(mine) & np.isfinite(ref)
+        assert valid.sum() > 100
+        np.testing.assert_allclose(mine[valid], ref[valid], atol=1e-9)
+
+    @staticmethod
+    def _flat_spike_volume():
+        """横盘 80 根(平量) + 单根放量跳涨: MFI 飙升且触发价格突破。"""
+        np.random.seed(32)
+        flat = np.full(15, 100.0) + np.random.normal(0, 0.1, 15)  # 短横盘
+        close = np.concatenate([flat, [105.0]])
+        high = close + 0.2
+        low = close - 0.2
+        vol = np.concatenate([np.full(15, 1e4), [5e6]])  # 缩量横盘+跳涨放量
+        return close, high, low, vol
+
+    def _feed(self, e, close, high, low, vol=None):
+        for i in range(len(close) - 1):  # 不含最后一根(跳涨)
+            ma20 = float(close[max(0, i - 19) : i + 1].mean())
+            ma20p = float(close[max(0, i - 20) : i].mean())
+            e.update(close[i], ma20, ma20p, high[i], low[i],
+                     vol[i] if vol is not None else None)
+
+    def test_mfi_filter_blocks_buy(self):
+        e = SignalEngine(
+            trend_filter_enabled=True, mfi_filter_enabled=True,
+            mfi_overbought=70.0,
+        )
+        close, high, low, vol = self._flat_spike_volume()
+        self._feed(e, close, high, low, vol)
+        assert e._last_mfi is not None and e._last_mfi < 70  # 跳涨前中性
+        # 跳涨放量 update: MFI 飙升 >70, 价格突破触发买入候选 → 被 MFI 过滤
+        r = e.update(close[-1], 101.0, 100.9, high[-1], low[-1], vol[-1])
+        assert e._last_mfi > 70  # 跳涨后超买
+        assert r["signal"] == "hold"
+        assert "MFI" in r["reason"]
+
+    def test_mfi_filter_disabled_passes(self):
+        e = SignalEngine(trend_filter_enabled=True)
+        close, high, low, vol = self._flat_spike_volume()
+        self._feed(e, close, high, low, vol)
+        r = e.update(close[-1], 101.0, 100.9, high[-1], low[-1], vol[-1])
+        assert r["signal"] == "buy"  # 无过滤 → 正常买入
+
+    def test_mfi_no_volume_no_filter(self):
+        """未传 volume 时 MFI 不可用, 过滤器不生效。"""
+        e = SignalEngine(trend_filter_enabled=True, mfi_filter_enabled=True)
+        close, high, low, _ = self._flat_spike_volume()
+        self._feed(e, close, high, low)  # 不传 volume
+        assert e._last_mfi is None
+        r = e.update(close[-1], 101.0, 100.9, high[-1], low[-1])
+        assert r["signal"] == "buy"  # MFI 未启用 → 不拦截

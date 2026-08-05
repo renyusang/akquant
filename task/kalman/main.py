@@ -313,6 +313,44 @@ def parse_args() -> argparse.Namespace:
         default=0.03,
         help="下跌趋势中买入所需的价格偏离阈值（默认: 0.03 = 3%%。正常为 2%%）",
     )
+    trend_group.add_argument(
+        "--adx-filter",
+        action="store_true",
+        default=False,
+        help="启用 ADX 趋势状态过滤（ADX < 阈值时锁定趋势方向,防止震荡期信号抖动）",
+    )
+    trend_group.add_argument(
+        "--adx-threshold",
+        type=float,
+        default=20.0,
+        help="ADX 趋势阈值（默认: 20.0。低于视为震荡,25 更严格）",
+    )
+    trend_group.add_argument(
+        "--adx-period",
+        type=int,
+        default=14,
+        help="ADX 计算周期（默认: 14）",
+    )
+    trend_group.add_argument(
+        "--min-hold",
+        type=int,
+        default=0,
+        help="最小持仓K线数（默认: 0=禁用。买入后N根内抑制价格回归/"
+        "速度反转卖出,仅止损可卖,避免震荡期高频磨损）",
+    )
+    trend_group.add_argument(
+        "--atr-adaptive-exit",
+        action="store_true",
+        default=False,
+        help="启用 NATR 自适应退出宽度（退出阈值=max(exit_threshold, "
+        "factor×NATR), 高波动期放宽避免被洗出。全池+组合验证最优）",
+    )
+    trend_group.add_argument(
+        "--exit-atr-factor",
+        type=float,
+        default=1.0,
+        help="退出NATR缩放系数（默认: 1.0）",
+    )
 
     parser.add_argument(
         "--portfolio",
@@ -348,6 +386,12 @@ def _resolve_strategy_params(args: argparse.Namespace) -> Dict[str, Any]:
         "trend_filter_confirm_bars": args.trend_confirm,
         "trend_bear_position_pct": args.trend_bear_pct,
         "downtrend_entry_threshold": args.downtrend_entry,
+        "adx_filter_enabled": args.adx_filter,
+        "adx_filter_threshold": args.adx_threshold,
+        "adx_filter_period": args.adx_period,
+        "min_hold_bars": args.min_hold,
+        "atr_adaptive_exit_enabled": args.atr_adaptive_exit,
+        "exit_atr_factor": args.exit_atr_factor,
     }
 
     # 确定 CSV 路径
