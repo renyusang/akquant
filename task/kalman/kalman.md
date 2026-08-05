@@ -240,6 +240,12 @@ strategy:                     # 共享策略参数
   trend_confirm_bars: 1
   trend_bear_pct: 0.30
   downtrend_entry: 0.03
+  adx_filter_enabled: false   # ADX 趋势状态门控(2026-08-02新增,全池验证无增益)
+  adx_filter_threshold: 20.0  # ADX<阈值视为震荡,锁定趋势方向(25 更严格)
+  adx_filter_period: 14       # ADX 计算周期
+  atr_adaptive_exit_enabled: true   # NATR自适应退出宽度(2026-08-04,默认启用)
+  exit_atr_factor: 1.0              # 退出阈值=max(0.5%, 1.0×NATR),高波动期放宽
+  sar_exit_enabled: false           # SAR跟踪止损(实证无效:0.5%回归先触发)
 
 stock:                        # 股票池
   initial_cash: 200000
@@ -304,6 +310,7 @@ python manage.py rollback 20260723_200000
 python main.py --symbol 002594
 python main.py --symbol 600519 --start 20200101 --end 20251231
 python main.py --symbol 002594 --trend-filter          # 启用趋势过滤
+python main.py --symbol 002594 --atr-adaptive-exit     # NATR自适应退出宽度(实盘默认启用,回测需显式开启)
 
 # 滚动窗口回测
 python main.py --symbol 002594 --walk-forward
@@ -542,6 +549,10 @@ bash run_daily.sh                  # crontab 已默认开启 --deploy
 10. **真实成交价回填**：人工实际下单后,用 `manage.py fill <symbol> <buy|sell> <shares> <price>` 记录实际价,`daily_signal` 下次执行时优先用此价(而非开盘价假设),使 `avg_cost`/`pnl` 反映真实成交。
 11. **warmup 预热**：已设 `warmup_bars=40`,0.3.20 的 warmup 机制已完善,前40 bar 不调 on_bar。
 12. **手续费**:回测(`run_backtest` 传 commission_rate=0.0003 / stamp_tax_rate=0.001 / transfer_fee_rate=0.00001 / min_commission=5.0)+ 实盘(`portfolio.calc_fee` 计算,`daily_signal` 买入 avg_cost 含费 / 卖出 pnl 减费)。A股:佣金万3双边最低5元、印花税千1仅卖出、过户费万0.1双边。
+13. **ADX 趋势状态门控**:`adx_filter_enabled` 启用后,ADX<阈值视为震荡期,`TrendDetector` 锁定趋势方向(不翻转、确认计数清零),防止震荡期 MA20 方向抖动。**全池验证(2026-08-02, HS300 288 只)**:门控无系统增益——配对胜率 45%、收益差中位数 -0.86pp(接近随机);效果与股票基线特征强相关(相关 -0.58):基线亏损股 56% 改善(均值 +14pp),强势/大牛股 65-87% 恶化;低频交易股(≤30笔)大幅恶化(-32.5pp);ADX≥25 系统性有害(-7.6pp)。**建议不作为全局开关**;若用,仅对"基线回测亏损"的股票启用。验证脚本 `task/select/validate_adx.py`。
+14. **震荡期与高频买卖研究(2026-08-03)**:全池信号实证——买入信号质量与 ADX/ER/带宽/NATR 分桶无关(亏损率 47-52% 无差异),"识别震荡期"路线证伪;48.7% 的交易 5 根内快速反转(往返 -3.07%、亏损率 81.7%),贡献 74.9% 总亏损;摩擦成本约 3.5-6pp。ADX 门控/min_hold/exit 放宽均无系统性增益。**BBANDS 挤压过滤**(`bbands_squeeze_enabled`, 带宽<历史均值×0.5 抑制买入)是唯一收益方向一致的机制:单标的全池均值 +2.4pp、中位 -1.4%、夏普中位 0.066;阈值敏感性:0.5 最优(0.3 不触发/0.7 过度抑制,非单调排除过拟合)。**但 HS300 实盘池组合回测(500k/10只/10%):收益 +8pp 但回撤 -18.7%→-23.4%、夏普 1.13→1.10,风险调整后不占优**。**建议默认关闭**,可选启用需接受回撤放大。综合结论:震荡期防高频买卖的结构性改进空间有限,更根本方向是退出机制(ATR 自适应宽度)。研究脚本 `task/select/study_oscillation.py`、`task/select/validate_adx.py`、`task/select/compare_portfolio_squeeze.py`。
+15. **NATR 自适应退出宽度(2026-08-04, 已纳入实盘默认配置)**:`atr_adaptive_exit_enabled=true, exit_atr_factor=1.0`——退出阈值 = max(0.5%, 1.0×NATR),高波动期放宽避免被洗出。实证:快速反转亏损随 NATR 单调加深(-1.42%→-4.73%),0.5% 固定阈值在高波动期过紧。**全池(288只):收益均值 +8.5pp、中位数转正 +1.95%(唯一)、夏普中位 0.106、收益差中位 +0.68pp(唯一全正);组合(HS300实盘池):收益 +14.1pp、交易次数 -45%(4502→2481)、回撤 -18.7%→-18.1% 略改善**。代价:单标的全池回撤中位 +5.7pp(组合层不明显)。**已写入 stocks.yaml / stocks_hs300.yaml 默认启用**(SAR 保持关闭);回测 CLI: `--atr-adaptive-exit --exit-atr-factor 1.0`。**SAR 跟踪止损(`sar_exit_enabled`)完全无效(288只全持平)——0.5% 价格回归总是先触发,SAR 被罩住;除非关闭价格回归信号,否则无独立价值**。研究脚本 `task/select/validate_adx.py`、`task/select/compare_portfolio_squeeze.py`。
+16. **量价确认研究:MFI 超买过滤(2026-08-05, 默认关闭)**:`mfi_filter_enabled`(MFI>70 抑制买入, `update` 新增 volume 参数)。实证:MFI>70 时买入信号快速反转率 71.6%(vs MFI<30 时 16.7%),资金超买追高质量最差。**单标的全池有效**(回撤最低 25.7%、收益差中位 +0.72pp, 与 atr 组合后均值 +21.8pp), **但组合实盘池有害**(收益 -23.2pp)——组合 max_positions 限制下被过滤信号换成其他标的, 而 MFI>70 恰是趋势最强阶段, 过滤掉组合右尾收益。**与 BBANDS 挤压过滤同模式: 单标的有效、组合负效果, 不纳入实盘默认配置**。四象限研究至此全部完成(趋势/震荡/风控/量价确认), 实盘仅落地 NATR 自适应退出。
 
 ---
 

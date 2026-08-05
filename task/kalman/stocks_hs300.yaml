@@ -11,6 +11,9 @@ strategy:
   trend_confirm_bars: 1
   trend_bear_pct: 0.3
   downtrend_entry: 0.03
+  atr_adaptive_exit_enabled: true   # NATR自适应退出宽度(2026-08-04, 全池+组合验证最优)
+  exit_atr_factor: 1.0          # 退出阈值=max(0.5%, 1.0×NATR), 高波动期放宽避免被洗出
+  sar_exit_enabled: false       # SAR跟踪止损(实证无效: 0.5%回归先触发, 保持关闭)
 stock:
   initial_cash: 500000
   max_positions: 10
