@@ -34,7 +34,8 @@ def _make_engine_factory(signal: str, target_pct: float):
         def process_history(self, df):
             pass
 
-        def update(self, close, ma20_cur, ma20_prev):
+        def update(self, close, ma20_cur, ma20_prev, high=None, low=None,
+                   volume=None):
             self._close = close
             return {
                 "signal": signal,
@@ -44,6 +45,7 @@ def _make_engine_factory(signal: str, target_pct: float):
                 "ma20": ma20_cur,
                 "ma20_rising": True,
                 "trend": "up",
+                "adx": None,
                 "close": close,
                 "reason": "test",
             }
@@ -361,3 +363,135 @@ class TestAddPositionCash:
             df = _make_df(50.0)
             expected_date = str(df["date"].iloc[-1])[:10]
             assert pending[0]["signal_date"] == expected_date
+
+
+# ---------------------------------------------------------------------------
+# 卖出成交后自动补仓(2026-08-05 改进: 无条件调用, 池内空位判断)
+# ---------------------------------------------------------------------------
+class TestAutoFillAfterSell:
+    """卖出成交空出仓位后, 用被跳过候选立即补仓。"""
+
+    def _setup(self, monkeypatch, tmp_path, positions, pending):
+        """初始化临时状态文件。"""
+        import json
+        import portfolio
+
+        pos_file = tmp_path / "positions.json"
+        pos_file.write_text(json.dumps(positions), encoding="utf-8")
+        pend_file = tmp_path / "pending_orders.json"
+        pend_file.write_text(json.dumps(pending), encoding="utf-8")
+
+        monkeypatch.setattr(portfolio, "POSITIONS_FILE", str(pos_file))
+        monkeypatch.setattr(portfolio, "TRADES_FILE",
+                            str(tmp_path / "trades.csv"))
+        monkeypatch.setattr(orders, "PENDING_FILE", str(pend_file))
+        # 缓存目录指向不存在 → 跳过涨停检查
+        monkeypatch.setattr(daily_signal, "CACHE_DIR",
+                            str(tmp_path / "no_cache"))
+        return portfolio
+
+    @staticmethod
+    def _defu_skipped():
+        """德福科技被跳过信号——与 evaluate_stock 真实输出一致:
+        target_pct 被清零(显示用), 原始仓位保留在 _target_pct。"""
+        return {
+            "symbol": "301511", "name": "德福科技", "close": 68.71,
+            "kalman_price": 58.66, "target_pct": 0.0, "_target_pct": 0.30,
+            "trend": "down", "date": "2026-08-04",
+            "reason": "价格突破(偏离17.1%)",
+        }
+
+    def _stock_positions(self, with_jushi=True):
+        pos = {
+            "001270": {"name": "铖昌科技", "shares": 100, "avg_cost": 92.0},
+            "002192": {"name": "融捷股份", "shares": 100, "avg_cost": 62.86},
+            "002460": {"name": "赣锋锂业", "shares": 200, "avg_cost": 50.0},
+            "300750": {"name": "宁德时代", "shares": 100, "avg_cost": 372.67},
+        }
+        if with_jushi:
+            pos["600176"] = {"name": "中国巨石", "shares": 300,
+                             "avg_cost": 38.007}
+        return pos
+
+    def test_fill_after_sell_frees_slot(self, monkeypatch, tmp_path):
+        """8-4 场景: 巨石卖出成交 → 股票池空位 → 德福立即补入。"""
+        portfolio = self._setup(
+            monkeypatch, tmp_path, self._stock_positions(True),
+            [{"symbol": "600176", "action": "sell", "shares": 300}],
+        )
+        # 模拟执行卖出成交
+        portfolio.remove_position("600176")
+        positions_now = portfolio.load_positions()
+        # 触发补仓(新逻辑: 无条件调用)
+        config = daily_signal.load_config()
+        filled = daily_signal._auto_fill_pool(
+            [self._defu_skipped()], 10, positions_now, config,
+            "stock", "股票", ("51", "15", "58", "56"), quiet=True,
+        )
+        assert filled == 1
+        pending = orders.load_pending()
+        assert any(o["symbol"] == "301511" and o["action"] == "buy"
+                   for o in pending)
+
+    def test_no_fill_when_pool_full(self, monkeypatch, tmp_path):
+        """池满(5/5) → 无空位 → 不补。"""
+        portfolio = self._setup(
+            monkeypatch, tmp_path, self._stock_positions(True), [],
+        )
+        positions_now = portfolio.load_positions()  # 含巨石 = 5 只
+        config = daily_signal.load_config()
+        filled = daily_signal._auto_fill_pool(
+            [self._defu_skipped()], 10, positions_now, config,
+            "stock", "股票", ("51", "15", "58", "56"), quiet=True,
+        )
+        assert filled == 0
+        assert not any(o.get("symbol") == "301511"
+                       for o in orders.load_pending())
+
+    def test_no_fill_without_skipped_candidates(self, monkeypatch, tmp_path):
+        """无被跳过候选 → 不补。"""
+        portfolio = self._setup(
+            monkeypatch, tmp_path, self._stock_positions(True), [],
+        )
+        portfolio.remove_position("600176")
+        config = daily_signal.load_config()
+        filled = daily_signal._auto_fill_pool(
+            [], 10, portfolio.load_positions(), config,
+            "stock", "股票", ("51", "15", "58", "56"), quiet=True,
+        )
+        assert filled == 0
+
+    def test_no_duplicate_when_pending_buy_exists(self, monkeypatch, tmp_path):
+        """德福已有待买订单 → 不重复补(池内空位扣除待买)。"""
+        portfolio = self._setup(
+            monkeypatch, tmp_path, self._stock_positions(False),
+            [{"symbol": "301511", "action": "buy", "shares": 100}],
+        )
+        config = daily_signal.load_config()
+        filled = daily_signal._auto_fill_pool(
+            [self._defu_skipped()], 10, portfolio.load_positions(), config,
+            "stock", "股票", ("51", "15", "58", "56"), quiet=True,
+        )
+        assert filled == 0  # 待买已占位, 不重复下单
+        buys = [o for o in orders.load_pending()
+                if o.get("action") == "buy"]
+        assert len(buys) == 1
+
+    def test_fill_with_zeroed_target_pct(self, monkeypatch, tmp_path):
+        """核心回归(2026-08-05): 跳过时 target_pct 清零但 _target_pct 保留
+        → 补仓按原始仓位计算股数, 而非 0 股静默跳过。"""
+        portfolio = self._setup(
+            monkeypatch, tmp_path, self._stock_positions(True), [],
+        )
+        portfolio.remove_position("600176")
+        config = daily_signal.load_config()
+        # 旧 bug: 无 _target_pct 时 target_pct=0 → 0股跳过
+        filled_old = daily_signal._auto_fill_pool(
+            [self._defu_skipped()], 10, portfolio.load_positions(), config,
+            "stock", "股票", ("51", "15", "58", "56"), quiet=True,
+        )
+        assert filled_old == 1  # 修复后按 _target_pct=0.30 → 100股
+        pending = orders.load_pending()
+        defu = next(o for o in pending if o["symbol"] == "301511")
+        assert defu["shares"] == 100
+        assert defu["target_pct"] == pytest.approx(0.06)  # 0.30×0.20

@@ -190,7 +190,11 @@ def evaluate_stock(
     ma20_cur = float(df["close"].iloc[-20:].mean())
     ma20_prev = float(df["close"].iloc[-21:-1].mean()) if len(df) >= 21 else ma20_cur
 
-    result = engine.update(close, ma20_cur, ma20_prev)
+    result = engine.update(
+        close, ma20_cur, ma20_prev, high=float(last["high"]),
+        low=float(last["low"]),
+        volume=float(last["volume"]) if "volume" in last.index else None,
+    )
 
     result["symbol"] = symbol
     result["name"] = name
@@ -230,6 +234,9 @@ def evaluate_stock(
                 if max_pos > 0 and current_count >= max_pos:
                     buy_reason = result.get("reason", "")
                     result["signal"] = "hold"
+                    # 保留原始目标仓位供补仓使用(2026-08-05修复:
+                    # 原清零导致 _auto_fill_pool 按 0 计算股数, 候选永远无法补入)
+                    result["_target_pct"] = result.get("target_pct", 0.95)
                     result["target_pct"] = 0.0
                     reason = f"已达最大持仓数({max_pos})"
                     result["reason"] = reason
@@ -561,10 +568,16 @@ def main() -> None:
             )
 
     # 仓位空出时自动买入最强信号（分池独立处理）
+    # 改进(2026-08-05): 不再依赖 freed>0 总持仓变化判断——分池空位由
+    # _auto_fill_pool 内部按 max_pos - 池持仓 - 池待买 计算,
+    # 无条件调用保证"卖出成交后立即补仓"可靠触发(8-4 曾因触发条件未满足漏补)。
     positions_now_all = load_positions()
     positions_now = len(positions_now_all)
     freed = positions_before - positions_now
-    if freed > 0 and skipped_buys:
+    if not args.quiet and (freed > 0 or skipped_buys):
+        print(f"\n  🔄 补仓检查: 总持仓 {positions_before}→{positions_now} "
+              f"(释放 {freed}), 被跳过候选 {len(skipped_buys)} 笔")
+    if skipped_buys:
         etf_pfx = ("51", "15", "58", "56")
         for pool_name, pool_cfg_key in [("股票", "stock"), ("ETF", "etf")]:
             _auto_fill_pool(
@@ -699,7 +712,12 @@ def _auto_fill_pool(
         if blocked:
             continue
 
-        capped_pct = round(float(s.get("target_pct", 0.95)) * max_pct, 4)
+        # 目标仓位: 优先用被跳过时保留的原始仓位(_target_pct),
+        # 回退 target_pct(0=已跳过清零, 0.95=默认满仓)
+        tgt = float(s.get("_target_pct", s.get("target_pct", 0.95)))
+        if tgt <= 0:
+            tgt = 0.95
+        capped_pct = round(tgt * max_pct, 4)
         lot = 200 if sym.startswith("688") else 100
         buy_qty = int(cash * capped_pct / s["close"] / lot) * lot
         if buy_qty <= 0:

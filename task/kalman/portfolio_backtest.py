@@ -136,7 +136,10 @@ def run_backtest(start_date="20200101", end_date="20260724", config_path=None):
                         ma20 = float(row["close"].iloc[max(0, idx - 19):idx + 1].mean())
                         ma20_prev = float(row["close"].iloc[max(0, idx - 20):idx].mean())
                         c = float(row["close"].iloc[idx])
-                        evaluators[sym].update(c, ma20, ma20_prev)
+                        hh = float(row["high"].iloc[idx])
+                        ll = float(row["low"].iloc[idx])
+                        vv = float(row["volume"].iloc[idx]) if "volume" in row.columns else None
+                        evaluators[sym].update(c, ma20, ma20_prev, high=hh, low=ll, volume=vv)
             continue
 
         # 执行待处理订单
@@ -208,7 +211,10 @@ def run_backtest(start_date="20200101", end_date="20260724", config_path=None):
             else:
                 ev.set_position(False)
 
-            result = ev.update(c, ma20_c, ma20_p)
+            hh = float(row["high"].iloc[idx])
+            ll = float(row["low"].iloc[idx])
+            vv = float(row["volume"].iloc[idx]) if "volume" in row.columns else None
+            result = ev.update(c, ma20_c, ma20_p, high=hh, low=ll, volume=vv)
             signal = result["signal"]
             target_pct = result["target_pct"]
             reason = result["reason"]

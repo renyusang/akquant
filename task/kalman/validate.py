@@ -108,6 +108,18 @@ def validate_pending_orders() -> List[Dict[str, Any]]:
     today = datetime.now().date()
 
     for order in pending:
+        # 防御: 缺 signal_date 的脏订单不崩溃(2026-08-05 曾因缺键 KeyError)
+        if not order.get("signal_date"):
+            issues.append({
+                "symbol": order.get("symbol", "?"),
+                "name": order.get("name", ""),
+                "check": "订单缺信号日期",
+                "level": "warn",
+                "detail": "pending_orders.json 脏数据: {}".format(
+                    {k: order.get(k) for k in ("symbol", "action", "shares")}
+                ),
+            })
+            continue
         signal_date = datetime.strptime(order["signal_date"], "%Y-%m-%d").date()
         days_pending = (today - signal_date).days
         if days_pending >= 3:
