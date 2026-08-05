@@ -36,6 +36,9 @@ def build_live_report():
     etf_cash = float(config.get("etf", {}).get("initial_cash", 100000))
     initial_cash = stock_cash + etf_cash
 
+    # 基金(ETF)判断: 51/15/58/56 开头(代码统一 6 位)
+    is_etf = lambda s: str(s).zfill(6).startswith(("51", "15", "58", "56"))
+
     # ---- 获取最新价格 ----
     price_map = _get_latest_prices()
 
@@ -70,8 +73,21 @@ def build_live_report():
         total_sell_proceeds = (trades["shares"].astype(float) * trades["exit_price"].astype(float)).sum()
 
     realized_pnl = trades["pnl"].sum() if len(trades) > 0 else 0.0
+    # 分池已实现盈亏(股票池/基金池)
+    if len(trades) > 0 and "symbol" in trades.columns:
+        trade_sym = trades["symbol"].astype(str).str.zfill(6)
+        realized_stock = trades.loc[~trade_sym.apply(is_etf), "pnl"].sum()
+        realized_etf = trades.loc[trade_sym.apply(is_etf), "pnl"].sum()
+    else:
+        realized_stock = realized_etf = 0.0
     total_pnl = realized_pnl + pos_pnl
-    cash_balance = initial_cash - total_buy_cost + total_sell_proceeds
+    # 累计手续费(卖出费来自 trades.csv fee; 买入费含在 avg_cost 中不可分)
+    total_fees = float(trades["fee"].sum()) if len(trades) > 0 else 0.0
+    # 权益口径修正(2026-08-05): 旧口径用裸价现金流(不含手续费/手动买入),
+    # 导致 最终权益 - 初始资金 ≠ 总盈亏。改为含费口径:
+    #   cash = 初始 + 已实现(含卖出费) + 浮动(含买入费) - 持仓市值
+    #   → 最终权益 = cash + 市值 = 初始 + 总盈亏 (恒等)
+    cash_balance = initial_cash + realized_pnl + pos_pnl - pos_value
     final_equity = cash_balance + pos_value
     total_ret = total_pnl / initial_cash * 100
 
@@ -167,7 +183,6 @@ def build_live_report():
         s = str(sym).zfill(6)
         return name_map.get(s, s)
 
-    is_etf = lambda s: str(s).startswith(("51", "15", "58", "56"))
     stock_pos = [p for p in pos_list if not is_etf(p["symbol"])]
     etf_pos = [p for p in pos_list if is_etf(p["symbol"])]
 
@@ -181,9 +196,16 @@ def build_live_report():
     # ---- 指标卡片 ----
     stock_used = sum(p["value"] for p in stock_pos)
     etf_used = sum(p["value"] for p in etf_pos)
+    # 分池总盈亏 = 池内已实现 + 池内浮动
+    stock_pnl = sum(p["pnl"] for p in stock_pos)
+    etf_pnl = sum(p["pnl"] for p in etf_pos)
+    stock_total_pnl = realized_stock + stock_pnl
+    etf_total_pnl = realized_etf + etf_pnl
     ret_cls = "positive" if total_ret > 0 else "negative"
     rpnl_cls = "positive" if realized_pnl > 0 else "negative"
     upnl_cls = "positive" if pos_pnl > 0 else "negative"
+    s_cls = "positive" if stock_total_pnl > 0 else "negative"
+    e_cls = "positive" if etf_total_pnl > 0 else "negative"
 
     metrics = f"""<h2>核心指标</h2>
 <table class='metrics'><tr>
@@ -191,6 +213,9 @@ def build_live_report():
 <td><span class='label'>已实现盈亏</span><span class='value {rpnl_cls}'>¥{realized_pnl:+,.0f}</span></td>
 <td><span class='label'>浮动盈亏</span><span class='value {upnl_cls}'>¥{pos_pnl:+,.0f}</span></td>
 <td><span class='label'>总盈亏</span><span class='value {ret_cls}'>¥{total_pnl:+,.0f}</span></td>
+<td><span class='label'>股票池总盈亏</span><span class='value {s_cls}'>¥{stock_total_pnl:+,.0f}</span></td>
+<td><span class='label'>基金池总盈亏</span><span class='value {e_cls}'>¥{etf_total_pnl:+,.0f}</span></td>
+<td><span class='label'>累计卖出手续费</span><span class='value'>¥{total_fees:,.2f}</span></td>
 <td><span class='label'>初始资金</span><span class='value'>¥{initial_cash:,.0f}</span></td>
 <td><span class='label'>最终现金</span><span class='value'>¥{cash_balance:,.0f}</span></td>
 <td><span class='label'>持仓市值</span><span class='value'>¥{pos_value:,.0f}</span></td>
@@ -481,17 +506,33 @@ def _pending_orders_html(name_map, stock_cash, etf_cash):
         _build_pending_table(html_parts, sells, name_map, "sell")
     html_parts.append('</div>')
 
-    # ---- 待买入（合并 pending buys + skipped buys） ----
+    # ---- 待买入（合并 pending buys + skipped buys, 分股票/基金） ----
+    def _split_by_pool(items):
+        st, et = [], []
+        for o in items:
+            (et if is_etf(o.get("symbol", "")) else st).append(o)
+        return st, et
+
+    buys_stock, buys_etf = _split_by_pool(buys)
+    skip_stock, skip_etf = _split_by_pool(skipped)
+
+    def _render_buy_block(title, buys_x, skip_x):
+        html_parts.append(f'<div style="margin-bottom:8px"><h4>{title}</h4>')
+        if not buys_x and not skip_x:
+            html_parts.append('<p style="color:#888">暂无</p>')
+        else:
+            if buys_x:
+                _build_pending_table(html_parts, buys_x, name_map, "buy")
+            if skip_x:
+                _build_skipped_table(html_parts, skip_x, name_map)
+        html_parts.append('</div>')
+
     html_parts.append('<div><h3>🟢 待买入</h3>')
     if not buys and not skipped:
         html_parts.append('<p style="color:#888">暂无待买入信号</p>')
     else:
-        # 先显示 pending 订单
-        if buys:
-            _build_pending_table(html_parts, buys, name_map, "buy")
-        # 再显示跳过的信号
-        if skipped:
-            _build_skipped_table(html_parts, skipped, name_map)
+        _render_buy_block('📈 股票', buys_stock, skip_stock)
+        _render_buy_block('📊 基金(ETF)', buys_etf, skip_etf)
     html_parts.append('</div>')
 
     html_parts.append('</div>')  # close col2
@@ -678,6 +719,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;m
 h1{color:#1a1a1a;border-bottom:3px solid #1f77b4;padding-bottom:10px}
 h2{color:#2c3e50;margin-top:40px;border-bottom:2px solid #ddd;padding-bottom:8px}
 h3{color:#555;margin-top:25px}
+h4{color:#777;margin:14px 0 4px;font-size:15px;border-left:3px solid #1f77b4;padding-left:8px}
 .metrics{width:100%;border-collapse:collapse;margin:20px 0;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);overflow:hidden}
 .metrics td{padding:16px 12px;text-align:center;border-right:1px solid #eee}
 .metrics td:last-child{border-right:none}
