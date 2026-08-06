@@ -162,6 +162,18 @@ def build_live_report():
                    marker_color=["#2ca02c" if v >= 0 else "#d62728" for v in yearly_ret.values]), row=3, col=1)
     fig1.update_layout(height=800, margin=dict(l=40, r=20, t=40, b=20),
                        hovermode="x unified", legend=dict(orientation="h", y=1.06))
+    # 权益曲线纵轴自适应(2026-08-06): 紧贴数据范围±5% padding,
+    # 避免 plotly 取整范围导致波动显示不明显。
+    # 修复: 范围须同时覆盖沪深300对比线, 否则其曲线被截断不可见
+    if len(eq) > 0:
+        eq_min = float(eq.min())
+        eq_max = float(eq.max())
+        if hs300_norm is not None and len(hs300_norm.dropna()) > 0:
+            eq_min = min(eq_min, float(hs300_norm.min()))
+            eq_max = max(eq_max, float(hs300_norm.max()))
+        eq_pad = (eq_max - eq_min) * 0.05 or 1.0
+        fig1.update_yaxes(range=[eq_min - eq_pad, eq_max + eq_pad],
+                          row=1, col=1)
 
     # 图表 2: 月度收益
     if len(eq) > 20:
@@ -208,27 +220,25 @@ def build_live_report():
     e_cls = "positive" if etf_total_pnl > 0 else "negative"
 
     metrics = f"""<h2>核心指标</h2>
-<table class='metrics'><tr>
-<td><span class='label'>总收益率</span><span class='value {ret_cls}'>{total_ret:+.1f}%</span></td>
-<td><span class='label'>已实现盈亏</span><span class='value {rpnl_cls}'>¥{realized_pnl:+,.0f}</span></td>
-<td><span class='label'>浮动盈亏</span><span class='value {upnl_cls}'>¥{pos_pnl:+,.0f}</span></td>
-<td><span class='label'>总盈亏</span><span class='value {ret_cls}'>¥{total_pnl:+,.0f}</span></td>
-<td><span class='label'>股票池总盈亏</span><span class='value {s_cls}'>¥{stock_total_pnl:+,.0f}</span></td>
-<td><span class='label'>基金池总盈亏</span><span class='value {e_cls}'>¥{etf_total_pnl:+,.0f}</span></td>
-<td><span class='label'>累计卖出手续费</span><span class='value'>¥{total_fees:,.2f}</span></td>
-<td><span class='label'>初始资金</span><span class='value'>¥{initial_cash:,.0f}</span></td>
-<td><span class='label'>最终现金</span><span class='value'>¥{cash_balance:,.0f}</span></td>
-<td><span class='label'>持仓市值</span><span class='value'>¥{pos_value:,.0f}</span></td>
-<td><span class='label'>最终权益</span><span class='value'>¥{final_equity:,.0f}</span></td>
-</tr><tr>
-<td><span class='label'>总交易</span><span class='value'>{len(trades)}</span></td>
-<td><span class='label'>盈利笔数</span><span class='value'>{win_count}</span></td>
-<td><span class='label'>胜率</span><span class='value'>{win_rate:.0f}%</span></td>
-<td><span class='label'>当前持仓</span><span class='value'>{len(positions)} 只</span></td>
-<td><span class='label'>股票池已用</span><span class='value'>¥{stock_used:,.0f}</span></td>
-<td><span class='label'>ETF池已用</span><span class='value'>¥{etf_used:,.0f}</span></td>
-<td></td><td></td>
-</tr></table>"""
+<div class='metrics'>
+<div class='mcard'><span class='label'>总收益率</span><span class='value {ret_cls}'>{total_ret:+.1f}%</span></div>
+<div class='mcard'><span class='label'>已实现盈亏</span><span class='value {rpnl_cls}'>¥{realized_pnl:+,.0f}</span></div>
+<div class='mcard'><span class='label'>浮动盈亏</span><span class='value {upnl_cls}'>¥{pos_pnl:+,.0f}</span></div>
+<div class='mcard'><span class='label'>总盈亏</span><span class='value {ret_cls}'>¥{total_pnl:+,.0f}</span></div>
+<div class='mcard'><span class='label'>股票池总盈亏</span><span class='value {s_cls}'>¥{stock_total_pnl:+,.0f}</span></div>
+<div class='mcard'><span class='label'>基金池总盈亏</span><span class='value {e_cls}'>¥{etf_total_pnl:+,.0f}</span></div>
+<div class='mcard'><span class='label'>累计卖出手续费</span><span class='value'>¥{total_fees:,.2f}</span></div>
+<div class='mcard'><span class='label'>初始资金</span><span class='value'>¥{initial_cash:,.0f}</span></div>
+<div class='mcard'><span class='label'>最终现金</span><span class='value'>¥{cash_balance:,.0f}</span></div>
+<div class='mcard'><span class='label'>持仓市值</span><span class='value'>¥{pos_value:,.0f}</span></div>
+<div class='mcard'><span class='label'>最终权益</span><span class='value'>¥{final_equity:,.0f}</span></div>
+<div class='mcard'><span class='label'>总交易</span><span class='value'>{len(trades)}</span></div>
+<div class='mcard'><span class='label'>盈利笔数</span><span class='value'>{win_count}</span></div>
+<div class='mcard'><span class='label'>胜率</span><span class='value'>{win_rate:.0f}%</span></div>
+<div class='mcard'><span class='label'>当前持仓</span><span class='value'>{len(positions)} 只</span></div>
+<div class='mcard'><span class='label'>股票池已用</span><span class='value'>¥{stock_used:,.0f}</span></div>
+<div class='mcard'><span class='label'>ETF池已用</span><span class='value'>¥{etf_used:,.0f}</span></div>
+</div>"""
 
     # ---- 完整 HTML ----
     css = _css()
@@ -237,7 +247,7 @@ def build_live_report():
     end_date = eq.index[-1].strftime("%Y-%m-%d") if len(eq) > 0 else "N/A"
 
     html = f"""<!DOCTYPE html><html lang='zh-CN'>
-<head><meta charset='utf-8'><title>实盘交易报告</title>{css}
+<head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>实盘交易报告</title>{css}
 <script src='https://cdn.plot.ly/plotly-2.35.2.min.js'></script></head>
 <body>
 <div style="background:#fff5f5;border:3px solid #e74c3c;border-radius:8px;padding:20px 24px;margin-bottom:24px;font-size:16px;color:#721c24;line-height:1.8;text-align:center">
@@ -422,8 +432,8 @@ def _positions_table(pos_list, name_map, label, pool_cash):
         lambda x: f"<span class='{'positive' if float(x)>0 else 'negative' if float(x)<0 else ''}'>{float(x):+,.0f}</span>")
     disp["收益率"] = disp["收益率"].apply(
         lambda x: f"<span class='{'positive' if float(x)>0 else 'negative' if float(x)<0 else ''}'>{float(x):+.1f}%</span>")
-    table = disp.to_html(index=False, classes="data-table", border=0, justify="center", escape=False)
-    return summary + table
+    table = disp.to_html(index=False, classes="data-table pos-table", border=0, justify="center", escape=False)
+    return summary + _wrap_table(table)
 
 
 def _trades_table(trades, name_map):
@@ -442,7 +452,7 @@ def _trades_table(trades, name_map):
         lambda x: f"<span class='{'positive' if float(x)>0 else 'negative'}'>{float(x):+.1f}%</span>")
 
     summary = f"<div class='summary-text'>共 {len(sells)} 笔 | 盈利 {wins} 笔 | 胜率 {wins/len(sells)*100:.0f}% | 总盈亏 <span class='{'positive' if total_pnl>0 else 'negative'}'>¥{total_pnl:+,.0f}</span></div>"
-    return summary + disp.to_html(index=False, classes="data-table", border=0, justify="center", escape=False)
+    return summary + _wrap_table(disp.to_html(index=False, classes="data-table trades-table", border=0, justify="center", escape=False))
 
 
 def _trade_details(buys_log, trades, name_map):
@@ -450,9 +460,9 @@ def _trade_details(buys_log, trades, name_map):
     rows = []
     for _, b in buys_log.iterrows():
         rows.append({
-            "日期": str(b["exec_date"])[:10],
             "代码": str(b["symbol"]).zfill(6),
             "名称": name_map.get(str(b["symbol"]).zfill(6), ""),
+            "日期": str(b["exec_date"])[:10],
             "方向": "买入",
             "数量": int(b["shares"]),
             "价格": f'{float(b["exec_price"]):.2f}',
@@ -461,9 +471,9 @@ def _trade_details(buys_log, trades, name_map):
         })
     for _, t in trades.iterrows():
         rows.append({
-            "日期": str(t["exit_date"])[:10],
             "代码": str(t["symbol"]).zfill(6),
             "名称": name_map.get(str(t["symbol"]).zfill(6), ""),
+            "日期": str(t["exit_date"])[:10],
             "方向": "卖出",
             "数量": int(t["shares"]),
             "价格": f'{float(t["exit_price"]):.2f}',
@@ -473,7 +483,7 @@ def _trade_details(buys_log, trades, name_map):
     if not rows:
         return "<p>暂无交易记录</p>"
     df = pd.DataFrame(rows).sort_values("日期", ascending=False)
-    return df.to_html(index=False, classes="data-table", border=0, justify="right", escape=False)
+    return _wrap_table(df.to_html(index=False, classes="data-table details-table", border=0, justify="right", escape=False))
 
 
 def _pending_orders_html(name_map, stock_cash, etf_cash):
@@ -629,9 +639,19 @@ def _build_skipped_table(html_parts, skipped, name_map):
         f'⏸️ 被跳过 ({len(skipped)} 笔，仓位满/资金不足)</p>'
     )
     html_parts.append(
-        df.to_html(index=False, classes="data-table", border=0,
-                   justify="center", escape=False)
+        _wrap_table(df.to_html(index=False, classes="data-table skipped-table", border=0,
+                               justify="center", escape=False))
     )
+
+
+def _wrap_table(html: str) -> str:
+    """表格横向滚动容器(手机窄屏时保持列宽可读, 不挤压重叠)。
+
+    -webkit-overflow-scrolling:touch: iOS Safari 惯性滚动(否则 flex 容器内
+    可能无法滚动); width:100% 保证容器不超父宽。
+    """
+    return (f"<div class='tscroll' style='overflow-x:auto;"
+            f"-webkit-overflow-scrolling:touch;width:100%'>{html}</div>")
 
 
 def _build_pending_table(html_parts, orders, name_map, action,
@@ -658,7 +678,7 @@ def _build_pending_table(html_parts, orders, name_map, action,
         return
 
     df = pd.DataFrame(rows)
-    table = df.to_html(index=False, classes="data-table", border=0, justify="center", escape=False)
+    table = _wrap_table(df.to_html(index=False, classes="data-table pending-table", border=0, justify="center", escape=False))
 
     # 汇总
     total_val = sum(
@@ -715,18 +735,22 @@ def _monthly_heatmap(eq, trades):
 
 def _css():
     return """<style>
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:1400px;margin:0 auto;padding:20px;background:#f5f5f5;color:#333}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:1400px;margin:0 auto;padding:20px;background:#f5f5f5;color:#333;overflow-x:clip}
 h1{color:#1a1a1a;border-bottom:3px solid #1f77b4;padding-bottom:10px}
 h2{color:#2c3e50;margin-top:40px;border-bottom:2px solid #ddd;padding-bottom:8px}
 h3{color:#555;margin-top:25px}
 h4{color:#777;margin:14px 0 4px;font-size:15px;border-left:3px solid #1f77b4;padding-left:8px}
-.metrics{width:100%;border-collapse:collapse;margin:20px 0;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);overflow:hidden}
-.metrics td{padding:16px 12px;text-align:center;border-right:1px solid #eee}
-.metrics td:last-child{border-right:none}
-.metrics .label{font-size:12px;color:#666;display:block}
-.metrics .value{font-size:22px;font-weight:bold;display:block;margin-top:4px}
+/* 核心指标: CSS Grid 自动换行(auto-fit), 任意宽度自适应多行 */
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:20px 0;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);overflow:hidden}
+.mcard{padding:16px 12px;text-align:center;border-right:1px solid #eee;border-bottom:1px solid #eee}
+.mcard:nth-child(odd){background:#fafafa}
+.mcard .label{font-size:12px;color:#666;display:block}
+.mcard .value{font-size:20px;font-weight:bold;display:block;margin-top:4px}
 .positive{color:#2ca02c}.negative{color:#d62728}
-.data-table{width:100%;border-collapse:collapse;font-size:13px;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);overflow:hidden;margin:12px 0}
+.data-table{width:max-content;min-width:max(640px,100%);border-collapse:separate;border-spacing:0;font-size:13px;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin:12px 0}
+/* 注: 不能有 overflow:hidden——它是 sticky 首列的祖先, 会使其失效 */
+/* 恢复 collapse 的细分隔线视觉(separate 下) */
+.data-table th,.data-table td{border-bottom:1px solid #eee}
 .data-table th{background:#1f77b4;color:white;padding:11px 10px;text-align:center;font-weight:600;white-space:nowrap;letter-spacing:0.5px}
 .data-table th:first-child,.data-table td:first-child{text-align:left}
 .data-table td{padding:9px 10px;border-bottom:1px solid #f0f0f0;text-align:right;white-space:nowrap}
@@ -735,7 +759,38 @@ h4{color:#777;margin:14px 0 4px;font-size:15px;border-left:3px solid #1f77b4;pad
 .data-table tr:nth-child(even){background:#f8fbff}
 .summary-text{font-size:14px;color:#555;margin:10px 0;padding:10px;background:white;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.05)}
 .nav{position:sticky;top:0;background:white;padding:8px 16px;border-radius:8px;box-shadow:0 2px 6px rgba(0,0,0,0.1);margin-bottom:20px;z-index:100}
-.col2{display:flex;gap:20px}
+/* 持仓双列: flex-wrap + 最小宽度, 宽度不足时平滑换行(无固定断点) */
+.col2{display:flex;flex-wrap:wrap;gap:20px}
+.col2>div{flex:1 1 340px;min-width:0}
+/* min-width:0 关键——flex 子项可压缩到容器宽, 表格溢出由内部 overflow 容器
+   接管滚动; 否则子项被 max-content 表格撑宽导致页面级横向滚动 */
+/* ≤900px: col2 用 block 替代 flex(绕开 iOS flex+overflow 兼容问题),
+   子项固定 100% 宽, 表格溢出由内部容器滚动 */
+@media (max-width: 900px){
+  .col2{display:block}
+  .col2>div{width:100%}
+}
+/* 手机窄屏: 缩小卡片字号/间距, 布局由 grid 自动重排 */
+@media (max-width: 480px){
+  .mcard{padding:10px 8px}
+  .mcard .value{font-size:16px}
+  .mcard .label{font-size:11px}
+  h1{font-size:22px}
+  .data-table{font-size:11px}
+  /* plotly 图例(6项横排)在窄屏重叠 → 隐藏, 悬停仍显示名称 */
+  .js-plotly-plot .legend{display:none}
+  /* 当前持仓/待执行订单: 手机强制上下单列排布 */
+  .col2{flex-direction:column}
+  .col2>div{min-width:0}
+}
+/* 表格横向滑动时冻结首列(名称/代码) — 2026-08-06
+   蓝色系与网页主色 #1f77b4(标题边框/权益曲线)同源匹配 */
+.data-table th:first-child,.data-table td:first-child{
+  position:sticky;left:0;background:#eef4fa;
+  box-shadow:1px 0 0 #d0e3f2;z-index:2;font-weight:bold;white-space:nowrap
+}
+/* 表头首列: 置顶且继承 th 深蓝底白字(不得覆盖其背景) */
+.data-table thead th:first-child{z-index:3}
 .col2>div{flex:1;min-width:0}
 details{margin-bottom:5px;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.08);padding:10px 20px}
 summary{cursor:pointer;user-select:none}
