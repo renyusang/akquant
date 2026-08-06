@@ -77,9 +77,20 @@ def check_consistency() -> List[str]:
             for sym, row in latest.iterrows():
                 curr_signals[sym] = row["signal"]
 
+    # 已成交卖出记录(execution_log executed sell)——
+    # 修复(2026-08-06): 卖出经订单执行成交(如 300750/600176)时 signals.csv
+    # 无最新 sell 信号, 原逻辑误报"持仓消失但无卖出信号"
+    executed_sells: set = set()
+    elog_path = os.path.join(TASK_DIR, "execution_log.csv")
+    if os.path.exists(elog_path):
+        el = pd.read_csv(elog_path, dtype={"symbol": str})
+        el["symbol"] = el["symbol"].str.zfill(6)
+        sold = el[(el["action"] == "sell") & (el["status"] == "executed")]
+        executed_sells = set(sold["symbol"])
+
     for sym, pos in prev.get("positions", {}).items():
         if sym not in curr_positions:
-            if curr_signals.get(sym) != "sell":
+            if curr_signals.get(sym) != "sell" and sym not in executed_sells:
                 warnings.append(
                     f"⚠️ {sym} 持仓消失但无卖出信号 (之前 {pos['shares']}股 @ ¥{pos['avg_cost']:.2f})"
                 )
@@ -100,7 +111,7 @@ def check_consistency() -> List[str]:
         # 检查是否已成交（进入了持仓）或仍然 pending
         in_positions = sym in curr_positions
         in_pending = any(o["symbol"] == sym for o in curr_pending)
-        if not in_positions and not in_pending:
+        if not in_positions and not in_pending and sym not in executed_sells:
             warnings.append(
                 f"⚠️ {sym} 待执行订单消失 (信号日 {po['signal_date']}, {po['shares']}股)"
             )

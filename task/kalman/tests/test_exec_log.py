@@ -121,3 +121,42 @@ class TestExecLog:
         df = exec_log._load()
         df["symbol"] = df["symbol"].astype(str).str.zfill(6)
         assert df.iloc[0]["symbol"] == "000001"
+
+
+class TestLogExecutedAppend:
+    """log_executed 无匹配记录时追加(2026-08-06 修复)。"""
+
+    def test_append_when_no_pending_record(self, tmp_path, monkeypatch):
+        """订单被回滚丢失日志后, 成交应追加 executed 记录。"""
+        import exec_log
+        monkeypatch.setattr(exec_log, "EXEC_LOG", str(tmp_path / "exec_log.csv"))
+        # 只有一条 skipped 记录(长电 8-6 场景)
+        pd.DataFrame([{
+            "signal_date": "2026-08-05", "exec_date": "",
+            "symbol": "600584", "name": "长电科技", "action": "buy",
+            "target_pct": 0.06, "shares": 100, "signal_reason": "价格突破",
+            "exec_price": "", "status": "skipped", "reason": "已达最大持仓数",
+        }]).to_csv(tmp_path / "exec_log.csv", index=False, encoding="utf-8-sig")
+
+        exec_log.log_executed("600584", "2026-08-05", 67.01, "2026-08-06")
+        df = exec_log._load()
+        ex = df[(df["symbol"] == "600584") & (df["status"] == "executed")]
+        assert len(ex) == 1
+        assert ex.iloc[0]["exec_price"] == 67.01
+        assert ex.iloc[0]["shares"] == 100  # 从 skipped 记录复制
+
+    def test_update_existing_pending_unchanged(self, tmp_path, monkeypatch):
+        """有 pending 记录时仍走更新路径(不追加)。"""
+        import exec_log
+        monkeypatch.setattr(exec_log, "EXEC_LOG", str(tmp_path / "exec_log.csv"))
+        pd.DataFrame([{
+            "signal_date": "2026-08-05", "exec_date": "",
+            "symbol": "600584", "name": "长电科技", "action": "buy",
+            "target_pct": 0.06, "shares": 100, "signal_reason": "",
+            "exec_price": "", "status": "pending", "reason": "",
+        }]).to_csv(tmp_path / "exec_log.csv", index=False, encoding="utf-8-sig")
+
+        exec_log.log_executed("600584", "2026-08-05", 67.01, "2026-08-06")
+        df = exec_log._load()
+        assert len(df[df["status"] == "executed"]) == 1
+        assert len(df[df["status"] == "pending"]) == 0

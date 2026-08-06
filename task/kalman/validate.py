@@ -54,7 +54,19 @@ def validate_data(symbol: str, name: str) -> List[Dict[str, Any]]:
             limit = 0.20  # 科创板/创业板
         else:
             limit = 0.10  # 主板
-        if daily_ret > limit:
+        # 涨停/跌停放行: 涨跌停价 = 前收×(1±limit) 四舍五入到分,
+        # 实际涨幅可能因取整略超 limit(如 +10.004% 恰为涨停)。
+        # 修复(2026-08-06): 按方向判断——上涨时收盘 ≤ 涨停价(+1分容差)
+        # 视为涨停; 下跌时收盘 ≥ 跌停价(-1分容差) 视为跌停。
+        # (注意: 不能用 or 同时判断, 否则上涨收盘必 ≥ 跌停价恒放行)
+        limit_up = round(close[-2] * (1 + limit), 2)
+        limit_down = round(close[-2] * (1 - limit), 2)
+        rising = close[-1] >= close[-2]
+        at_limit = (
+            (rising and close[-1] <= limit_up + 0.01)
+            or (not rising and close[-1] >= limit_down - 0.01)
+        )
+        if daily_ret > limit and not at_limit:
             issues.append({
                 "symbol": symbol, "name": name,
                 "check": "涨跌幅异常",

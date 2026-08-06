@@ -62,7 +62,12 @@ def log_pending(
 
 
 def log_executed(symbol: str, signal_date: str, exec_price: float, exec_date: str) -> None:
-    """标记为已成交。支持覆盖 pending/failed 状态（此前可能被误标）。"""
+    """标记为已成交。支持覆盖 pending/failed 状态（此前可能被误标）。
+
+    修复(2026-08-06): 无匹配 pending/failed 记录时(如日志文件被回滚丢失),
+    从该标的最近记录复制信息追加 executed——避免成交不入日志/交易明细
+    (长电科技 8-6 案例: 订单手动补回但日志缺失导致交易明细无记录)。
+    """
     df = _load()
     sym = str(symbol).zfill(6)
     mask = (df["symbol"] == sym) & (df["signal_date"] == signal_date) & (df["status"].isin(["pending", "failed"]))
@@ -71,7 +76,21 @@ def log_executed(symbol: str, signal_date: str, exec_price: float, exec_date: st
         df.at[idx, "exec_price"] = exec_price
         df.at[idx, "exec_date"] = exec_date
         df.at[idx, "status"] = "executed"
-        _save(df)
+    else:
+        ref = df[df["symbol"] == sym]
+        if len(ref):
+            r = ref.iloc[-1]
+            df = pd.concat([df, pd.DataFrame([{
+                "signal_date": signal_date, "exec_date": exec_date,
+                "symbol": sym, "name": r.get("name", sym),
+                "action": r.get("action", "buy"),
+                "target_pct": r.get("target_pct", 0.0),
+                "shares": r.get("shares", 0),
+                "signal_reason": r.get("signal_reason", ""),
+                "exec_price": exec_price, "status": "executed",
+                "reason": r.get("reason", ""),
+            }])], ignore_index=True)
+    _save(df)
 
 
 def log_failed(symbol: str, signal_date: str, reason: str) -> None:
