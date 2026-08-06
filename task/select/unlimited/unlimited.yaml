@@ -1,0 +1,165 @@
+strategy:
+  kalman_q_price: 0.0001
+  kalman_q_vel: 1.0e-05
+  kalman_r: 0.01
+  entry_threshold: 0.02
+  exit_threshold: 0.005
+  stop_loss_pct: 0.05
+  use_price_signal: true
+  use_velocity_signal: true
+  trend_filter_enabled: true
+  trend_confirm_bars: 1
+  trend_bear_pct: 0.3
+  downtrend_entry: 0.03
+  atr_adaptive_exit_enabled: true
+  exit_atr_factor: 1.0
+  sar_exit_enabled: false
+  lot_based_position: true
+stock:
+  initial_cash: 1000000000.0
+  max_positions: 99999
+  single_position_pct: 0.2
+etf:
+  initial_cash: 1000000000.0
+  max_positions: 99999
+  single_position_pct: 0.2
+data_years: 2
+watchlist:
+  stocks:
+  - symbol: 002594
+    name: 比亚迪
+  - symbol: '600900'
+    name: 长江电力
+  - symbol: '001270'
+    name: 铖昌科技
+  - symbol: '300750'
+    name: 宁德时代
+  - symbol: '002460'
+    name: 赣锋锂业
+  - symbol: 002192
+    name: 融捷股份
+  - symbol: '301511'
+    name: 德福科技
+  - symbol: '600519'
+    name: 贵州茅台
+  - symbol: '600584'
+    name: 长电科技
+  - symbol: '300373'
+    name: 扬杰科技
+  - symbol: 000977
+    name: 浪潮信息
+  - symbol: '000021'
+    name: 深科技
+  - symbol: '600176'
+    name: 中国巨石
+  - symbol: '002436'
+    name: 兴森科技
+  - symbol: '688041'
+    name: 海光信息
+  - symbol: 000938
+    name: 紫光股份
+  - symbol: 000933
+    name: 神火股份
+  - symbol: '603256'
+    name: 宏和科技
+  - symbol: '688256'
+    name: 寒武纪
+  - symbol: '688981'
+    name: 中芯国际
+  - symbol: '002371'
+    name: 北方华创
+  - symbol: '300308'
+    name: 中际旭创
+  - symbol: '300136'
+    name: 信维通信
+  - symbol: '688347'
+    name: 华虹宏力
+  - symbol: '688521'
+    name: 芯原股份
+  - symbol: '603893'
+    name: 瑞芯微
+  - symbol: '601012'
+    name: 隆基绿能
+  - symbol: '600438'
+    name: 通威股份
+  - symbol: '603259'
+    name: 药明康德
+  - symbol: '300274'
+    name: 阳光电源
+  - symbol: '605117'
+    name: 德业股份
+  - symbol: '603629'
+    name: 利通电子
+  etfs:
+  - symbol: '510050'
+    name: 上证50ETF
+    type: etf
+  - symbol: '510330'
+    name: 沪深300ETF
+    type: etf
+  - symbol: '512500'
+    name: 中证500ETF
+    type: etf
+  - symbol: '159845'
+    name: 中证1000ETF
+    type: etf
+  - symbol: '159367'
+    name: 创业板50ETF
+    type: etf
+  - symbol: '588000'
+    name: 科创板50ETF
+    type: etf
+  - symbol: '159783'
+    name: 科创创业50
+    type: etf
+  - symbol: '159957'
+    name: 创业板ETF
+    type: etf
+  - symbol: '518880'
+    name: 黄金ETF
+    type: etf
+  - symbol: '159928'
+    name: 消费ETF
+    type: etf
+  - symbol: '512880'
+    name: 证券ETF
+    type: etf
+  - symbol: '512170'
+    name: 医疗ETF
+    type: etf
+  - symbol: '512660'
+    name: 军工ETF
+    type: etf
+  - symbol: '515790'
+    name: 光伏ETF
+    type: etf
+  - symbol: '515030'
+    name: 新能源车ETF
+    type: etf
+  - symbol: '512800'
+    name: 银行ETF
+    type: etf
+  - symbol: '516160'
+    name: 新能源ETF
+    type: etf
+  - symbol: '512480'
+    name: 半导体ETF
+    type: etf
+  - symbol: '515220'
+    name: 煤炭ETF
+    type: etf
+  - symbol: '512400'
+    name: 有色金属ETF
+    type: etf
+  - symbol: '513180'
+    name: 恒生科技ETF
+    type: etf
+  - symbol: '513100'
+    name: 纳斯达克ETF
+    type: etf
+  - symbol: '515050'
+    name: 5G通信ETF
+    type: etf
+  - symbol: '510880'
+    name: 红利ETF
+    type: etf

@@ -1,0 +1,11 @@
+# 运行时状态(独立系统, 不入版本库)
+positions.json
+pending_orders.json
+trades.csv
+execution_log.csv
+signals.csv
+state_snapshot.json
+actual_fills.json
+unlimited_report.html
+backups/
+__pycache__/
