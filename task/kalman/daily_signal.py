@@ -249,7 +249,12 @@ def evaluate_stock(
         max_pct = float(params.get("single_position_pct", 0.95))
         capped_pct = round(result["target_pct"] * max_pct, 4)
         lot = 200 if str(symbol).startswith("688") else 100
-        buy_qty = int(cash * capped_pct / result["close"] / lot) * lot
+        if params.get("lot_based_position"):
+            # 无限仓位模式(2026-08-06): 数量=target_pct映射到[1,3]手, 不受资金限制
+            qty_lots = max(1, round(result["target_pct"] * 3))
+            buy_qty = qty_lots * lot
+        else:
+            buy_qty = int(cash * capped_pct / result["close"] / lot) * lot
         if buy_qty > 0:
             etf_pfx = ("51", "15", "58", "56")
             is_etf = (asset_type == "etf")
@@ -298,7 +303,13 @@ def evaluate_stock(
             add_value = target_value - current_value
             capped_pct = round(result["target_pct"] * max_pct, 4)
             lot = 200 if str(symbol).startswith("688") else 100
-            add_qty = int(add_value / result["close"] / lot) * lot
+            if params.get("lot_based_position"):
+                # 无限仓位模式: 补足到 target_pct 对应的目标手数
+                cur_lots = max(1, int(pos_info["shares"]) // lot)
+                tgt_lots = max(1, round(result["target_pct"] * 3))
+                add_qty = max(0, tgt_lots - cur_lots) * lot
+            else:
+                add_qty = int(add_value / result["close"] / lot) * lot
             if add_qty > 0:
                 etf_pfx = ("51", "15", "58", "56")
                 is_etf_pool = (asset_type == "etf")

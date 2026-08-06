@@ -495,3 +495,84 @@ class TestAutoFillAfterSell:
         defu = next(o for o in pending if o["symbol"] == "301511")
         assert defu["shares"] == 100
         assert defu["target_pct"] == pytest.approx(0.06)  # 0.30×0.20
+
+
+# ---------------------------------------------------------------------------
+# 无限仓位模式 lot_based_position(2026-08-06): 数量=target_pct映射[1,3]手
+# ---------------------------------------------------------------------------
+class TestLotBasedPosition:
+    """无资金限制的固定手数买入: 最小1手, 最大3手。"""
+
+    def _lot_config(self, max_pct=0.20):
+        cfg = _make_config(cash=1e9, max_pct=max_pct, max_pos=99999)
+        cfg["strategy"] = {"lot_based_position": True}
+        return cfg
+
+    def test_buy_downtrend_one_lot(self, monkeypatch):
+        """下跌趋势(0.30) → 1手 = 100股。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.30,
+                          last_close=100.0)
+            result = daily_signal.evaluate_stock(
+                STOCK, self._lot_config(), 2, {"stock": 0.0})
+            assert result["signal"] == "buy"
+            assert result["shares"] == 100
+            pending = orders.load_pending()
+            assert len(pending) == 1
+            assert pending[0]["shares"] == 100
+
+    def test_buy_uptrend_three_lots(self, monkeypatch):
+        """上涨趋势(0.95) → 3手 = 300股。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.95,
+                          last_close=100.0)
+            result = daily_signal.evaluate_stock(
+                STOCK, self._lot_config(), 2, {"stock": 0.0})
+            assert result["shares"] == 300
+            assert orders.load_pending()[0]["shares"] == 300
+
+    def test_buy_star_board_lot_200(self, monkeypatch):
+        """科创板(688, 最小200股): 下跌 → 1手 = 200股。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.30,
+                          last_close=100.0)
+            stock = {"symbol": "688041", "name": "海光信息", "type": "stock"}
+            result = daily_signal.evaluate_stock(
+                stock, self._lot_config(), 2, {"stock": 0.0})
+            assert result["shares"] == 200
+
+    def test_no_cash_or_slot_limit(self, monkeypatch):
+        """无限仓位: 即使"满仓"(持仓超5只)仍可买入(无 max_pos 拦截)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            pool_pos = {f"00000{i}": {"shares": 100, "avg_cost": 10.0,
+                                      "first_buy_date": "2026-01-01",
+                                      "name": f"S{i}"} for i in range(10)}
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.95,
+                          last_close=100.0, pool_pos=pool_pos)
+            result = daily_signal.evaluate_stock(
+                STOCK, self._lot_config(), 2, {"stock": 0.0})
+            assert result["signal"] == "buy"  # 不被"已达最大持仓数"拦截
+            assert result["shares"] == 300
+
+    def test_add_to_target_lots(self, monkeypatch):
+        """趋势翻转补仓: 持有1手(100股) → 补足3手(加200股)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            pos = {"shares": 100, "avg_cost": 100.0,
+                   "first_buy_date": "2026-01-01", "name": "宁德时代"}
+            _setup_common(monkeypatch, tmp, signal="hold", target_pct=0.95,
+                          last_close=100.0, pos=pos, pool_pos={"300750": pos})
+            result = daily_signal.evaluate_stock(
+                STOCK, self._lot_config(), 2, {"stock": 0.0})
+            assert result["signal"] == "buy"  # 趋势翻转补仓
+            assert result["shares"] == 200   # 补足 300-100
+
+    def test_default_mode_unchanged(self, monkeypatch):
+        """默认(无 lot_based_position): 原资金比例算法不变。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.95,
+                          last_close=100.0)
+            result = daily_signal.evaluate_stock(
+                STOCK, _make_config(cash=100000.0, max_pct=0.20), 2,
+                {"stock": 0.0})
+            # 100000*0.95*0.20/100 = 190 → 100股(整手)
+            assert result["shares"] == 100

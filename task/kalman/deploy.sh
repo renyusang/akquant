@@ -128,6 +128,17 @@ generate_index() {
   </div>
 </div>
 
+<h2>🟢 无限仓位信号</h2>
+<div class="section">
+  <div class="card">
+    <span class="icon">🛰️</span>
+    <div class="info">
+      <a href="unlimited/unlimited_report.html">无限仓位信号报告</a>
+      <div class="desc">1-3手信号 · 归一化收益排序 · 股票搜索</div>
+    </div>
+  </div>
+</div>
+
 <h2>🔵 组合回测</h2>
 <div class="section">
   <div class="card">
