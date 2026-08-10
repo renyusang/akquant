@@ -171,13 +171,16 @@ class TrendDetector:
         confirm_bars: int = 1,
         adx_enabled: bool = False,
         adx_threshold: float = 20.0,
+        recover_confirm_bars: int = 1,
     ) -> None:
         self._enabled = enabled
         self._confirm = max(1, int(confirm_bars))
+        self._recover_confirm = max(1, int(recover_confirm_bars))
         self._adx_enabled = adx_enabled
         self._adx_threshold = float(adx_threshold)
         self._state: str = "up"
         self._counter: int = 0
+        self._recover_counter: int = 0
 
     @property
     def state(self) -> str:
@@ -209,15 +212,22 @@ class TrendDetector:
 
         if is_bearish:
             self._counter += 1
+            self._recover_counter = 0  # 转涨条件不满足, 确认中断
             if self._counter >= self._confirm and self._state == "up":
                 self._state = "down"
         elif ma20_rising:
             self._counter = 0
             if self._state == "down":
-                self._state = "up"
+                # 转涨确认(2026-08-07): 连续 M 天 close≥MA20 且 MA20↑ 才转涨,
+                # 确认期内保持 down(隐式中间状态, 防死区仓位跳变)
+                self._recover_counter += 1
+                if self._recover_counter >= self._recover_confirm:
+                    self._state = "up"
+                    self._recover_counter = 0
         else:
             # close >= MA20 但 MA20 仍向下 → 维持下跌状态
             self._counter = max(self._counter, self._confirm)
+            self._recover_counter = 0  # MA20 走平/向下, 确认中断
 
         return self._state
 
@@ -286,6 +296,9 @@ class SignalEngine:
         self.downtrend_entry = float(
             _p("downtrend_entry", 0.03, "downtrend_entry_threshold")
         )
+        self.recover_confirm_bars = int(
+            _p("recover_confirm_bars", 1, "trend_recover_confirm_bars")
+        )
         self.adx_enabled = bool(_p("adx_enabled", False, "adx_filter_enabled"))
         self.adx_threshold = float(
             _p("adx_threshold", 20.0, "adx_filter_threshold")
@@ -322,6 +335,7 @@ class SignalEngine:
             confirm_bars=self.trend_confirm_bars,
             adx_enabled=self.adx_enabled,
             adx_threshold=self.adx_threshold,
+            recover_confirm_bars=self.recover_confirm_bars,
         )
 
         # ---- 内部状态 ----

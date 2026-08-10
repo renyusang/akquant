@@ -50,6 +50,9 @@ class KalmanStrategy(Strategy):
     use_velocity_signal = BoolParam(True, title="是否使用速度反转信号")
     trend_filter_enabled = BoolParam(False, title="是否启用趋势过滤")
     trend_filter_confirm_bars = IntParam(3, ge=1, le=20, title="趋势确认天数")
+    trend_recover_confirm_bars = IntParam(
+        1, ge=1, le=10, title="转涨确认天数(连续M天站上MA20且MA20向上才转涨, 防死区仓位跳变)"
+    )
     trend_bear_position_pct = FloatParam(
         0.30, ge=0.0, le=1.0, title="下跌仓位比例"
     )
@@ -111,6 +114,7 @@ class KalmanStrategy(Strategy):
         self.use_velocity_signal = bool(p("use_velocity_signal"))
         self.trend_filter_enabled = bool(p("trend_filter_enabled"))
         self.trend_filter_confirm_bars = max(1, int(p("trend_filter_confirm_bars")))
+        self.trend_recover_confirm_bars = max(1, int(p("trend_recover_confirm_bars")))
         self.trend_bear_position_pct = float(p("trend_bear_position_pct"))
         self.downtrend_entry_threshold = float(p("downtrend_entry_threshold"))
         self.single_position_pct = float(p("single_position_pct"))
@@ -169,6 +173,7 @@ class KalmanStrategy(Strategy):
                 use_velocity_signal=self.use_velocity_signal,
                 trend_filter_enabled=self.trend_filter_enabled,
                 trend_confirm_bars=self.trend_filter_confirm_bars,
+                recover_confirm_bars=self.trend_recover_confirm_bars,
                 trend_bear_pct=self.trend_bear_position_pct,
                 downtrend_entry=self.downtrend_entry_threshold,
                 adx_filter_enabled=self.adx_filter_enabled,

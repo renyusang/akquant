@@ -828,3 +828,68 @@ class TestMfi:
         assert e._last_mfi is None
         r = e.update(close[-1], 101.0, 100.9, high[-1], low[-1])
         assert r["signal"] == "buy"  # MFI 未启用 → 不拦截
+
+
+# ---- 转涨确认 recover_confirm_bars(2026-08-07) ----
+
+class TestTrendRecoverConfirm:
+    """转涨需要连续 M 天确认, 确认期内保持 down。"""
+
+    def _td(self, confirm=1, recover=1):
+        return TrendDetector(enabled=True, confirm_bars=confirm,
+                             recover_confirm_bars=recover)
+
+    def test_default_one_unchanged(self):
+        """默认 1: 立即转涨(与原行为一致)。"""
+        td = self._td()
+        td.update(95, 100, 100)               # → down
+        assert td.update(102, 101, 100) == "up"  # 立即转涨
+
+    def test_recover_needs_confirm_days(self):
+        """recover=2: 第1天保持 down, 第2天转 up。"""
+        td = self._td(recover=2)
+        td.update(95, 100, 100)               # → down
+        assert td.update(102, 101, 100) == "down"  # 确认第1天
+        assert td.update(103, 102, 101) == "up"    # 确认第2天
+
+    def test_recover_interrupted_by_drop(self):
+        """确认期价格回落(close<MA20) → 计数清零重新累计。"""
+        td = self._td(recover=3)
+        td.update(95, 100, 100)               # → down
+        assert td.update(102, 101, 100) == "down"  # 确认1
+        assert td.update(101, 101.5, 101) == "down"  # close<MA20 → 中断
+        assert td.update(103, 102, 101) == "down"  # 重新确认1
+        assert td.update(104, 103, 102) == "down"  # 确认2
+        assert td.update(105, 104, 103) == "up"    # 确认3 → 转涨
+
+    def test_recover_interrupted_by_ma20_flat(self):
+        """确认期 MA20 走平 → 中断。"""
+        td = self._td(recover=2)
+        td.update(95, 100, 100)               # → down
+        assert td.update(102, 101, 100) == "down"  # 确认1
+        assert td.update(103, 102, 102) == "down"  # MA20 未上升 → 中断
+        assert td.update(104, 103, 102) == "down"  # 重新确认1
+        assert td.update(105, 104, 103) == "up"
+
+    def test_bearish_confirm_unchanged(self):
+        """转跌确认逻辑不受影响。"""
+        td = self._td(confirm=2, recover=3)
+        assert td.update(99, 101, 100) == "up"    # 转跌确认1
+        assert td.update(98, 101, 100) == "down"  # 确认2 → down
+        assert td.update(103, 102, 101) == "down"  # 转涨确认1
+        assert td.update(104, 103, 102) == "down"  # 确认2
+        assert td.update(105, 104, 103) == "up"    # 确认3 → up
+
+    def test_engine_param_alias(self):
+        """SignalEngine 别名: trend_recover_confirm_bars。"""
+        e = SignalEngine(trend_filter_enabled=True,
+                         trend_recover_confirm_bars=2)
+        assert e.recover_confirm_bars == 2
+        e.set_position(False, 0.0)
+        # 完整链路: down 后需要 2 天确认才转 up
+        r = None
+        for close, ma20, ma20p in [(95, 100, 100), (102, 101, 100),
+                                   (103, 102, 101)]:
+            r = e.update(close, ma20, ma20p)
+        assert r["trend"] == "up"
+        assert r["signal"] != "sell"  # 无持仓

@@ -46,12 +46,10 @@ BASE_CFG = dict(
 
 CONFIGS = {
     "baseline": dict(BASE_CFG),
-    "atr1.0": dict(BASE_CFG, atr_adaptive_exit_enabled=True,
-                   exit_atr_factor=1.0),
-    "mfi70": dict(BASE_CFG, mfi_filter_enabled=True, mfi_overbought=70.0),
-    "atr+mfi": dict(BASE_CFG, atr_adaptive_exit_enabled=True,
-                    exit_atr_factor=1.0, mfi_filter_enabled=True,
-                    mfi_overbought=70.0),
+    "rc2": dict(BASE_CFG, trend_recover_confirm_bars=2),
+    "rc3": dict(BASE_CFG, trend_recover_confirm_bars=3),
+    "rc3+atr": dict(BASE_CFG, trend_recover_confirm_bars=3,
+                    atr_adaptive_exit_enabled=True, exit_atr_factor=1.0),
 }
 
 
