@@ -77,32 +77,60 @@ def check_consistency() -> List[str]:
             for sym, row in latest.iterrows():
                 curr_signals[sym] = row["signal"]
 
-    # 已成交卖出记录(execution_log executed sell)——
-    # 修复(2026-08-06): 卖出经订单执行成交(如 300750/600176)时 signals.csv
-    # 无最新 sell 信号, 原逻辑误报"持仓消失但无卖出信号"
-    executed_sells: set = set()
+    # 已成交记录(execution_log executed)——买卖成交均放行股数变化。
+    # 修复(2026-08-06): 卖出成交误报"持仓消失但无卖出信号"。
+    # 修复(2026-08-11): 买入成交(如昨日信号今日执行)导致股数增加被误报;
+    #   同时按 exec_date 限定到最近一次快照之后的窗口——
+    #   历史成交不豁免新变化, 防止"买了 500 却多出 1000"之类异常漏报。
+    prev_ts = prev.get("timestamp", "")
+    prev_date = prev_ts[:10] if len(prev_ts) >= 10 else ""
+    executed_buys: Dict[str, int] = {}   # symbol -> 窗口内成交买入股数
+    executed_sells: Dict[str, int] = {}  # symbol -> 窗口内成交卖出股数
     elog_path = os.path.join(TASK_DIR, "execution_log.csv")
     if os.path.exists(elog_path):
         el = pd.read_csv(elog_path, dtype={"symbol": str})
         el["symbol"] = el["symbol"].str.zfill(6)
-        sold = el[(el["action"] == "sell") & (el["status"] == "executed")]
-        executed_sells = set(sold["symbol"])
+        executed = el[el["status"] == "executed"]
+        if "exec_date" in executed.columns and prev_date:
+            ex = executed["exec_date"]
+            # exec_date 缺失(历史回填/旧数据)无法判定时点 → 保守视为窗口内
+            executed = executed[ex.isna() | (ex.astype(str) >= prev_date)]
+        if not executed.empty:
+            # shares 缺失(旧数据/无该列)无法比对数量 → 视为数量足够(存在即豁免)
+            if "shares" in executed.columns:
+                sh = pd.to_numeric(executed["shares"], errors="coerce")
+                sh = sh.fillna(10 ** 9)
+            else:
+                sh = pd.Series(10 ** 9, index=executed.index)
+            executed = executed.assign(_shares=sh)
+            executed_buys = (executed[executed["action"] == "buy"]
+                             .groupby("symbol")["_shares"].sum().to_dict())
+            executed_sells = (executed[executed["action"] == "sell"]
+                              .groupby("symbol")["_shares"].sum().to_dict())
 
     for sym, pos in prev.get("positions", {}).items():
         if sym not in curr_positions:
-            if curr_signals.get(sym) != "sell" and sym not in executed_sells:
+            sold_shares = executed_sells.get(sym, 0)
+            if curr_signals.get(sym) != "sell" and sold_shares < pos["shares"]:
                 warnings.append(
                     f"⚠️ {sym} 持仓消失但无卖出信号 (之前 {pos['shares']}股 @ ¥{pos['avg_cost']:.2f})"
                 )
 
-    # 2. 持仓股数变化（无买卖信号）
+    # 2. 持仓股数变化（须有窗口内买卖成交且净变化吻合）
     for sym, pos in curr_positions.items():
         if sym in prev.get("positions", {}):
             prev_pos = prev["positions"][sym]
             if pos["shares"] != prev_pos["shares"]:
-                warnings.append(
-                    f"⚠️ {sym} 股数变化: {prev_pos['shares']}→{pos['shares']} (无对应信号)"
+                delta = pos["shares"] - prev_pos["shares"]
+                executed_delta = (
+                    int(executed_buys.get(sym, 0))
+                    - int(executed_sells.get(sym, 0))
                 )
+                if executed_delta != delta:
+                    warnings.append(
+                        f"⚠️ {sym} 股数变化: {prev_pos['shares']}→{pos['shares']} "
+                        f"(无对应成交, 窗口内净成交 {executed_delta:+d} 股)"
+                    )
 
     # 3. 待执行订单未按预期执行
     prev_pending = prev.get("pending", [])

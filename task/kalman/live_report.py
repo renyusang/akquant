@@ -176,14 +176,28 @@ def build_live_report():
                           row=1, col=1)
 
     # 图表 2: 月度收益
-    if len(eq) > 20:
-        monthly = eq.resample("ME").last().pct_change().dropna() * 100
+    # 修复(2026-08-12): 原门槛 len(eq) > 20 —— 实盘运行初期权益曲线不足
+    # 20 个点(7-20 首批成交至今仅 16 点)时月度收益整块空白。
+    # 改为以"存在月度数据"为门槛(monthly 内部 dropna 已保护空数据)。
+    monthly = _monthly_returns(eq, initial_cash)
+    if len(monthly) > 0:
+        pct_v = monthly["pct"].values
+        amt_v = monthly["amount"].values
         fig2 = make_subplots(rows=1, cols=1, subplot_titles=("月度收益 (%)",))
-        mc = ["#d62728" if v < 0 else "#2ca02c" for v in monthly.values]
-        fig2.add_trace(go.Bar(x=monthly.index, y=monthly.values, name="月度收益",
-                       marker_color=mc, text=[f"{v:+.1f}%" for v in monthly.values],
-                       textposition="outside", textfont=dict(size=11)), row=1, col=1)
+        mc = ["#d62728" if v < 0 else "#2ca02c" for v in pct_v]
+        fig2.add_trace(go.Bar(x=monthly.index, y=pct_v, name="月度收益",
+                       marker_color=mc,
+                       text=[f"{v:+.1f}%<br>¥{a:+,.0f}"
+                             for v, a in zip(pct_v, amt_v)],
+                       textposition="outside", textfont=dict(size=11)),
+                       row=1, col=1)
+        # y 轴按数据自动留白: 顶部 ≥1.5× 最高柱, 标签(两行)不被裁剪
+        pmax = float(max(pct_v)) if len(pct_v) else 0.0
+        pmin = float(min(pct_v)) if len(pct_v) else 0.0
+        y_hi = max(pmax * 1.5, 0.5)
+        y_lo = min(pmin * 1.5, -0.5)
         fig2.update_layout(height=300, margin=dict(l=40, r=20, t=40, b=20), showlegend=False)
+        fig2.update_yaxes(range=[y_lo, y_hi])
         chart2 = fig2.to_html(full_html=False, include_plotlyjs=False)
     else:
         chart2 = ""
@@ -202,7 +216,7 @@ def build_live_report():
     pos_etf_html = _positions_table(etf_pos, name_map, "ETF", etf_cash)
     trades_html = _trades_table(trades, name_map)
     details_html = _trade_details(buys_log, trades, name_map)
-    monthly_table = _monthly_heatmap(eq, trades)
+    monthly_table = _monthly_heatmap(eq, trades, initial_cash)
     pending_html = _pending_orders_html(name_map, stock_cash, etf_cash)
 
     # ---- 指标卡片 ----
@@ -691,16 +705,36 @@ def _build_pending_table(html_parts, orders, name_map, action,
     html_parts.append(table)
 
 
-def _monthly_heatmap(eq, trades):
+def _monthly_returns(eq, initial_cash):
+    """月度收益: 首月以初始资金为基准, 之后各月环比。
+
+    修复(2026-08-12): 原 resample+pct_change 方案中首月无环比基准
+    被 dropna 掉 —— 实盘 7-20 开始交易后 7 月月度收益永远缺失。
+    首月基准改为初始资金: (首月末权益 / 初始资金 - 1) × 100。
+    返回 DataFrame[pct(%), amount(¥)]: amount = 当月权益变化额。
+    """
+    monthly_equity = eq.resample("ME").last()
+    if len(monthly_equity) == 0:
+        return pd.DataFrame({"pct": pd.Series(dtype=float),
+                             "amount": pd.Series(dtype=float)})
+    prev = monthly_equity.shift(1)
+    prev.iloc[0] = float(initial_cash)
+    return pd.DataFrame({
+        "pct": (monthly_equity / prev - 1) * 100,
+        "amount": monthly_equity - prev,
+    })
+
+
+def _monthly_heatmap(eq, trades, initial_cash):
     """月度收益热力图。"""
-    if len(eq) < 20:
-        return ""
-    monthly = eq.resample("ME").last().pct_change().dropna() * 100
+    # 修复(2026-08-12): 原门槛 len(eq) < 20 导致运行初期月度收益空白,
+    # 统一以"存在月度数据"为门槛。
+    monthly = _monthly_returns(eq, initial_cash)
     if len(monthly) < 1:
         return ""
     years = sorted(set(d.year for d in monthly.index), reverse=True)
     months = list(range(1, 13))
-    max_abs = max(abs(monthly.max()), abs(monthly.min()), 5.0)
+    max_abs = max(abs(monthly["pct"].max()), abs(monthly["pct"].min()), 5.0)
 
     html = ['<table class="data-table"><thead><tr><th>年份</th>']
     for m in months:
@@ -713,14 +747,18 @@ def _monthly_heatmap(eq, trades):
         for m in months:
             matches = [d for d in monthly.index if d.year == y and d.month == m]
             if matches:
-                ret = float(monthly.loc[matches[0]])
+                ret = float(monthly.loc[matches[0], "pct"])
                 if pd.notna(ret):
+                    amt = float(monthly.loc[matches[0], "amount"])
                     intensity = min(abs(ret) / max_abs, 1.0)
                     if ret > 0:
                         bg = f"background-color:rgba(0,180,0,{intensity:.2f});"
                     else:
                         bg = f"background-color:rgba(220,0,0,{intensity:.2f});"
-                    html.append(f'<td class="heat-cell" style="{bg}"><span style="color:#222;font-weight:bold;">{ret:+.1f}%</span></td>')
+                    html.append(
+                        f'<td class="heat-cell" style="{bg}">'
+                        f'<span style="color:#222;font-weight:bold;">{ret:+.1f}%</span>'
+                        f'<br><span style="color:#444;font-size:11px;">¥{amt:+,.0f}</span></td>')
                     y_ret += ret
                 else:
                     html.append('<td class="heat-cell">-</td>')

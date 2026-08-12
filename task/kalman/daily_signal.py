@@ -155,10 +155,15 @@ def evaluate_stock(
     config: Dict[str, Any],
     data_years: int,
     allocated_cash: Dict[str, float] | None = None,
+    defer_orders: bool = False,
 ) -> Dict[str, Any]:
     """对单只股票执行信号评估。
 
     allocated_cash: 本轮已承诺但未成交的资金 {pool: amount},用于防止同次扫描超额下单。
+    defer_orders: 两阶段下单模式(2026-08-12)——只评估不下单,
+        买入/补仓候选记录到 result["_deferred"], 由 _place_deferred_orders
+        统一按"补仓优先 + 偏离度降序"排序后下单。
+        卖出信号不受影响(卖出优先级最高, 评估时立即下单)。
     """
     symbol = stock["symbol"]
     name = stock.get("name", symbol)
@@ -221,17 +226,19 @@ def evaluate_stock(
             if result["signal"] == "buy":
                 max_pos = int(params.get("max_positions", 999))
                 asset_type = params.get("asset_type", "stock")
+                all_positions = load_positions()
                 pool_positions = sum(
-                    1 for s in load_positions().keys()
+                    1 for s in all_positions.keys()
                     if (s.startswith("5") or s.startswith("1")) == (asset_type == "etf")
                 )
                 pool_pending = sum(
                     1 for o in existing
                     if (o["symbol"].startswith("5") or o["symbol"].startswith("1")) == (asset_type == "etf")
                     and o.get("action") != "sell"  # 待卖出释放仓位,不占用上限
+                    and o["symbol"] not in all_positions  # 补仓单(已持仓)不占新增名额
                 )
                 current_count = pool_positions + pool_pending
-                if max_pos > 0 and current_count >= max_pos:
+                if max_pos > 0 and current_count >= max_pos and not defer_orders:
                     buy_reason = result.get("reason", "")
                     result["signal"] = "hold"
                     # 保留原始目标仓位供补仓使用(2026-08-05修复:
@@ -256,33 +263,52 @@ def evaluate_stock(
         else:
             buy_qty = int(cash * capped_pct / result["close"] / lot) * lot
         if buy_qty > 0:
-            etf_pfx = ("51", "15", "58", "56")
-            is_etf = (asset_type == "etf")
-            pool_pos = {
-                s: p
-                for s, p in load_positions().items()
-                if (s.startswith(etf_pfx)) == is_etf
-            }
-            used = sum(p["shares"] * p["avg_cost"] for p in pool_pos.values())
-            committed = allocated_cash.get(asset_type, 0.0) if allocated_cash else 0.0
-            remaining_cash = cash - used - committed
-            if buy_qty * result["close"] > remaining_cash * 1.05:
-                reason = f"资金不足(需¥{buy_qty * result['close']:,.0f}>可用¥{remaining_cash:,.0f})"
-                log_skipped(symbol, name, entry_date, reason, result.get("reason", ""))
+            if defer_orders:
+                # 两阶段模式: 只记录候选, 名额/资金检查与下单延迟到
+                # _place_deferred_orders(补仓优先 + 偏离度降序)
+                kp = float(result.get("kalman_price", 0) or 0)
+                dev = (result["close"] / kp - 1) * 100 if kp > 0 else 0.0
+                result["_deferred"] = {
+                    "kind": "new", "symbol": symbol, "name": name,
+                    "shares": buy_qty, "price": result["close"],
+                    "target_pct": capped_pct, "reason": result.get("reason", ""),
+                    "deviation": dev, "asset_type": asset_type,
+                }
             else:
-                add_pending_order(symbol, name, "buy", buy_qty, result["close"], entry_date, capped_pct)
-                log_pending(symbol, name, "buy", capped_pct, buy_qty, result["reason"], entry_date)
-                result["shares"] = buy_qty
-                # 记录已承诺资金，防止后续标的超额下单
-                if allocated_cash is not None:
-                    allocated_cash[asset_type] = allocated_cash.get(asset_type, 0.0) + buy_qty * result["close"]
+                etf_pfx = ("51", "15", "58", "56")
+                is_etf = (asset_type == "etf")
+                pool_pos = {
+                    s: p
+                    for s, p in load_positions().items()
+                    if (s.startswith(etf_pfx)) == is_etf
+                }
+                used = sum(p["shares"] * p["avg_cost"] for p in pool_pos.values())
+                committed = allocated_cash.get(asset_type, 0.0) if allocated_cash else 0.0
+                remaining_cash = cash - used - committed
+                if buy_qty * result["close"] > remaining_cash * 1.05:
+                    reason = f"资金不足(需¥{buy_qty * result['close']:,.0f}>可用¥{remaining_cash:,.0f})"
+                    log_skipped(symbol, name, entry_date, reason, result.get("reason", ""))
+                else:
+                    add_pending_order(symbol, name, "buy", buy_qty, result["close"], entry_date, capped_pct)
+                    log_pending(symbol, name, "buy", capped_pct, buy_qty, result["reason"], entry_date)
+                    result["shares"] = buy_qty
+                    # 记录已承诺资金，防止后续标的超额下单
+                    if allocated_cash is not None:
+                        allocated_cash[asset_type] = allocated_cash.get(asset_type, 0.0) + buy_qty * result["close"]
         else:
+            # 买不起 1 手(整手归零) → 标记跳过, signal 改 hold
+            # (修复 2026-08-12: 原逻辑 signal 保持 buy 落盘 signals.csv,
+            #  报告/快照误显 buy, 且 state_check "昨日买入未执行" 误报)
             buy_reason = result.get("reason", "")
-            log_skipped(
-                symbol, name, entry_date,
-                f"资金不足(单只上限¥{cash * max_pct:,.0f}, 股价¥{result['close']:.2f})",
-                buy_reason,
-            )
+            result["signal"] = "hold"
+            result["_target_pct"] = result.get("target_pct", 0.95)
+            result["target_pct"] = 0.0
+            result["reason"] = (
+                f"资金不足(单只上限¥{cash * max_pct:,.0f}, "
+                f"股价¥{result['close']:.2f})")
+            result["_skipped"] = True
+            log_skipped(symbol, name, entry_date, result["reason"],
+                        buy_reason)
     elif result["signal"] == "sell":
         # 卖出 → 待执行订单（次日开盘价成交）
         if has_pos and pos_info:
@@ -294,45 +320,161 @@ def evaluate_stock(
 
     # 7. 趋势翻转补仓: 持仓标的从下跌趋势→上涨,目标仓位从30%→95%
     if has_pos and result["signal"] == "hold" and result["target_pct"] > 0:
-        cash = float(stock.get("cash", params.get("initial_cash", 100000)))
-        max_pct = float(params.get("single_position_pct", 0.95))
-        target_value = cash * result["target_pct"] * max_pct
-        # 当前市值按市价计算(对齐回测 strategy.py),避免浮盈被低估导致补仓过量
-        current_value = pos_info["shares"] * close if pos_info else 0
-        if target_value > current_value * 1.05:
-            add_value = target_value - current_value
-            capped_pct = round(result["target_pct"] * max_pct, 4)
-            lot = 200 if str(symbol).startswith("688") else 100
-            if params.get("lot_based_position"):
-                # 无限仓位模式: 补足到 target_pct 对应的目标手数
-                cur_lots = max(1, int(pos_info["shares"]) // lot)
-                tgt_lots = max(1, round(result["target_pct"] * 3))
-                add_qty = max(0, tgt_lots - cur_lots) * lot
-            else:
-                add_qty = int(add_value / result["close"] / lot) * lot
-            if add_qty > 0:
-                etf_pfx = ("51", "15", "58", "56")
-                is_etf_pool = (asset_type == "etf")
-                pool_pos = {
-                    s: p for s, p in load_positions().items()
-                    if (s.startswith(etf_pfx)) == is_etf_pool
-                }
-                used = sum(p["shares"] * p["avg_cost"] for p in pool_pos.values())
-                committed = allocated_cash.get(asset_type, 0.0) if allocated_cash else 0.0
-                remaining_cash = cash - used - committed
-                if add_qty * result["close"] <= remaining_cash * 1.05:
-                    add_pending_order(symbol, name, "buy", add_qty,
-                                      result["close"], entry_date, capped_pct)
-                    log_pending(symbol, name, "buy", capped_pct, add_qty,
-                                f"趋势翻转补仓: {result['reason']}", entry_date)
-                    result["signal"] = "buy"
-                    result["shares"] = add_qty
-                    result["reason"] = f"趋势翻转补仓: {result['reason']}"
-                    if allocated_cash is not None:
-                        allocated_cash[asset_type] = (
-                            allocated_cash.get(asset_type, 0.0) + add_qty * result["close"])
+        from orders import load_pending as _lp7
+        if any(str(o["symbol"]).zfill(6) == str(symbol).zfill(6)
+               for o in _lp7()):
+            pass  # 已有待执行订单(含补仓单), 不重复生成补仓候选
+        else:
+            cash = float(stock.get("cash", params.get("initial_cash", 100000)))
+            max_pct = float(params.get("single_position_pct", 0.95))
+            target_value = cash * result["target_pct"] * max_pct
+            # 当前市值按市价计算(对齐回测 strategy.py),避免浮盈被低估导致补仓过量
+            current_value = pos_info["shares"] * close if pos_info else 0
+            if target_value > current_value * 1.05:
+                add_value = target_value - current_value
+                capped_pct = round(result["target_pct"] * max_pct, 4)
+                lot = 200 if str(symbol).startswith("688") else 100
+                if params.get("lot_based_position"):
+                    # 无限仓位模式: 补足到 target_pct 对应的目标手数
+                    cur_lots = max(1, int(pos_info["shares"]) // lot)
+                    tgt_lots = max(1, round(result["target_pct"] * 3))
+                    add_qty = max(0, tgt_lots - cur_lots) * lot
+                else:
+                    add_qty = int(add_value / result["close"] / lot) * lot
+                if add_qty > 0:
+                    if defer_orders:
+                        # 两阶段模式: 补仓候选延迟到 _place_deferred_orders
+                        kp = float(result.get("kalman_price", 0) or 0)
+                        dev = (result["close"] / kp - 1) * 100 if kp > 0 else 0.0
+                        result["_deferred"] = {
+                            "kind": "refill", "symbol": symbol, "name": name,
+                            "shares": add_qty, "price": result["close"],
+                            "target_pct": capped_pct,
+                            "reason": f"趋势翻转补仓: {result.get('reason', '')}",
+                            "deviation": dev, "asset_type": asset_type,
+                        }
+                    else:
+                        etf_pfx = ("51", "15", "58", "56")
+                        is_etf_pool = (asset_type == "etf")
+                        pool_pos = {
+                            s: p for s, p in load_positions().items()
+                            if (s.startswith(etf_pfx)) == is_etf_pool
+                        }
+                        used = sum(p["shares"] * p["avg_cost"] for p in pool_pos.values())
+                        committed = allocated_cash.get(asset_type, 0.0) if allocated_cash else 0.0
+                        remaining_cash = cash - used - committed
+                        if add_qty * result["close"] <= remaining_cash * 1.05:
+                            add_pending_order(symbol, name, "buy", add_qty,
+                                              result["close"], entry_date, capped_pct)
+                            log_pending(symbol, name, "buy", capped_pct, add_qty,
+                                        f"趋势翻转补仓: {result['reason']}", entry_date)
+                            result["signal"] = "buy"
+                            result["shares"] = add_qty
+                            result["reason"] = f"趋势翻转补仓: {result['reason']}"
+                            if allocated_cash is not None:
+                                allocated_cash[asset_type] = (
+                                    allocated_cash.get(asset_type, 0.0) + add_qty * result["close"])
 
     return result
+
+
+def _place_deferred_orders(
+    results: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    allocated_cash: Dict[str, float] | None = None,
+) -> None:
+    """两阶段下单(2026-08-12): 补仓优先, 新建仓按偏离度降序。
+
+    阶段 1(evaluate_stock defer_orders=True)只收集候选(_deferred),
+    阶段 2 统一排序后按 名额+资金 检查下单:
+    - 补仓(已持仓)优先于新建仓: 已有持仓、趋势已确认, 先于新标的消耗资金
+    - 同类型按偏离度降序: 信号最强(偏离最大)的先拿名额
+      (原逻辑按 watchlist 扫描顺序先到先得, 配置顺序无业务语义却决定结果)
+    - 新建仓占用 max_positions 名额, 补仓不占(成交后不新增持仓标的)
+    """
+    deferred = [r for r in results if r.get("_deferred") is not None]
+    if not deferred:
+        return
+
+    refills = [r for r in deferred if r["_deferred"]["kind"] == "refill"]
+    news = [r for r in deferred if r["_deferred"]["kind"] == "new"]
+    refills.sort(key=lambda r: float(r["_deferred"].get("deviation", 0)),
+                 reverse=True)
+    news.sort(key=lambda r: float(r["_deferred"].get("deviation", 0)),
+              reverse=True)
+    candidates = refills + news
+
+    placed_new = 0  # 已下单的新建仓数(占用名额)
+    for r in candidates:
+        d = r["_deferred"]
+        symbol, name = d["symbol"], d["name"]
+        asset_type = d["asset_type"]
+        entry_date = str(r.get("date", ""))[:10]
+        etf_pfx = ("51", "15", "58", "56")
+        is_etf = (asset_type == "etf")
+
+        def _pool_positions() -> int:
+            return sum(1 for s in load_positions()
+                       if (s.startswith(etf_pfx)) == is_etf)
+
+        # 名额检查(仅新建仓; 补仓单成交后不新增持仓标的)
+        if d["kind"] == "new":
+            pool_cfg = config.get(asset_type, {})
+            max_pos = int(pool_cfg.get(
+                "max_positions", 5 if asset_type == "stock" else 3))
+            # 已有 pending 中的新建单也占名额(防超买: 昨日下单未成交
+            # 今日再下单 → 成交后持仓超限); 补仓单(已持仓)不占
+            from orders import load_pending as _lp
+            existing = _lp()
+            pool_pending_new = sum(
+                1 for o in existing
+                if (o["symbol"].startswith(etf_pfx)) == is_etf
+                and o.get("action") != "sell"
+                and o["symbol"] not in load_positions())
+            if (max_pos > 0
+                    and _pool_positions() + placed_new + pool_pending_new
+                    >= max_pos):
+                _block(r, d, symbol, name, entry_date,
+                       f"已达最大持仓数({max_pos})")
+                continue
+
+        # 资金检查
+        cash = float(config.get(asset_type, {}).get(
+            "initial_cash", 200000 if asset_type == "stock" else 100000))
+        pool_pos = {s: p for s, p in load_positions().items()
+                    if (s.startswith(etf_pfx)) == is_etf}
+        used = sum(p["shares"] * p["avg_cost"] for p in pool_pos.values())
+        committed = allocated_cash.get(asset_type, 0.0) if allocated_cash else 0.0
+        remaining_cash = cash - used - committed
+        if d["shares"] * d["price"] > remaining_cash * 1.05:
+            _block(r, d, symbol, name, entry_date,
+                   f"资金不足(需¥{d['shares'] * d['price']:,.0f}"
+                   f">可用¥{remaining_cash:,.0f})")
+            continue
+
+        # 下单
+        add_pending_order(symbol, name, "buy", d["shares"], d["price"],
+                          entry_date, d["target_pct"])
+        log_pending(symbol, name, "buy", d["target_pct"], d["shares"],
+                    d["reason"], entry_date)
+        r["signal"] = "buy"
+        r["shares"] = d["shares"]
+        r["reason"] = d["reason"]
+        if allocated_cash is not None:
+            allocated_cash[asset_type] = (
+                allocated_cash.get(asset_type, 0.0) + d["shares"] * d["price"])
+        if d["kind"] == "new":
+            placed_new += 1
+
+
+def _block(r, d, symbol, name, entry_date, reason: str) -> None:
+    """两阶段下单被拦截: 标记 _skipped 并写执行日志(对齐原第5/6步拦截)。"""
+    r["signal"] = "hold"
+    r["_target_pct"] = d["target_pct"]  # 保留原始仓位供 _auto_fill_pool 使用
+    r["target_pct"] = 0.0
+    r["reason"] = reason
+    r["_skipped"] = True
+    log_skipped(symbol, name, entry_date, reason, d["reason"])
 
 
 def format_signal(result: Dict[str, Any]) -> str:
@@ -512,8 +654,9 @@ def main() -> None:
 
     positions_before = len(load_positions())
     results = []
-    skipped_buys: List[Dict[str, Any]] = []  # 被跳过的买入信号（等仓位空出）
     allocated_cash: Dict[str, float] = {}  # 本轮已承诺资金 {pool: amount}
+
+    # 阶段 1: 评估全部标的(只收集候选, 不下单)
     for i, stock in enumerate(all_watchlist, 1):
         symbol = stock["symbol"]
         name = stock.get("name", symbol)
@@ -521,10 +664,9 @@ def main() -> None:
             print(f"\n[{i}/{len(all_watchlist)}] {symbol} {name} ...")
 
         try:
-            result = evaluate_stock(stock, config, data_years, allocated_cash)
+            result = evaluate_stock(stock, config, data_years, allocated_cash,
+                                    defer_orders=True)
             results.append(result)
-            if result.get("_skipped"):
-                skipped_buys.append(result)
             if not args.quiet:
                 print(format_signal(result))
         except Exception as e:
@@ -534,6 +676,20 @@ def main() -> None:
             })
             if not args.quiet:
                 print(f"  ❌ 错误: {e}")
+
+    # 阶段 2: 统一排序下单(2026-08-12)——补仓优先, 新建按偏离度降序
+    _place_deferred_orders(results, config, allocated_cash)
+    skipped_buys = [r for r in results if r.get("_skipped")]
+    if not args.quiet:
+        for r in results:
+            d = r.get("_deferred")
+            if d is not None:
+                if r["signal"] == "buy":
+                    print(f"  📌 下单 {d['symbol']} {d['name']}: "
+                          f"{r['shares']}股 @{r['close']:.2f} "
+                          f"(偏离{d['deviation']:+.1f}%)")
+                else:
+                    print(f"  ⏸️ 拦截 {d['symbol']} {d['name']}: {r['reason']}")
 
     if not args.quiet:
         print_summary(results)

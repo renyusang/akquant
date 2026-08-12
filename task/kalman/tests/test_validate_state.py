@@ -68,38 +68,43 @@ class TestLimitUpFalsePositive:
         assert all(i["check"] != "涨跌幅异常" for i in issues)
 
 
+def _setup_state_check(monkeypatch, tmp_path, prev_positions, prev_pending,
+                   curr_positions, curr_pending, elog_rows,
+                   snapshot_ts="2026-08-10 22:00:00"):
+    """构造 state_check 检查环境: 快照 + 持仓 + 待执行 + 执行日志。"""
+    snap = tmp_path / "state_snapshot.json"
+    snap.write_text(json.dumps({
+        "timestamp": snapshot_ts,
+        "positions": prev_positions, "pending": prev_pending,
+        "signals": {},
+    }), encoding="utf-8")
+    monkeypatch.setattr(state_check, "SNAPSHOT_FILE", str(snap))
+    monkeypatch.setattr(state_check, "TASK_DIR", str(tmp_path))
+
+    import orders
+    import portfolio
+    pos_file = tmp_path / "positions.json"
+    pos_file.write_text(json.dumps(curr_positions), encoding="utf-8")
+    pend_file = tmp_path / "pending_orders.json"
+    pend_file.write_text(json.dumps(curr_pending), encoding="utf-8")
+    monkeypatch.setattr(portfolio, "POSITIONS_FILE", str(pos_file))
+    monkeypatch.setattr(portfolio, "TRADES_FILE",
+                        str(tmp_path / "trades.csv"))
+    monkeypatch.setattr(orders, "PENDING_FILE", str(pend_file))
+
+    if elog_rows:
+        pd.DataFrame(elog_rows).to_csv(
+            tmp_path / "execution_log.csv", index=False,
+            encoding="utf-8-sig")
+
+
+
 class TestExecutedSellFalsePositive:
     """订单执行卖出成交后 state_check 不应误报。"""
 
-    def _setup(self, monkeypatch, tmp_path, prev_positions, prev_pending,
-               curr_positions, curr_pending, elog_rows):
-        snap = tmp_path / "state_snapshot.json"
-        snap.write_text(json.dumps({
-            "positions": prev_positions, "pending": prev_pending,
-            "signals": {},
-        }), encoding="utf-8")
-        monkeypatch.setattr(state_check, "SNAPSHOT_FILE", str(snap))
-        monkeypatch.setattr(state_check, "TASK_DIR", str(tmp_path))
-
-        import orders
-        import portfolio
-        pos_file = tmp_path / "positions.json"
-        pos_file.write_text(json.dumps(curr_positions), encoding="utf-8")
-        pend_file = tmp_path / "pending_orders.json"
-        pend_file.write_text(json.dumps(curr_pending), encoding="utf-8")
-        monkeypatch.setattr(portfolio, "POSITIONS_FILE", str(pos_file))
-        monkeypatch.setattr(portfolio, "TRADES_FILE",
-                            str(tmp_path / "trades.csv"))
-        monkeypatch.setattr(orders, "PENDING_FILE", str(pend_file))
-
-        if elog_rows:
-            pd.DataFrame(elog_rows).to_csv(
-                tmp_path / "execution_log.csv", index=False,
-                encoding="utf-8-sig")
-
     def test_executed_sell_no_warning(self, monkeypatch, tmp_path):
         """宁德时代卖出已成交(execution_log executed) → 不误报。"""
-        self._setup(
+        _setup_state_check(
             monkeypatch, tmp_path,
             prev_positions={"300750": {"shares": 100, "avg_cost": 372.67}},
             prev_pending=[{"symbol": "300750", "signal_date": "2026-08-04",
@@ -115,7 +120,7 @@ class TestExecutedSellFalsePositive:
 
     def test_no_executed_record_still_warns(self, monkeypatch, tmp_path):
         """无任何卖出记录 → 仍警告(保留原检测能力)。"""
-        self._setup(
+        _setup_state_check(
             monkeypatch, tmp_path,
             prev_positions={"300750": {"shares": 100, "avg_cost": 372.67}},
             prev_pending=[],
@@ -125,3 +130,108 @@ class TestExecutedSellFalsePositive:
         )
         warnings = state_check.check_consistency()
         assert any("300750" in w and "持仓消失" in w for w in warnings)
+
+
+class TestExecutedBuyFalsePositive:
+    """订单执行买入成交导致股数增加时 state_check 不应误报(2026-08-11 修复)。
+
+    修复背景: 昨日信号今日开盘成交(如赣锋锂业 200→700), 检查时 signals.csv
+    最新信号为 buy 或已变 hold(满仓), 原逻辑对股数变化仅豁免卖出成交,
+    买入成交一律误报"无对应信号"。
+    """
+
+    def test_executed_buy_no_warning(self, monkeypatch, tmp_path):
+        """窗口内买入成交 500 股, 持仓 200→700 → 不误报。"""
+        _setup_state_check(
+            monkeypatch, tmp_path,
+            prev_positions={"002460": {"shares": 200, "avg_cost": 50.0}},
+            prev_pending=[],
+            curr_positions={"002460": {"shares": 700, "avg_cost": 52.97}},
+            curr_pending=[],
+            elog_rows=[{"signal_date": "2026-08-10", "exec_date": "2026-08-11",
+                        "symbol": "002460", "action": "buy",
+                        "status": "executed", "shares": 500,
+                        "exec_price": 54.14}],
+        )
+        warnings = state_check.check_consistency()
+        assert not any("002460" in w for w in warnings)
+
+    def test_executed_buy_share_mismatch_warns(self, monkeypatch, tmp_path):
+        """买入 400 股却多出 500 股 → 净变化不吻合, 仍警告(防漏报)。"""
+        _setup_state_check(
+            monkeypatch, tmp_path,
+            prev_positions={"002460": {"shares": 200, "avg_cost": 50.0}},
+            prev_pending=[],
+            curr_positions={"002460": {"shares": 700, "avg_cost": 52.97}},
+            curr_pending=[],
+            elog_rows=[{"signal_date": "2026-08-10", "exec_date": "2026-08-11",
+                        "symbol": "002460", "action": "buy",
+                        "status": "executed", "shares": 400,
+                        "exec_price": 54.14}],
+        )
+        warnings = state_check.check_consistency()
+        assert any("002460" in w and "股数变化" in w for w in warnings)
+
+    def test_outside_window_execution_warns(self, monkeypatch, tmp_path):
+        """成交在快照之前(exec_date < prev timestamp) → 不豁免, 仍警告。"""
+        _setup_state_check(
+            monkeypatch, tmp_path,
+            prev_positions={"002460": {"shares": 200, "avg_cost": 50.0}},
+            prev_pending=[],
+            curr_positions={"002460": {"shares": 700, "avg_cost": 52.97}},
+            curr_pending=[],
+            elog_rows=[{"signal_date": "2026-08-04", "exec_date": "2026-08-05",
+                        "symbol": "002460", "action": "buy",
+                        "status": "executed", "shares": 500,
+                        "exec_price": 50.1}],
+        )
+        warnings = state_check.check_consistency()
+        assert any("002460" in w and "股数变化" in w for w in warnings)
+
+    def test_partial_sell_reduces_shares_no_warning(self, monkeypatch, tmp_path):
+        """窗口内部分卖出 500 股, 持仓 700→200 → 不误报。"""
+        _setup_state_check(
+            monkeypatch, tmp_path,
+            prev_positions={"002460": {"shares": 700, "avg_cost": 52.97}},
+            prev_pending=[],
+            curr_positions={"002460": {"shares": 200, "avg_cost": 50.0}},
+            curr_pending=[],
+            elog_rows=[{"signal_date": "2026-08-10", "exec_date": "2026-08-11",
+                        "symbol": "002460", "action": "sell",
+                        "status": "executed", "shares": 500,
+                        "exec_price": 55.0}],
+        )
+        warnings = state_check.check_consistency()
+        assert not any("002460" in w for w in warnings)
+
+    def test_no_exec_date_column_exempts(self, monkeypatch, tmp_path):
+        """历史回填数据无 exec_date 列 → 保守视为窗口内, 不误报。"""
+        _setup_state_check(
+            monkeypatch, tmp_path,
+            prev_positions={"002460": {"shares": 200, "avg_cost": 50.0}},
+            prev_pending=[],
+            curr_positions={"002460": {"shares": 700, "avg_cost": 52.97}},
+            curr_pending=[],
+            elog_rows=[{"signal_date": "2026-08-10",
+                        "symbol": "002460", "action": "buy",
+                        "status": "executed", "shares": 500}],
+        )
+        warnings = state_check.check_consistency()
+        assert not any("002460" in w for w in warnings)
+
+    def test_old_snapshot_without_timestamp_exempts(self, monkeypatch, tmp_path):
+        """旧快照无 timestamp(快照日期无法判定) → 全量豁免, 不误报。"""
+        _setup_state_check(
+            monkeypatch, tmp_path,
+            prev_positions={"002460": {"shares": 200, "avg_cost": 50.0}},
+            prev_pending=[],
+            curr_positions={"002460": {"shares": 700, "avg_cost": 52.97}},
+            curr_pending=[],
+            elog_rows=[{"signal_date": "2026-08-04", "exec_date": "2026-08-05",
+                        "symbol": "002460", "action": "buy",
+                        "status": "executed", "shares": 500,
+                        "exec_price": 50.1}],
+            snapshot_ts="",
+        )
+        warnings = state_check.check_consistency()
+        assert not any("002460" in w for w in warnings)

@@ -576,3 +576,213 @@ class TestLotBasedPosition:
                 {"stock": 0.0})
             # 100000*0.95*0.20/100 = 190 → 100股(整手)
             assert result["shares"] == 100
+
+
+# ---------------------------------------------------------------------------
+# 待执行订单的名额占用(2026-08-12): 补仓单(已持仓)不占新增名额
+# ---------------------------------------------------------------------------
+class TestPendingSlotAccounting:
+    """max_positions 名额: 新标的买入单占名额(防超买),
+    已持仓标的的补仓单不占名额(成交后不新增持仓标的)。"""
+
+    ETF_POOL = {
+        "512400": {"name": "有色金属ETF", "shares": 11300, "avg_cost": 1.775},
+        "159845": {"name": "中证1000ETF", "shares": 2000, "avg_cost": 2.93},
+        "512660": {"name": "军工ETF", "shares": 5400, "avg_cost": 1.09},
+        "515030": {"name": "新能源车ETF", "shares": 3700, "avg_cost": 1.66},
+    }
+    NEW_ETF = {"symbol": "510330", "name": "沪深300ETF", "type": "etf"}
+
+    def _etf_config(self):
+        cfg = _make_config(cash=100000.0, max_pct=0.20, max_pos=5)
+        cfg["etf"] = {"initial_cash": 100000.0, "max_positions": 5,
+                      "single_position_pct": 0.20}
+        return cfg
+
+    def _add_pending(self, symbol, name, action="buy", shares=5400):
+        orders.add_pending_order(symbol, name, action, shares,
+                                 signal_price=1.10, signal_date="2026-08-12")
+
+    def test_refill_pending_not_block_new_entry(self, monkeypatch):
+        """4只持仓 + 军工ETF补仓单(已持仓) → 新ETF买入放行。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.95,
+                          last_close=4.95, pool_pos=dict(self.ETF_POOL))
+            self._add_pending("512660", "军工ETF", shares=600)  # 补仓单
+            result = daily_signal.evaluate_stock(
+                self.NEW_ETF, self._etf_config(), 2, {"etf": 0.0})
+            assert result["signal"] == "buy", result.get("reason")
+
+    def test_new_entry_pending_blocks_another(self, monkeypatch):
+        """4只持仓 + 新标的买入单(半导体ETF) → 另一新ETF仍被拦截(防超买)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.95,
+                          last_close=4.95, pool_pos=dict(self.ETF_POOL))
+            self._add_pending("512480", "半导体ETF", shares=100)  # 新标的单
+            result = daily_signal.evaluate_stock(
+                self.NEW_ETF, self._etf_config(), 2, {"etf": 0.0})
+            assert result["signal"] == "hold"
+            assert "已达最大持仓数" in result.get("reason", "")
+
+    def test_full_pool_blocks_new_entry(self, monkeypatch):
+        """5只持仓满(无pending) → 新ETF仍被拦截(回归)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = dict(self.ETF_POOL)
+            pool["515790"] = {"name": "光伏ETF", "shares": 24300,
+                              "avg_cost": 0.816}
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.95,
+                          last_close=4.95, pool_pos=pool)
+            result = daily_signal.evaluate_stock(
+                self.NEW_ETF, self._etf_config(), 2, {"etf": 0.0})
+            assert result["signal"] == "hold"
+            assert "已达最大持仓数" in result.get("reason", "")
+
+
+# ---------------------------------------------------------------------------
+# 两阶段下单(2026-08-12): 补仓优先 + 新建按偏离度降序
+# ---------------------------------------------------------------------------
+class TestDeferredOrderPlacement:
+    """_place_deferred_orders: 排序/名额/资金逻辑。"""
+
+    STOCK_POOL = {
+        "000001": {"name": "平安银行", "shares": 100, "avg_cost": 10.0},
+        "000002": {"name": "万科A", "shares": 100, "avg_cost": 10.0},
+        "000003": {"name": "标的C", "shares": 100, "avg_cost": 10.0},
+        "000004": {"name": "标的D", "shares": 100, "avg_cost": 10.0},
+    }
+
+    def _cfg(self, max_pos=5, cash=200000.0):
+        return _make_config(cash=cash, max_pct=0.20, max_pos=max_pos)
+
+    def _candidate(self, sym, name, kind, dev, shares=100, price=10.0,
+                   asset_type="stock"):
+        return {
+            "symbol": sym, "name": name, "close": price,
+            "date": "2026-08-12",
+            "_deferred": {
+                "kind": kind, "symbol": sym, "name": name,
+                "shares": shares, "price": price, "target_pct": 0.19,
+                "reason": "test", "deviation": dev, "asset_type": asset_type,
+            },
+        }
+
+    def test_new_by_deviation_priority(self, monkeypatch, tmp_path):
+        """4持仓+1名额: 候选列表顺序与偏离度无关, 偏离9.9%应下单, 3.5%被拦。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, pool_pos=dict(self.STOCK_POOL))
+            results = [
+                self._candidate("000005", "低偏离", "new", dev=3.5),
+                self._candidate("000006", "高偏离", "new", dev=9.9),
+            ]
+            allocated = {}
+            daily_signal._place_deferred_orders(results, self._cfg(), allocated)
+            assert results[1]["signal"] == "buy"      # 高偏离下单
+            assert results[0]["signal"] == "hold"     # 低偏离被拦
+            assert "已达最大持仓数" in results[0]["reason"]
+            pend = orders.load_pending()
+            assert len(pend) == 1
+            assert pend[0]["symbol"] == "000006"
+
+    def test_refill_priority_when_cash_limited(self, monkeypatch, tmp_path):
+        """资金只够一单: 低偏离补仓优先消耗资金, 高偏离新建被资金不足拦截。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, pool_pos=dict(self.STOCK_POOL))
+            results = [
+                self._candidate("000006", "新建高偏离", "new", dev=9.9),
+                self._candidate("000001", "补仓低偏离", "refill", dev=1.5),
+            ]
+            # 池现金 5000, 持仓市值 4000 → 剩余 1000, 只够一单
+            daily_signal._place_deferred_orders(
+                results, self._cfg(cash=5000.0), {})
+            refill = next(r for r in results
+                          if r["_deferred"]["kind"] == "refill")
+            new = next(r for r in results
+                       if r["_deferred"]["kind"] == "new")
+            assert refill["signal"] == "buy"          # 补仓优先
+            assert new["signal"] == "hold"
+            assert "资金不足" in new["reason"]
+
+    def test_refill_does_not_consume_slot(self, monkeypatch, tmp_path):
+        """补仓不占名额: 4持仓 + 补仓 + 新建 → 两者都下单(名额5)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, pool_pos=dict(self.STOCK_POOL))
+            results = [
+                self._candidate("000006", "新建", "new", dev=9.9),
+                self._candidate("000001", "补仓", "refill", dev=1.5),
+            ]
+            daily_signal._place_deferred_orders(results, self._cfg(), {})
+            assert all(r["signal"] == "buy" for r in results)
+            assert len(orders.load_pending()) == 2
+
+    def test_full_pool_blocks_new(self, monkeypatch, tmp_path):
+        """5持仓满 + 1新建 → 名额拦截。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = dict(self.STOCK_POOL)
+            pool["000007"] = {"name": "标的E", "shares": 100, "avg_cost": 10.0}
+            _setup_common(monkeypatch, tmp, pool_pos=pool)
+            results = [self._candidate("000008", "新建", "new", dev=5.0)]
+            daily_signal._place_deferred_orders(results, self._cfg(), {})
+            assert results[0]["signal"] == "hold"
+            assert "已达最大持仓数" in results[0]["reason"]
+
+    def test_insufficient_cash_blocks(self, monkeypatch, tmp_path):
+        """现金不足: 大额候选 → 资金不足拦截, 无订单产生。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, pool_pos=dict(self.STOCK_POOL))
+            results = [self._candidate("000008", "新建", "new", dev=5.0,
+                                       shares=100, price=100.0)]
+            daily_signal._place_deferred_orders(
+                results, self._cfg(cash=5000.0), {})
+            assert results[0]["signal"] == "hold"
+            assert "资金不足" in results[0]["reason"]
+            assert orders.load_pending() == []
+
+    def test_evaluate_defer_orders_no_pending(self, monkeypatch):
+        """evaluate_stock defer 模式: 不下单, 候选记录在 _deferred。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.95,
+                          last_close=100.0)
+            result = daily_signal.evaluate_stock(
+                STOCK, _make_config(), 2, {"stock": 0.0}, defer_orders=True)
+            assert result["signal"] == "buy"
+            assert result.get("_deferred", {}).get("kind") == "new"
+            assert orders.load_pending() == []  # 未下单
+
+    def test_evaluate_non_defer_still_places(self, monkeypatch):
+        """默认模式(无限仓位等调用方): 行为不变, 立即下单。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.95,
+                          last_close=100.0)
+            result = daily_signal.evaluate_stock(
+                STOCK, _make_config(cash=100000.0, max_pct=0.20), 2,
+                {"stock": 0.0})
+            assert result["signal"] == "buy"
+            assert result.get("_deferred") is None
+            assert len(orders.load_pending()) == 1
+
+    def test_pending_new_consumes_slot(self, monkeypatch, tmp_path):
+        """已有 pending 新建单(非持仓)占名额: 4持仓 + 创业板50单 + 新候选 → 拦截。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, pool_pos=dict(self.STOCK_POOL))
+            orders.add_pending_order("000009", "已下单标的", "buy", 100,
+                                     signal_price=10.0,
+                                     signal_date="2026-08-11")
+            results = [self._candidate("000008", "新建", "new", dev=9.9)]
+            daily_signal._place_deferred_orders(results, self._cfg(), {})
+            assert results[0]["signal"] == "hold"
+            assert "已达最大持仓数" in results[0]["reason"]
+            # pending 仍只有 1 笔(未重复下单)
+            assert len(orders.load_pending()) == 1
+
+    def test_buy_qty_zero_marks_hold(self, monkeypatch):
+        """股价过高买不起 1 手(buy_qty=0) → signal 改 hold, 不落盘 buy。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.95,
+                          last_close=500.0)  # 19万/500/100<1手
+            result = daily_signal.evaluate_stock(
+                STOCK, _make_config(cash=100000.0, max_pct=0.20), 2,
+                {"stock": 0.0})
+            assert result["signal"] == "hold"
+            assert result.get("_skipped") is True
+            assert "资金不足" in result["reason"]
+            assert orders.load_pending() == []
