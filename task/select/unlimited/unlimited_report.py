@@ -192,12 +192,20 @@ def build_unlimited_report() -> None:
     else:
         avg_norm_stock = avg_norm_etf = 0.0
 
+    # 总盈亏 = 已实现 + 浮动 (对齐实盘 live_report 口径, 2026-08-12)
+    total_pnl = realized_all + floating_all
+    total_stock = realized_stock + floating_stock
+    total_etf = realized_etf + floating_etf
+
     def _cls(v):
         return "positive" if v > 0 else "negative"
 
     pos_pnl_cls = _cls(floating_all)
     rpnl_cls = _cls(realized_all)
     norm_cls = _cls(avg_norm)
+    total_cls = _cls(total_pnl)
+    total_stock_cls = _cls(total_stock)
+    total_etf_cls = _cls(total_etf)
 
     # ---- 归一化收益柱状图(股票/基金分开) ----
     def _norm_chart(sub, title):
@@ -414,6 +422,9 @@ oninput='filterTables(this.value)'>
 <div class='mcard'><span class='label'>浮动·股票</span><span class='value {_cls(floating_stock)}'>¥{floating_stock:+,.0f}</span></div>
 <div class='mcard'><span class='label'>浮动·基金</span><span class='value {_cls(floating_etf)}'>¥{floating_etf:+,.0f}</span></div>
 <div class='mcard'><span class='label'>浮动·整体</span><span class='value {pos_pnl_cls}'>¥{floating_all:+,.0f}</span></div>
+<div class='mcard'><span class='label'>总盈亏</span><span class='value {total_cls}'>¥{total_pnl:+,.0f}</span></div>
+<div class='mcard'><span class='label'>股票池总盈亏</span><span class='value {total_stock_cls}'>¥{total_stock:+,.0f}</span></div>
+<div class='mcard'><span class='label'>基金池总盈亏</span><span class='value {total_etf_cls}'>¥{total_etf:+,.0f}</span></div>
 <div class='mcard'><span class='label'>归一化·股票</span><span class='value {_cls(avg_norm_stock)}'>{avg_norm_stock:+.1%}</span></div>
 <div class='mcard'><span class='label'>归一化·基金</span><span class='value {_cls(avg_norm_etf)}'>{avg_norm_etf:+.1%}</span></div>
 <div class='mcard'><span class='label'>归一化·整体</span><span class='value {norm_cls}'>{avg_norm:+.1%}</span></div>
