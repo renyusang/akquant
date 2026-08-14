@@ -39,64 +39,56 @@ data_years: 2
 # 监控列表（type 为 etf 时自动使用 ETF 数据源和资金池）
 watchlist:
   stocks:
-    - symbol: "002594"
-      name: "比亚迪"
-    - symbol: "600900"
-      name: "长江电力"
-    - symbol: "001270"
-      name: "铖昌科技"
-    - symbol: "300750"
-      name: "宁德时代"
-    - symbol: "002460"
-      name: "赣锋锂业"
-    - symbol: "002192"
-      name: "融捷股份"
-    - symbol: "301511"
-      name: "德福科技"
-    - symbol: "600519"
-      name: "贵州茅台"
-    - symbol: "600584"
-      name: "长电科技"
-    - symbol: "300373"
-      name: "扬杰科技"
-    - symbol: "000977"
-      name: "浪潮信息"
-    - symbol: "000021"
-      name: "深科技"
-    - symbol: "600176"
-      name: "中国巨石"
-    - symbol: "002436"
-      name: "兴森科技"
-    - symbol: "688041"
-      name: "海光信息"
-    - symbol: "000938"
-      name: "紫光股份"
-    - symbol: "000933"
-      name: "神火股份"
-    - symbol: "603256"
-      name: "宏和科技"
-    - symbol: "688256"
-      name: "寒武纪"
-    - symbol: "688981"
-      name: "中芯国际"
-    - symbol: "002371"
-      name: "北方华创"
-    - symbol: "300308"
-      name: "中际旭创"
-    - symbol: "300136"
-      name: "信维通信"
-    - symbol: "688347"
-      name: "华虹宏力"
-    - symbol: "688521"
-      name: "芯原股份"
-    - symbol: "603893"
-      name: "瑞芯微"
-    - symbol: "601012"
-      name: "隆基绿能"
-    - symbol: "600438"
-      name: "通威股份"
-    - symbol: "603259"
-      name: "药明康德"
+  - symbol: "300502"
+    name: 新易盛
+  - symbol: "300489"
+    name: 光智科技
+  - symbol: "300394"
+    name: 天孚通信
+  - symbol: "300620"
+    name: 光库科技
+  - symbol: "688519"
+    name: 南亚新材
+  - symbol: "300604"
+    name: 长川科技
+  - symbol: "300475"
+    name: 香农芯创
+  - symbol: "688234"
+    name: 天岳先进
+  - symbol: "600176"
+    name: 中国巨石
+  - symbol: "688525"
+    name: 佰维存储
+  - symbol: "300751"
+    name: 迈为股份
+  - symbol: "300476"
+    name: 胜宏科技
+  - symbol: "688248"
+    name: 南网科技
+  - symbol: "002916"
+    name: 深南电路
+  - symbol: "002008"
+    name: 大族激光
+  - symbol: "300395"
+    name: 菲利华
+  - symbol: "300803"
+    name: 指南针
+  - symbol: "002837"
+    name: 英维克
+  - symbol: "603308"
+    name: 应流股份
+  - symbol: "002709"
+    name: 天赐材料
+  - symbol: "002192"
+    name: 融捷股份
+  - symbol: "002460"
+    name: 赣锋锂业
+  - symbol: "001270"
+    name: 铖昌科技
+  - symbol: "301511"
+    name: 德福科技
+  - symbol: "600584"
+    name: 长电科技
 
   etfs:
     - symbol: "510050"
