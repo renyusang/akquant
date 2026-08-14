@@ -96,7 +96,9 @@ def build_live_report():
     win_rate = win_count / len(sells) * 100 if len(sells) > 0 else 0
 
     # ---- 权益曲线（累积已实现盈亏 + 估算持仓市值） ----
-    equity_curve = _build_equity_curve(trades, positions, price_map, initial_cash)
+    price_history = _get_price_history()
+    equity_curve = _build_equity_curve(trades, positions, price_map,
+                                       initial_cash, price_history)
     equity_curve["date"] = pd.to_datetime(equity_curve["date"])
     # 去重：同一天取最后一条
     eq = equity_curve.groupby("date")["equity"].last()
@@ -346,13 +348,40 @@ def _get_latest_prices():
     return price_map
 
 
-def _build_equity_curve(trades, positions, price_map, initial_cash):
+def _get_price_history():
+    """从缓存读取全部历史收盘价 → {symbol: {date_str: close}}。
+
+    修复(2026-08-13): 权益曲线历史点原用"当前价"估算持仓市值,
+    导致 7 月等历史月份收益随每日价格漂移(7月 +0.4% 隔日变 -0.2%)。
+    历史点改用当日收盘价: 历史月份收益固定, 只有当月随行情变化。
+    """
+    hist = {}
+    cache_dir = os.path.join(TASK_DIR, ".cache")
+    if os.path.exists(cache_dir):
+        for fname in os.listdir(cache_dir):
+            if fname.endswith(".parquet"):
+                try:
+                    df = pd.read_parquet(os.path.join(cache_dir, fname),
+                                         columns=["date", "close"])
+                    sym = fname.replace(".parquet", "").zfill(6)
+                    dates = pd.to_datetime(df["date"]).astype(str).str[:10]
+                    hist[sym] = dict(zip(dates, df["close"].astype(float)))
+                except Exception:
+                    pass
+    return hist
+
+
+def _build_equity_curve(trades, positions, price_map, initial_cash,
+                        price_history=None):
     """从 execution_log.csv + trades.csv + positions.json 重建权益曲线。
 
     数据来源:
     - execution_log.csv: 所有已执行的买入事件
     - trades.csv: 所有已完成的卖出事件
     - positions.json: 当前持仓（未平仓）
+
+    历史点持仓市值用当日收盘价(price_history), 缺失回退当前价;
+    最终快照(今日)用当前价。
     """
     elog_path = os.path.join(TASK_DIR, "execution_log.csv")
 
@@ -409,8 +438,16 @@ def _build_equity_curve(trades, positions, price_map, initial_cash):
                 cash += ev["shares"] * ev["price"]
                 del holdings[ev["symbol"]]
 
-        market_value = sum(h["shares"] * price_map.get(s, h["price"])
-                           for s, h in holdings.items())
+        # 历史点市值用当日收盘价(修复 2026-08-13: 原用当前价导致
+        # 历史月份收益随每日价格漂移), 缺失回退当前价
+        market_value = 0.0
+        for s, h in holdings.items():
+            px = None
+            if price_history:
+                px = price_history.get(s, {}).get(ev["date"])
+            if px is None or pd.isna(px):
+                px = price_map.get(s, h["price"])
+            market_value += h["shares"] * float(px)
         equity_rows.append({"date": ev["date"], "equity": cash + market_value})
 
     # 最终快照

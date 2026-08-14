@@ -38,3 +38,12 @@ build/
 # 研究生成物
 grid_search_*.csv
 kline_*.html
+
+# 选股研究产物
+candidates*.csv
+risk_flags.csv
+industry_cache.csv
+recommended_watchlist.csv
+screen_pool*_result.csv
+stocks_new_pool.yaml
+stocks.yaml.bak_*
