@@ -47,6 +47,8 @@ class KalmanStrategy(Strategy):
     exit_threshold = FloatParam(0.005, ge=0.0, le=0.10, title="卖出价格偏离阈值")
     stop_loss_pct = FloatParam(0.05, ge=0.01, le=0.30, title="止损比例")
     use_price_signal = BoolParam(True, title="是否使用价格偏离信号")
+    market_filter_enabled = BoolParam(
+        False, title="大盘环境过滤(弱市禁止新开仓, 不影响持仓退出)")
     use_velocity_signal = BoolParam(True, title="是否使用速度反转信号")
     trend_filter_enabled = BoolParam(False, title="是否启用趋势过滤")
     trend_filter_confirm_bars = IntParam(3, ge=1, le=20, title="趋势确认天数")
@@ -111,6 +113,9 @@ class KalmanStrategy(Strategy):
         self.exit_threshold = float(p("exit_threshold"))
         self.stop_loss_pct = float(p("stop_loss_pct"))
         self.use_price_signal = bool(p("use_price_signal"))
+        self.market_filter_enabled = bool(p("market_filter_enabled"))
+        # 大盘状态映射 {date_str: "强"/"弱"/"过渡"}, 由回测层传入
+        self.market_state_map = dict(kwargs.get("market_state_map") or {})
         self.use_velocity_signal = bool(p("use_velocity_signal"))
         self.trend_filter_enabled = bool(p("trend_filter_enabled"))
         self.trend_filter_confirm_bars = max(1, int(p("trend_filter_confirm_bars")))
@@ -281,6 +286,20 @@ class KalmanStrategy(Strategy):
 
         if pos == 0:
             if result["signal"] == "buy":
+                # 大盘环境过滤(2026-08-14 研究): 弱市禁止新开仓,
+                # 持仓中的补仓/卖出不受影响
+                if self.market_filter_enabled:
+                    # bar.timestamp 为 UTC 纳秒 → 北京时间日期
+                    from datetime import datetime, timedelta, timezone
+                    _ts = datetime.fromtimestamp(bar.timestamp / 1e9,
+                                                 tz=timezone.utc)
+                    d = (_ts + timedelta(hours=8)).strftime("%Y-%m-%d")
+                    if self.market_state_map.get(d) == "弱":
+                        self.log(
+                            f"[大盘弱市跳过买入] {bar.timestamp_iso} "
+                            f"{symbol} close¥{close_price:.2f}"
+                        )
+                        return
                 if limit_up and close_price >= limit_up:
                     self.log(
                         f"[涨停跳过买入] {bar.timestamp_iso} {symbol} "
