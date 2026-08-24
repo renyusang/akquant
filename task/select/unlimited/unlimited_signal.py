@@ -85,6 +85,9 @@ def main() -> None:
     data_issues, order_issues = ds.run_all_checks(all_watchlist, quiet=args.quiet)
     all_validation_issues = data_issues + order_issues
 
+    # 并行预取数据(2026-08-24, 复用实盘实现): 扫描前并行下载缺失/过期数据
+    ds.prefetch_data(all_watchlist, data_years, quiet=args.quiet)
+
     # 执行待处理订单(T-1 信号, 今日开盘价成交, 涨跌停保护)
     ds._execute_today_pending(config, today)
 

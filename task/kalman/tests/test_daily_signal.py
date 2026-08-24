@@ -809,3 +809,88 @@ class TestDeferredOrderPlacement:
             assert result.get("_skipped") is True
             assert "资金不足" in result["reason"]
             assert orders.load_pending() == []
+
+
+class TestPrefetchData:
+    """并行预取(2026-08-24): 主循环前线程池下载缺失/过期数据。
+
+    下载无副作用可并行; evaluate_stock 有下单副作用, 评估阶段保持串行。
+    """
+
+    def test_prefetch_downloads_missing(self, monkeypatch, tmp_path):
+        """缓存缺失的标的全部触发下载。"""
+        calls = []
+
+        def _dl(sym, years, at="stock"):
+            calls.append(sym)
+            return pd.DataFrame()
+
+        monkeypatch.setattr(daily_signal, "download_with_cache", _dl)
+        monkeypatch.setattr(daily_signal, "CACHE_DIR", str(tmp_path / "nc"))
+        n = daily_signal.prefetch_data(
+            [{"symbol": "000001"}, {"symbol": "000002"}], 2, quiet=True)
+        assert n == 2
+        assert set(calls) == {"000001", "000002"}
+
+    def test_prefetch_skips_fresh_cache(self, monkeypatch, tmp_path):
+        """缓存已含今日数据 → 不下载。"""
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        df = pd.DataFrame({"date": [pd.Timestamp.now().normalize()],
+                           "close": [1.0]})
+        df.to_parquet(cache / "000001.parquet", index=False)
+        calls = []
+        monkeypatch.setattr(daily_signal, "download_with_cache",
+                            lambda *a, **k: calls.append(1))
+        monkeypatch.setattr(daily_signal, "CACHE_DIR", str(cache))
+        n = daily_signal.prefetch_data([{"symbol": "000001"}], 2, quiet=True)
+        assert n == 0 and calls == []
+
+    def test_prefetch_stale_cache_downloads(self, monkeypatch, tmp_path):
+        """缓存数据早于今日 → 触发下载(对齐 download_with_cache 判断)。"""
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        df = pd.DataFrame({"date": [pd.Timestamp.now().normalize()
+                                    - pd.Timedelta(days=2)], "close": [1.0]})
+        df.to_parquet(cache / "000001.parquet", index=False)
+        calls = []
+        monkeypatch.setattr(daily_signal, "download_with_cache",
+                            lambda *a, **k: calls.append(a[0]))
+        monkeypatch.setattr(daily_signal, "CACHE_DIR", str(cache))
+        n = daily_signal.prefetch_data([{"symbol": "000001"}], 2, quiet=True)
+        assert n == 1 and calls == ["000001"]
+
+    def test_prefetch_failure_skipped(self, monkeypatch, tmp_path):
+        """下载失败不抛错(主循环串行阶段重试/回退缓存)。"""
+        def _fail(*a, **k):
+            raise ValueError("模拟失败")
+
+        monkeypatch.setattr(daily_signal, "download_with_cache", _fail)
+        monkeypatch.setattr(daily_signal, "CACHE_DIR", str(tmp_path / "nc"))
+        n = daily_signal.prefetch_data([{"symbol": "000001"}], 2, quiet=True)
+        assert n == 1  # 尝试数(失败静默)
+
+    def test_prefetch_is_parallel(self, monkeypatch, tmp_path):
+        """并行生效: 4 只各耗时 0.3s → 总耗时显著小于串行 1.2s。"""
+        import time
+
+        def _slow(sym, years, at="stock"):
+            time.sleep(0.3)
+            return pd.DataFrame()
+
+        monkeypatch.setattr(daily_signal, "download_with_cache", _slow)
+        monkeypatch.setattr(daily_signal, "CACHE_DIR", str(tmp_path / "nc"))
+        t0 = time.time()
+        daily_signal.prefetch_data(
+            [{"symbol": f"{i:06d}"} for i in range(4)], 2, quiet=True)
+        elapsed = time.time() - t0
+        assert elapsed < 1.0, f"并行未生效: 耗时 {elapsed:.2f}s (串行应 ~1.2s)"
+
+    def test_no_pending_returns_zero(self, monkeypatch, tmp_path):
+        """全部缓存新鲜 → 返回 0, 无下载。"""
+        calls = []
+        monkeypatch.setattr(daily_signal, "download_with_cache",
+                            lambda *a, **k: calls.append(1))
+        monkeypatch.setattr(daily_signal, "CACHE_DIR", str(tmp_path / "nc"))
+        assert daily_signal.prefetch_data([], 2, quiet=True) == 0
+        assert calls == []

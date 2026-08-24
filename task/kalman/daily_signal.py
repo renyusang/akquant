@@ -150,6 +150,62 @@ def download_with_cache(symbol: str, data_years: int = 2, asset_type: str = "sto
 # =============================================================================
 # 主流程
 # =============================================================================
+def prefetch_data(watchlist: list, data_years: int = 2, workers: int = 8,
+                  quiet: bool = False) -> int:
+    """并行预取缺失/过期行情数据(2026-08-24)。
+
+    主循环 evaluate_stock 前用线程池并行下载 watchlist 中缓存缺失或
+    未更新到今日的标的, 评估阶段全部缓存命中。
+
+    设计依据:
+    - 下载无副作用(各写各的 .cache 文件) → 可安全并行;
+      evaluate_stock 含下单/资金计数副作用 → 评估阶段必须保持串行
+    - 实测 8 路并行 8 只 5.7s vs 串行 22.3s(3.9x), 16 路无限流;
+      8 路为性价比拐点(16 只 4.6s vs 8 路 5.7s)
+    - 失败标的静默跳过: 主循环串行阶段自然重试或回退旧缓存
+    - 配合 data_utils socket 30s 超时兜底, 单只挂起不再阻塞全部
+
+    返回实际下载(尝试)数。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _needs(symbol: str) -> bool:
+        cache_path = os.path.join(CACHE_DIR, f"{symbol}.parquet")
+        if not os.path.exists(cache_path):
+            return True
+        try:
+            cached = pd.read_parquet(cache_path)
+            if len(cached) == 0:
+                return True
+            last_date = pd.to_datetime(cached["date"].max())
+            return last_date.date() < datetime.now().date()
+        except Exception:
+            return True
+
+    pending = [s for s in watchlist if _needs(s["symbol"])]
+    if not pending:
+        return 0
+    if not quiet:
+        print(f"  ⚡ 并行预取数据 ({len(pending)} 只, {workers} 路线程)...")
+
+    def _fetch(stock: dict) -> None:
+        try:
+            download_with_cache(stock["symbol"], data_years,
+                                stock.get("type", "stock"))
+        except Exception:
+            pass  # 失败留给主循环串行阶段重试/回退缓存
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for _ in ex.map(_fetch, pending):
+            done += 1
+            if not quiet and done % 10 == 0:
+                print(f"    预取 {done}/{len(pending)}")
+    if not quiet:
+        print(f"  ⚡ 预取完成 ({done}/{len(pending)})")
+    return len(pending)
+
+
 def evaluate_stock(
     stock: Dict[str, Any],
     config: Dict[str, Any],
@@ -651,6 +707,10 @@ def main() -> None:
     # ---- 0. 数据校验 ----
     data_issues, order_issues = run_all_checks(all_watchlist, quiet=args.quiet)
     all_validation_issues = data_issues + order_issues
+
+    # ---- 0.5 并行预取数据(2026-08-24): 评估循环前并行下载缺失/过期数据,
+    # 主循环串行评估时全部缓存命中(下载无副作用可并行, 评估有副作用须串行)
+    prefetch_data(all_watchlist, data_years, quiet=args.quiet)
 
     positions_before = len(load_positions())
     results = []
