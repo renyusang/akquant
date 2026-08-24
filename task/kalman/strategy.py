@@ -145,9 +145,17 @@ class KalmanStrategy(Strategy):
         # ---- SignalEngine 实例（按 symbol 管理） ----
         self._engines: Dict[str, SignalEngine] = {}
         self._entry_prices: Dict[str, float] = {}
-        # 延迟下单:T日信号存 pending,T+1 on_bar 检查一字涨跌停后下单(CurrentOpen T+1 撮合)
-        self._pending_buys: Dict[str, tuple] = {}    # {symbol: (signal_close, target_pct)}
+        # 已下单未成交的买入登记(2026-08-24 修复超买):
+        #   {symbol: (signal_close, order_bar)} — 用于失败超时释放名额。
+        # 原漏洞: 引擎按事件流调度(下一事件即撮合), get_positions() 的
+        # ctx.positions 快照在多 symbol 回测下会 stale(返回空), 同 bar 多
+        # 标的买入全部放行 → T+1 全部成交, 实际持仓远超 max_positions
+        # (组合回测曾出现单日 19 只入场)。实盘 daily_signal 有两阶段下单
+        # 含 pending 名额检查, 回测侧对齐。
+        self._pending_buys: Dict[str, tuple] = {}    # {symbol: (signal_close, order_bar)}
         self._pending_sells: Dict[str, float] = {}   # {symbol: signal_close}
+        # 自维护持仓标的数(含已下单未成交): 不依赖引擎快照(会 stale)
+        self._opened_count: int = 0
         self._trade_count: int = 0
         # 最小持仓周期: 记录每标的的入场 bar 序号(加仓不重置)
         self._bar_count: int = 0
@@ -260,6 +268,8 @@ class KalmanStrategy(Strategy):
         close_price: float = bar.close
         self._bar_count += 1
 
+        self._clean_pending_buys(symbol)
+        self._clean_pending_sells(symbol)
         engine = self._get_engine(symbol)
         engine.set_position(
             float(self.get_position(symbol)) > 0,
@@ -306,14 +316,11 @@ class KalmanStrategy(Strategy):
                         f"close¥{close_price:.2f}≥涨停¥{limit_up:.2f}"
                     )
                     return
-                if self.max_positions > 0:
-                    held = sum(
-                        1
-                        for s, v in self.get_positions().items()
-                        if abs(float(v)) > 0
-                    )
-                    if held >= self.max_positions:
-                        return
+                # 修复(2026-08-24): 自维护持仓计数(含已下单未成交)检查名额。
+                # 不用 get_positions()——ctx.positions 快照在多 symbol 回测下
+                # stale(返回空导致超买漏洞); _opened_count 由下单/卖出维护。
+                if self.max_positions > 0 and self._opened_count >= self.max_positions:
+                    return
                 target_pct = result["target_pct"] * self.single_position_pct
                 # 按 initial_cash 固定金额下单(对齐 portfolio_backtest,无复利效应)
                 self.order_target_value(
@@ -322,6 +329,8 @@ class KalmanStrategy(Strategy):
                 )
                 self._entry_prices[symbol] = close_price
                 self._entry_bars[symbol] = self._bar_count
+                self._pending_buys[symbol] = (close_price, self._bar_count)
+                self._opened_count += 1
                 self._trade_count += 1
                 self.log(
                     f"[买入] {bar.timestamp_iso} | "
@@ -360,6 +369,11 @@ class KalmanStrategy(Strategy):
                         return
                 entry_price = self._entry_prices.get(symbol, close_price)
                 self.close_position(symbol)
+                # 修复(2026-08-24): 卖出下单不立即释放名额——卖出订单 T+1
+                # 才成交, 若被拒持仓保留; 立即 -1 会让名额提前释放 → 同日
+                # 新买入 → 持仓净增(曾致最大持仓 10)。改为登记 _pending_sells,
+                # 成交后(持仓消失)由 _clean_pending_sells 释放名额。
+                self._pending_sells[symbol] = close_price
                 self._trade_count += 1
                 pnl_pct = (close_price / entry_price - 1) * 100
                 self.log(
@@ -386,6 +400,41 @@ class KalmanStrategy(Strategy):
                         f"趋势→{result['trend']} | "
                         f"卡尔曼估计={result['kalman_price']:.2f}"
                     )
+
+    # ------------------------------------------------------------------
+    # 待成交买入清理(2026-08-24 超买修复配套)
+    # ------------------------------------------------------------------
+    def _clean_pending_buys(self, symbol: str) -> None:
+        """清理某标的的待成交买入登记(2026-08-24 超买修复配套)。
+
+        - 已成交: get_position(symbol) > 0 → 移除登记(_opened_count 不变,
+          下单时已计入名额, 成交后该标的占用名额是事实)
+        - 被拒(资金不足等): get_open_orders(symbol) 已不含该订单且无持仓
+          → 移除登记并 _opened_count -= 1 释放名额
+        注意: 不能用 bar 窗口超时判断——多 symbol 回测下引擎按事件流调度,
+        同时间戳内 10 个 symbol 轮转会跨多个 bar 序号, 短窗口会误判
+        "超时"释放名额导致超买重现。get_open_orders 查引擎实时订单状态,
+        无此问题。
+        """
+        if symbol not in self._pending_buys:
+            return
+        if float(self.get_position(symbol)) > 0:
+            del self._pending_buys[symbol]          # 已成交
+        elif not self.get_open_orders(symbol):
+            del self._pending_buys[symbol]          # 订单消失且无持仓 = 被拒
+            self._opened_count = max(0, self._opened_count - 1)
+
+    def _clean_pending_sells(self, symbol: str) -> None:
+        """待成交卖出成交后释放名额(2026-08-24 超买修复配套)。
+
+        卖出下单时不释放名额(订单 T+1 才成交, 被拒则持仓保留——提前释放
+        会导致同日新买入使持仓净增)。成交后(持仓消失)再 -1 释放。
+        """
+        if symbol not in self._pending_sells:
+            return
+        if float(self.get_position(symbol)) <= 0:
+            del self._pending_sells[symbol]         # 持仓已清 = 卖出成交
+            self._opened_count = max(0, self._opened_count - 1)
 
     # ------------------------------------------------------------------
     # MA20 计算
