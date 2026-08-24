@@ -47,6 +47,7 @@ from portfolio import (
     remove_position,
     save_positions,
 )
+from live_report import _get_skipped_buys
 import pandas as pd
 
 
@@ -124,7 +125,12 @@ def cmd_show() -> None:
         return total_cost, total_market
 
     if not positions:
+        # 修复(2026-08-21): 无持仓时 stock_cost 等未初始化,
+        # 下方 total_cost = stock_cost + etf_cost 直接 UnboundLocalError
+        # (实盘 8-20 清仓后首次触发; 此前持仓从未清零)
         print("当前无持仓")
+        stock_cost = stock_market = etf_cost = etf_market = 0.0
+        total_pnl = 0.0
     else:
         stock_cost, stock_market = _print_table("股票", stock_pos, cash, max_pct, max_value)
         etf_cost, etf_market = _print_table("ETF", etf_pos, etf_cash, etf_max_pct, etf_max_value)
@@ -182,36 +188,17 @@ def cmd_show() -> None:
                 ps = f"+¥{pnl:,.0f}" if pnl >= 0 else f"¥{pnl:,.0f}"
                 print(f"   {t['symbol']} {t['name']} {int(t['shares'])}股  ¥{float(t['entry_price']):.2f}→¥{float(t['exit_price']):.2f}  {ps}  {t['entry_date']}→{t['exit_date']}")
 
-    skipped = []
-    elog_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "execution_log.csv")
-    sig_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals.csv")
-    if os.path.exists(elog_csv) and os.path.exists(sig_csv):
-        elog = pd.read_csv(elog_csv, dtype={"symbol": str})
-        elog["symbol"] = elog["symbol"].str.zfill(6)
-        sig_df = pd.read_csv(sig_csv, dtype={"symbol": str})
-        sig_df["symbol"] = sig_df["symbol"].str.zfill(6)
-        latest = sig_df.sort_values("date").groupby("symbol").last()
-        pos_set = set(positions.keys())
-        pend_set = {o["symbol"] for o in pending}
-        seen = set()
-        for _, r in elog.iterrows():
-            sym = r["symbol"]
-            if r.get("status") != "skipped" or r.get("action") != "buy":
-                continue
-            if sym in pos_set or sym in pend_set or sym in seen:
-                continue
-            seen.add(sym)
-            if sym in latest.index:
-                row = latest.loc[sym]
-                c = float(row.get("close", 0))
-                k = float(row.get("kalman_price", c))
-                dev = (c / k - 1) * 100 if k > 0 else 0
-                # 仅正偏离(实际价>滤波价)才是买入候选; 负偏离应卖出
-                if dev <= 0:
-                    continue
-                target_pct = float(row.get("target_pct", 0.95))
-                skipped.append({"symbol": sym, "name": row.get("name", sym), "close": c, "deviation": dev, "trend": row.get("trend", "?"), "target_pct": target_pct})
-        skipped.sort(key=lambda x: x["deviation"], reverse=True)
+    # 被跳过的买入候选(2026-08-21 起复用 live_report 规范实现:
+    # watchlist + 近5日过滤 + 跳过当日快照; 原 manage 内联复制无这些过滤,
+    # 会永久显示历史跳过与已移出池标的, 且日期误用最新信号日期)
+    name_map = {}
+    try:
+        wl = cfg.get("watchlist", {})
+        for item in (wl.get("stocks", []) or []) + (wl.get("etfs", []) or []):
+            name_map[str(item["symbol"]).zfill(6)] = item.get("name", item["symbol"])
+    except Exception:
+        name_map = {}
+    skipped = _get_skipped_buys(pending, name_map)
 
     stock_skipped = [s for s in skipped if not s["symbol"].startswith(etf_prefixes)]
     etf_skipped = [s for s in skipped if s["symbol"].startswith(etf_prefixes)]
@@ -219,7 +206,7 @@ def cmd_show() -> None:
     def _show_group(label, items, pool_slots, pool_cash, pool_max_pct):
         if not items:
             return
-        print(f"\n⏸️ [{label}] 待买入 ({len(items)} 只，空位{pool_slots}个):")
+        print(f"\n⏸️ [{label}] 近期被跳过的买入候选 ({len(items)} 只，当前空位{pool_slots}个):")
         picked = 0
         for s in items:
             sym = s["symbol"]
@@ -240,13 +227,14 @@ def cmd_show() -> None:
             trend = s.get("trend", "up")
             target = 0.30 if trend == "down" else 0.95
             est_qty = int(pool_cash * pool_max_pct * target / s["close"] / lot) * lot
+            skip_tag = f"  跳过{s['signal_date']}"
             if blocked:
-                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  偏离{s['deviation']:+.1f}%  趋势={s['trend']}  ⚠️涨停跳过")
+                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  偏离{s['deviation']:+.1f}%  趋势={s['trend']}{skip_tag}  ⚠️涨停跳过")
             elif picked < pool_slots:
-                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  {est_qty}股  偏离{s['deviation']:+.1f}%  趋势={s['trend']}  ← 买入 #{picked+1}")
+                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  {est_qty}股  偏离{s['deviation']:+.1f}%  趋势={s['trend']}{skip_tag}  ← 买入 #{picked+1}")
                 picked += 1
             else:
-                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  {est_qty}股  偏离{s['deviation']:+.1f}%  趋势={s['trend']}")
+                print(f"   {s['symbol']} {s['name']:<6s} ¥{s['close']:>8.2f}  {est_qty}股  偏离{s['deviation']:+.1f}%  趋势={s['trend']}{skip_tag}")
 
     pending_sells = sum(1 for o in pending if o.get("action") == "sell")
     pending_buys = len(pending) - pending_sells

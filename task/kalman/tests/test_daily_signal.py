@@ -372,7 +372,12 @@ class TestAutoFillAfterSell:
     """卖出成交空出仓位后, 用被跳过候选立即补仓。"""
 
     def _setup(self, monkeypatch, tmp_path, positions, pending):
-        """初始化临时状态文件。"""
+        """初始化临时状态文件。
+
+        修复(2026-08-21): 原 _auto_fill_pool 经 load_config() 读**生产**
+        stocks.yaml——股票池现金从 20 万调至 30 万后买入量 100→200 股,
+        测试断言随之失败。改为固定临时配置(20万池), 测试与生产配置解耦。
+        """
         import json
         import portfolio
 
@@ -388,6 +393,24 @@ class TestAutoFillAfterSell:
         # 缓存目录指向不存在 → 跳过涨停检查
         monkeypatch.setattr(daily_signal, "CACHE_DIR",
                             str(tmp_path / "no_cache"))
+        # 固定测试配置(股票池 20 万), 不随生产 stocks.yaml 漂移。
+        # 注意: load_config 默认参数 path=CONFIG_FILE 在定义时已绑定,
+        # patch 模块属性无效 → 直接 patch load_config 指向临时文件
+        cfg_file = tmp_path / "stocks.yaml"
+        cfg_file.write_text(
+            "stock:\n  initial_cash: 200000\n  max_positions: 5\n"
+            "  single_position_pct: 0.20\n"
+            "etf:\n  initial_cash: 100000\n  max_positions: 5\n"
+            "  single_position_pct: 0.20\n"
+            "strategy: {}\n"
+            "watchlist:\n  stocks: []\n  etfs: []\n", encoding="utf-8")
+
+        def _fixed_config(path=None):
+            import yaml
+            with open(str(cfg_file), encoding="utf-8") as f:
+                return yaml.safe_load(f)
+
+        monkeypatch.setattr(daily_signal, "load_config", _fixed_config)
         return portfolio
 
     @staticmethod

@@ -11,7 +11,7 @@
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
 import numpy as np
@@ -19,6 +19,10 @@ import pandas as pd
 import yaml
 
 TASK_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 被跳过买入候选的显示窗口(天): 过期候选已失效(新买入需新信号),
+# 与 daily_signal _auto_fill_pool 只用当日候选的设计一致
+_SKIPPED_WINDOW_DAYS = 5
 
 
 # 图表高度自适应脚本(2026-08-19, P2): 窄屏(≤600px 宽或 ≤500px 高, 覆盖
@@ -148,6 +152,15 @@ def build_live_report():
     equity_curve["date"] = pd.to_datetime(equity_curve["date"])
     # 去重：同一天取最后一条
     eq = equity_curve.groupby("date")["equity"].last()
+    # 分池权益曲线(2026-08-21): 股票池/基金池各自单独曲线, 供走势图叠加
+    eq_stock = _build_equity_curve(trades, positions, price_map, stock_cash,
+                                   price_history, pool="stock")
+    eq_stock["date"] = pd.to_datetime(eq_stock["date"])
+    eq_stock = eq_stock.groupby("date")["equity"].last()
+    eq_etf = _build_equity_curve(trades, positions, price_map, etf_cash,
+                                 price_history, pool="etf")
+    eq_etf["date"] = pd.to_datetime(eq_etf["date"])
+    eq_etf = eq_etf.groupby("date")["equity"].last()
     # 沪深300基准(归一化到初始资金,与权益曲线对比)
     hs300_norm = None
     try:
@@ -166,7 +179,7 @@ def build_live_report():
     yearly_ret = eq.resample("YE").last().pct_change() * 100
 
     fig1 = make_subplots(rows=3, cols=1,
-                         subplot_titles=("权益曲线(含沪深300对比)", "回撤(%)", "年度收益(%)"),
+                         subplot_titles=("总权益(含沪深300对比)", "回撤(%)", "年度收益(%)"),
                          row_heights=[0.5, 0.25, 0.25], vertical_spacing=0.12)
     fig1.add_trace(go.Scatter(x=eq.index, y=eq, mode="lines", name="权益",
                    line=dict(color="#1f77b4", width=1.5), fill="tozeroy",
@@ -174,6 +187,9 @@ def build_live_report():
     if hs300_norm is not None:
         fig1.add_trace(go.Scatter(x=hs300_norm.index, y=hs300_norm.values, name="沪深300",
                        line=dict(color="#ff7f0e", dash="dash", width=1.2)), row=1, col=1)
+    # 分池独立图(2026-08-21): 股票池/基金池各自权益+回撤, 不并入总图
+    fig_stock = _build_pool_fig(eq_stock, "stock", "股票池")
+    fig_etf = _build_pool_fig(eq_etf, "etf", "基金池")
     # 买入标记
     elog_path2 = os.path.join(TASK_DIR, "execution_log.csv")
     buys_log = pd.DataFrame()
@@ -251,6 +267,11 @@ def build_live_report():
         chart2 = ""
 
     chart1 = fig1.to_html(full_html=False, include_plotlyjs=False)
+    # 分池独立图(2026-08-21): 股票池/基金池各自权益+回撤, col2 并排
+    chart_stock = _chart_box(
+        fig_stock.to_html(full_html=False, include_plotlyjs=False), 480, 400)
+    chart_etf = _chart_box(
+        fig_etf.to_html(full_html=False, include_plotlyjs=False), 480, 400)
 
     # ---- 构建表格 ----
     def _nm(sym):
@@ -323,7 +344,8 @@ def build_live_report():
 <h1>实盘交易报告</h1>
 <p style='color:#666;font-size:14px'>交易区间: {start_date} ~ {end_date} | 初始资金: ¥{initial_cash:,.0f} | 生成时间: {now}</p>
 <details open><summary><h2>核心指标</h2></summary>{metrics}</details>
-<details open><summary><h2>权益走势</h2></summary>{_chart_box(chart1, 800, 560)}</details>
+<details open><summary><h2>权益走势</h2></summary>{_chart_box(chart1, 800, 560)}
+<div class='col2'><div><h4>股票池</h4>{chart_stock}</div><div><h4>基金池</h4>{chart_etf}</div></div></details>
 <details open><summary><h2>月度收益</h2></summary>{_chart_box(chart2, 300, 260)}{monthly_table}</details>
 <details open><summary><h2>当前持仓</h2></summary>
 <div class='col2'><div><h3>股票</h3>{pos_stock_html}</div><div><h3>ETF</h3>{pos_etf_html}</div></div></details>
@@ -419,7 +441,7 @@ def _get_price_history():
 
 
 def _build_equity_curve(trades, positions, price_map, initial_cash,
-                        price_history=None):
+                        price_history=None, pool=None):
     """从 execution_log.csv + trades.csv + positions.json 重建权益曲线。
 
     数据来源:
@@ -429,7 +451,18 @@ def _build_equity_curve(trades, positions, price_map, initial_cash,
 
     历史点持仓市值用当日收盘价(price_history), 缺失回退当前价;
     最终快照(今日)用当前价。
+
+    pool: None=合并曲线(股票+ETF); "stock"/"etf"=仅该池——按代码前缀
+    过滤事件与持仓, 初始资金用该池的 initial_cash(2026-08-21 新增,
+    供权益走势图叠加股票池/基金池单独曲线)。
     """
+    is_etf = lambda s: str(s).zfill(6).startswith(("51", "15", "58", "56"))
+
+    def _in_pool(sym: str) -> bool:
+        if pool is None:
+            return True
+        return is_etf(sym) == (pool == "etf")
+
     elog_path = os.path.join(TASK_DIR, "execution_log.csv")
 
     # 收集所有买卖事件
@@ -441,6 +474,8 @@ def _build_equity_curve(trades, positions, price_map, initial_cash,
         elog["symbol"] = elog["symbol"].str.zfill(6)
         executed_buys = elog[(elog["action"] == "buy") & (elog["status"] == "executed")]
         for _, b in executed_buys.iterrows():
+            if not _in_pool(str(b["symbol"]).zfill(6)):
+                continue
             events.append({
                 "date": str(b["exec_date"])[:10],
                 "type": "buy",
@@ -451,6 +486,8 @@ def _build_equity_curve(trades, positions, price_map, initial_cash,
 
     # 卖出事件：从 trades.csv
     for _, t in trades.iterrows():
+        if not _in_pool(str(t["symbol"]).zfill(6)):
+            continue
         exit_date = str(t.get("exit_date", ""))[:10]
         if exit_date and exit_date != "nan":
             events.append({
@@ -497,10 +534,11 @@ def _build_equity_curve(trades, positions, price_map, initial_cash,
             market_value += h["shares"] * float(px)
         equity_rows.append({"date": ev["date"], "equity": cash + market_value})
 
-    # 最终快照
+    # 最终快照(分池时只统计该池持仓)
     current_market = sum(
         p["shares"] * price_map.get(sym, p["avg_cost"])
         for sym, p in positions.items()
+        if _in_pool(sym)
     )
     equity_rows.append({
         "date": datetime.now().strftime("%Y-%m-%d"),
@@ -513,6 +551,37 @@ def _build_equity_curve(trades, positions, price_map, initial_cash,
 # =============================================================================
 # HTML table builders
 # =============================================================================
+def _build_pool_fig(eq_pool, pool: str, title: str):
+    """构建分池独立权益图(2026-08-21): 权益 + 回撤 两个子图。
+
+    股票池/基金池各自的权益曲线与回撤(从本池初始资金起算的 cummax),
+    不并入总权益图——两池规模不同(30万 vs 10万), 合画会互相压缩波动。
+    eq_pool: 已按日期去重的权益 Series。
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    color = "#2ca02c" if pool == "stock" else "#9467bd"
+    fig = make_subplots(rows=2, cols=1,
+                        subplot_titles=(f"{title}权益", "回撤(%)"),
+                        row_heights=[0.65, 0.35], vertical_spacing=0.12)
+    fig.add_trace(go.Scatter(x=eq_pool.index, y=eq_pool, mode="lines",
+                   line=dict(color=color, width=1.5), fill="tozeroy",
+                   fillcolor="rgba(0,0,0,0.04)"), row=1, col=1)
+    dd = (eq_pool - eq_pool.cummax()) / eq_pool.cummax() * 100
+    fig.add_trace(go.Scatter(x=dd.index, y=dd.values, fill="tozeroy",
+                   line=dict(color="#d62728", width=1)), row=2, col=1)
+    fig.update_layout(height=480, margin=dict(l=40, r=20, t=40, b=20),
+                      showlegend=False)
+    # 权益纵轴自适应(与 fig1 同款: 紧贴数据±5%)
+    if len(eq_pool) > 0:
+        lo = float(eq_pool.min())
+        hi = float(eq_pool.max())
+        pad = (hi - lo) * 0.05 or 1.0
+        fig.update_yaxes(range=[lo - pad, hi + pad], row=1, col=1)
+    return fig
+
+
 def _positions_table(pos_list, name_map, label, pool_cash):
     if not pos_list:
         return f"<div class='summary-text'>{label}: 无持仓 (可用 ¥{pool_cash:,.0f})</div>"
@@ -648,13 +717,24 @@ def _pending_orders_html(name_map, stock_cash, etf_cash):
     return "\n".join(html_parts)
 
 
-def _get_skipped_buys(pending, name_map):
-    """从 execution_log.csv + signals.csv 提取被跳过的买入信号。
+def _get_skipped_buys(pending, name_map, within_days: int = _SKIPPED_WINDOW_DAYS):
+    """从 execution_log.csv + signals.csv 提取近期被跳过的买入候选。
 
-    逻辑对齐 manage.py cmd_show:
-    - execution_log 中 status=skipped, action=buy
-    - 排除已持仓或已有 pending 订单的标的
-    - 从 signals.csv 获取最新信号信息（close, kalman_price, trend）
+    修复(2026-08-21)——原实现三处误导:
+    1. 无 watchlist 过滤: 已移出监控列表的旧池标的(永不复扫)仍显示为候选
+    2. 无日期过滤: 数周前的历史跳过永久显示(池清空后仍显示旧候选)
+    3. 日期列误用 signals.csv 最新信号日期: 跳过发生在几周前却显示为
+       "昨日被跳过"; 现价/偏离同样混用最新快照, 与跳过事件时间点不一致
+
+    现行为:
+    - 仅显示当前 watchlist 内标的(name_map), 排除已持仓/已有待执行订单
+    - 每标的取最新一次跳过记录, 信号价/偏离/趋势取**跳过当日**的
+      signals.csv 快照(行内时间点一致, 不混用最新价)
+    - 仅显示近 within_days 天内的跳过——过期候选已失效(新买入需新信号,
+      与 daily_signal _auto_fill_pool 只用当日候选的设计一致)
+    - 负偏离(应卖出)不列入
+
+    manage.py cmd_show 复用本函数。
     """
     import pandas as pd
 
@@ -665,48 +745,58 @@ def _get_skipped_buys(pending, name_map):
     if not os.path.exists(elog_path) or not os.path.exists(sig_path):
         return []
 
-    elog = pd.read_csv(elog_path, dtype={"symbol": str})
+    elog = pd.read_csv(elog_path, dtype={"symbol": str, "signal_date": str})
     elog["symbol"] = elog["symbol"].str.zfill(6)
     sig_df = pd.read_csv(sig_path, dtype={"symbol": str})
     sig_df["symbol"] = sig_df["symbol"].str.zfill(6)
 
-    # 最新信号快照
-    latest = sig_df.sort_values("date").groupby("symbol").last()
+    # 每标的最新一次 skip 记录
+    sk = elog[(elog["status"] == "skipped") & (elog["action"] == "buy")].copy()
+    if sk.empty:
+        return []
+    sk = sk[sk["signal_date"].notna()]
+    sk = sk.sort_values("signal_date").groupby("symbol").last().reset_index()
+
+    # 跳过当日的信号快照 {(symbol, date): row}
+    sig_idx = {(str(r["symbol"]).zfill(6), str(r["date"])[:10]): r
+               for _, r in sig_df.iterrows()}
 
     # 当前持仓
     pos_set = set()
     if os.path.exists(pos_path):
-        import json
         with open(pos_path) as f:
             pos_set = set(json.load(f).keys())
 
     pend_set = {o["symbol"] for o in pending}
-    seen = set()
-    skipped = []
+    cutoff = (datetime.now() - timedelta(days=within_days)).strftime("%Y-%m-%d")
 
-    for _, r in elog.iterrows():
+    skipped = []
+    for _, r in sk.iterrows():
         sym = r["symbol"]
-        if r.get("status") != "skipped" or r.get("action") != "buy":
+        if sym in pos_set or sym in pend_set:
             continue
-        if sym in pos_set or sym in pend_set or sym in seen:
+        if sym not in name_map:  # 已移出 watchlist 的旧池标的
             continue
-        seen.add(sym)
-        if sym in latest.index:
-            row = latest.loc[sym]
-            c = float(row.get("close", 0))
-            k = float(row.get("kalman_price", c))
-            dev = (c / k - 1) * 100 if k > 0 else 0
-            if dev <= 0:
-                continue  # 负偏离=卖出信号,不列入待买入
-            skipped.append({
-                "symbol": sym,
-                "name": row.get("name", sym),
-                "close": c,
-                "deviation": dev,
-                "trend": row.get("trend", "?"),
-                "target_pct": float(row.get("target_pct", 0.95)),
-                "signal_date": str(row.get("date", ""))[:10],
-            })
+        skip_date = str(r["signal_date"])[:10]
+        if not skip_date or skip_date < cutoff:  # 过期跳过, 候选已失效
+            continue
+        row = sig_idx.get((sym, skip_date))
+        if row is None:  # 跳过当日无信号快照, 无法还原当日状态
+            continue
+        c = float(row.get("close", 0))
+        k = float(row.get("kalman_price", c))
+        dev = (c / k - 1) * 100 if k > 0 else 0
+        if dev <= 0:
+            continue  # 负偏离=卖出信号, 不列入待买入
+        skipped.append({
+            "symbol": sym,
+            "name": row.get("name", sym),
+            "close": c,
+            "deviation": dev,
+            "trend": row.get("trend", "?"),
+            "target_pct": float(row.get("target_pct", 0.95)),
+            "signal_date": skip_date,
+        })
 
     # 按偏离度降序
     skipped.sort(key=lambda x: x["deviation"], reverse=True)
@@ -714,27 +804,27 @@ def _get_skipped_buys(pending, name_map):
 
 
 def _build_skipped_table(html_parts, skipped, name_map):
-    """构建被跳过买入信号表格。"""
+    """构建被跳过买入信号表格(跳过当日快照, 日期/价格时间点一致)。"""
     import pandas as pd
 
     rows = []
     for s in skipped:
         sym = str(s["symbol"]).zfill(6)
         name = name_map.get(sym, s["name"])
-        dev = s["deviation"]
         rows.append({
             "代码": sym,
             "名称": name,
-            "现价": f'{s["close"]:.2f}',
+            "信号价": f'{s["close"]:.2f}',
             "偏离": f'{s["deviation"]:+.1f}%',
             "趋势": s["trend"],
-            "信号日": s["signal_date"],
+            "跳过日": s["signal_date"],
         })
 
     df = pd.DataFrame(rows)
     html_parts.append(
         f'<p style="margin-top:16px;color:#e67e22;font-weight:bold">'
-        f'⏸️ 被跳过 ({len(skipped)} 笔，仓位满/资金不足)</p>'
+        f'⏸️ 被跳过 ({len(skipped)} 笔，跳过时仓位满/资金不足，'
+        f'近{_SKIPPED_WINDOW_DAYS}日内)</p>'
     )
     html_parts.append(
         _wrap_table(df.to_html(index=False, classes="data-table skipped-table", border=0,

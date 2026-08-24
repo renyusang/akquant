@@ -271,3 +271,251 @@ class TestBuildReportSmoke:
         n_box = html.count("class='chart-box'")
         n_plot = html.count('class="plotly-graph-div"')
         assert n_box == n_plot
+
+
+class TestSkippedBuys:
+    """被跳过买入候选(2026-08-21 修复): watchlist/近5日过滤 + 跳过当日快照。
+
+    原实现三处误导: 无 watchlist 过滤(旧池标的永久显示)、无日期过滤
+    (数周前跳过永久显示)、日期/现价混用 signals.csv 最新快照(看似
+    "昨日被跳过", 实为几周前)。manage.py cmd_show 复用同一实现。
+    """
+
+    ELOG_COLS = ["signal_date", "exec_date", "symbol", "name", "action",
+                 "target_pct", "shares", "signal_reason", "exec_price",
+                 "status", "reason"]
+    SIG_COLS = ["date", "symbol", "name", "close", "kalman_price",
+                "kalman_velocity", "ma20", "ma20_rising", "trend",
+                "signal", "target_pct", "reason"]
+
+    def _d(self, days_ago):
+        from datetime import datetime, timedelta
+        return (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+
+    def _setup(self, monkeypatch, tmp_path, skips, sig_rows, positions=None):
+        """skips: [(date, symbol, reason)]; sig_rows: [(date, symbol, close, kalman, trend)]"""
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        elog = pd.DataFrame([{
+            "signal_date": d, "exec_date": "", "symbol": s, "name": s,
+            "action": "buy", "target_pct": 0.19, "shares": 100,
+            "signal_reason": "价格突破", "exec_price": "",
+            "status": "skipped", "reason": r,
+        } for d, s, r in skips], columns=self.ELOG_COLS)
+        elog.to_csv(tmp_path / "execution_log.csv", index=False)
+        sig = pd.DataFrame([{
+            "date": d, "symbol": s, "name": s, "close": c,
+            "kalman_price": k, "kalman_velocity": 0.0, "ma20": k,
+            "ma20_rising": True, "trend": t, "signal": "hold",
+            "target_pct": 0.19, "reason": "已达最大持仓数",
+        } for d, s, c, k, t in sig_rows], columns=self.SIG_COLS)
+        sig.to_csv(tmp_path / "signals.csv", index=False)
+        (tmp_path / "positions.json").write_text(
+            json.dumps(positions or {}), encoding="utf-8")
+
+    def test_recent_skip_shows_skip_date_and_snapshot(self, monkeypatch, tmp_path):
+        """昨日跳过: 日期=跳过日, 价格=跳过当日快照。"""
+        y, old = self._d(1), self._d(9)
+        self._setup(monkeypatch, tmp_path,
+                    skips=[(y, "000001", "已达最大持仓数(5)")],
+                    sig_rows=[(old, "000001", 8.0, 8.5, "up"),
+                              (y, "000001", 10.0, 9.7, "up")])
+        out = live_report._get_skipped_buys([], {"000001": "测试"})
+        assert len(out) == 1
+        assert out[0]["signal_date"] == y   # 跳过日, 而非最新信号日
+        assert out[0]["close"] == 10.0      # 跳过当日快照价
+        assert out[0]["deviation"] == pytest.approx((10.0 / 9.7 - 1) * 100)
+
+    def test_old_skip_filtered(self, monkeypatch, tmp_path):
+        """10 天前的跳过已失效(新买入需新信号) → 不显示。"""
+        d10 = self._d(10)
+        self._setup(monkeypatch, tmp_path,
+                    skips=[(d10, "000001", "已达最大持仓数(5)")],
+                    sig_rows=[(d10, "000001", 10.0, 9.7, "up")])
+        assert live_report._get_skipped_buys([], {"000001": "测试"}) == []
+
+    def test_removed_from_watchlist_filtered(self, monkeypatch, tmp_path):
+        """不在当前 watchlist(旧池标的, 永不复扫) → 不显示, 即使跳过很近。"""
+        y = self._d(1)
+        self._setup(monkeypatch, tmp_path,
+                    skips=[(y, "000002", "已达最大持仓数(5)")],
+                    sig_rows=[(y, "000002", 10.0, 9.7, "up")])
+        assert live_report._get_skipped_buys([], {"000001": "在池"}) == []
+
+    def test_held_and_pending_excluded(self, monkeypatch, tmp_path):
+        """已持仓 / 已有待执行订单的标的不列入候选。"""
+        y = self._d(1)
+        rows = [(y, s, 10.0, 9.7, "up") for s in ("000001", "000002", "000003")]
+        self._setup(monkeypatch, tmp_path,
+                    skips=[(y, s, "x") for s in ("000001", "000002", "000003")],
+                    sig_rows=rows,
+                    positions={"000001": {"shares": 100, "avg_cost": 9}})
+        out = live_report._get_skipped_buys(
+            [{"symbol": "000002", "action": "buy"}],
+            {"000001": "a", "000002": "b", "000003": "c"})
+        assert [s["symbol"] for s in out] == ["000003"]
+
+    def test_negative_deviation_excluded(self, monkeypatch, tmp_path):
+        """跳过当日偏离为负(实际是卖出方向) → 不列入待买入。"""
+        y = self._d(1)
+        self._setup(monkeypatch, tmp_path,
+                    skips=[(y, "000001", "x")],
+                    sig_rows=[(y, "000001", 9.0, 9.7, "up")])
+        assert live_report._get_skipped_buys([], {"000001": "a"}) == []
+
+    def test_latest_skip_wins(self, monkeypatch, tmp_path):
+        """同一标的多次跳过 → 取最新一次记录。"""
+        d3, d1 = self._d(3), self._d(1)
+        self._setup(monkeypatch, tmp_path,
+                    skips=[(d3, "000001", "旧原因"), (d1, "000001", "新原因")],
+                    sig_rows=[(d3, "000001", 10.0, 9.7, "up"),
+                              (d1, "000001", 11.0, 9.7, "up")])
+        out = live_report._get_skipped_buys([], {"000001": "a"})
+        assert len(out) == 1
+        assert out[0]["signal_date"] == d1
+        assert out[0]["close"] == 11.0
+
+    def test_skip_day_snapshot_not_latest(self, monkeypatch, tmp_path):
+        """跳过后又有更新信号(已转跌) → 仍显示跳过当日快照(时间点一致)。"""
+        d1, today = self._d(1), self._d(0)
+        self._setup(monkeypatch, tmp_path,
+                    skips=[(d1, "000001", "x")],
+                    sig_rows=[(d1, "000001", 10.0, 9.7, "up"),
+                              (today, "000001", 8.0, 8.5, "down")])
+        out = live_report._get_skipped_buys([], {"000001": "a"})
+        assert len(out) == 1
+        assert out[0]["close"] == 10.0
+        assert out[0]["trend"] == "up"
+
+    def test_no_skip_day_signal_excluded(self, monkeypatch, tmp_path):
+        """跳过当日无信号快照(无法还原当日状态) → 不显示。"""
+        y, d2 = self._d(1), self._d(2)
+        self._setup(monkeypatch, tmp_path,
+                    skips=[(y, "000001", "x")],
+                    sig_rows=[(d2, "000001", 10.0, 9.7, "up")])
+        assert live_report._get_skipped_buys([], {"000001": "a"}) == []
+
+    def test_missing_files_returns_empty(self, monkeypatch, tmp_path):
+        """无 execution_log/signals 文件 → 空列表(边界)。"""
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        assert live_report._get_skipped_buys([], {"000001": "a"}) == []
+
+    def test_manage_reuses_shared_helper(self):
+        """manage.py 复用 live_report 的规范实现(消除内联复制)。"""
+        import manage
+        assert manage._get_skipped_buys is live_report._get_skipped_buys
+
+
+class TestEquityCurvePool:
+    """分池权益曲线(2026-08-21): pool 参数按代码前缀过滤事件与持仓。
+
+    权益走势图叠加股票池/基金池单独曲线: 各自从本池初始资金起算,
+    只含本池买卖事件, 最终快照只统计本池持仓。
+    注意: 历史点无 price_history 时回退当前价(price_map), 与合并曲线同口径。
+    """
+
+    ROWS = [
+        {"signal_date": "2026-07-01", "exec_date": "2026-07-02",
+         "symbol": "000001", "name": "测试股", "action": "buy",
+         "target_pct": 0.19, "shares": 100, "signal_reason": "x",
+         "exec_price": 10.0, "status": "executed", "reason": ""},
+        {"signal_date": "2026-07-01", "exec_date": "2026-07-02",
+         "symbol": "510050", "name": "测试ETF", "action": "buy",
+         "target_pct": 0.19, "shares": 1000, "signal_reason": "x",
+         "exec_price": 1.0, "status": "executed", "reason": ""},
+        {"signal_date": "2026-07-03", "exec_date": "2026-07-04",
+         "symbol": "000001", "name": "测试股", "action": "sell",
+         "target_pct": 0.0, "shares": 100, "signal_reason": "x",
+         "exec_price": 11.0, "status": "executed", "reason": ""},
+    ]
+
+    def _setup(self, monkeypatch, tmp_path):
+        pd.DataFrame(self.ROWS).to_csv(tmp_path / "execution_log.csv", index=False)
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        return pd.DataFrame([{
+            "entry_date": "2026-07-01", "exit_date": "2026-07-04",
+            "symbol": "000001", "name": "测试股", "shares": 100,
+            "entry_price": 10.0, "exit_price": 11.0, "pnl": 100.0,
+            "pnl_pct": 10.0, "fee": 0.0, "reason": "x",
+        }])
+
+    POS = {"000001": {"name": "a", "shares": 100, "avg_cost": 10.0},
+           "510050": {"name": "b", "shares": 1000, "avg_cost": 1.0}}
+    PM = {"000001": 12.0, "510050": 1.2}
+
+    def test_stock_pool_only(self, monkeypatch, tmp_path):
+        """股票池: 只含股票事件, 初始=股票池现金, ETF 事件不进入。"""
+        trades = self._setup(monkeypatch, tmp_path)
+        raw = live_report._build_equity_curve(
+            trades, self.POS, self.PM, 300000.0, pool="stock")
+        assert raw["equity"].iloc[0] == pytest.approx(300000.0)
+        eq = raw.groupby("date")["equity"].last()
+        # 7-02: 现金299,000 + 000001持仓100×当前价12 = 300,200(ETF事件被过滤)
+        assert eq["2026-07-02"] == pytest.approx(300200.0)
+        # 7-04 卖出+1100: 300,100(持仓已清)
+        assert eq["2026-07-04"] == pytest.approx(300100.0)
+        # 最终快照: 300,100 + positions 股票持仓100×12 = 301,300
+        assert eq.iloc[-1] == pytest.approx(301300.0)
+
+    def test_etf_pool_only(self, monkeypatch, tmp_path):
+        """基金池: 只含 ETF 事件, 股票事件不进入; 无 ETF 卖出日无行。"""
+        trades = self._setup(monkeypatch, tmp_path)
+        raw = live_report._build_equity_curve(
+            trades, self.POS, self.PM, 100000.0, pool="etf")
+        assert raw["equity"].iloc[0] == pytest.approx(100000.0)
+        eq = raw.groupby("date")["equity"].last()
+        # 7-02: 现金99,000 + 510050持仓1000×1.2 = 100,200
+        assert eq["2026-07-02"] == pytest.approx(100200.0)
+        assert "2026-07-04" not in eq.index  # 无 ETF 事件
+        # 最终快照: 99,000 + ETF持仓1000×1.2 = 100,200
+        assert eq.iloc[-1] == pytest.approx(100200.0)
+
+    def test_merged_includes_both(self, monkeypatch, tmp_path):
+        """pool=None(合并): 两池事件都计入, 初始=总初始。"""
+        trades = self._setup(monkeypatch, tmp_path)
+        raw = live_report._build_equity_curve(
+            trades, self.POS, self.PM, 400000.0)
+        assert raw["equity"].iloc[0] == pytest.approx(400000.0)
+        eq = raw.groupby("date")["equity"].last()
+        assert eq["2026-07-02"] == pytest.approx(400400.0)  # 双池事件
+        assert eq["2026-07-04"] == pytest.approx(400300.0)
+        assert eq.iloc[-1] == pytest.approx(401500.0)
+
+
+class TestBuildReportPoolTraces:
+    """分池权益独立成图(2026-08-21): 股票池/基金池各自权益+回撤图,
+    不并入总权益图(col2 并排, 手机自动堆叠)。"""
+
+    def test_pool_fig_has_equity_and_drawdown(self):
+        """分池图: 2 行子图(权益+回撤), 权益起点=池初始资金, 回撤从 cummax 算。"""
+        import pandas as pd
+        eq = pd.Series([300000.0, 306000.0, 297000.0],
+                       index=pd.to_datetime(
+                           ["2026-08-19", "2026-08-20", "2026-08-21"]))
+        fig = live_report._build_pool_fig(eq, "stock", "股票池")
+        assert len(fig.data) == 2  # 权益 + 回撤
+        # 权益线: 起点/终点正确
+        assert fig.data[0].y[0] == 300000.0
+        assert fig.data[0].y[-1] == 297000.0
+        # 回撤线: 峰值后回撤 = (297000-306000)/306000*100
+        assert fig.data[1].y[0] == 0.0
+        assert fig.data[1].y[-1] == pytest.approx((297000 - 306000) / 306000 * 100)
+        # 子图标题
+        assert "股票池权益" in fig.layout.annotations[0].text
+
+    def test_report_has_separate_pool_charts(self, monkeypatch, tmp_path):
+        """生成的 HTML: 主图不含股票池线; 股票/基金独立图各含权益+回撤。"""
+        TestBuildReportSmoke()._prepare(monkeypatch, tmp_path)
+        live_report.build_live_report()
+        html = (tmp_path / "live_report.html").read_text(encoding="utf-8")
+        decoded = html.encode("utf-8").decode("unicode_escape", errors="ignore")
+        # 独立图子图标题存在(2 张分池图 × 权益+回撤)
+        assert "股票池权益" in decoded
+        assert "基金池权益" in decoded
+        assert "回撤(%)" in decoded
+        # col2 布局容器存在(两分池图并排)
+        assert "class='col2'" in html or 'class="col2"' in html
+        # chart-box 共 4 个: 主图 800/560 + 股票池 480/400 + 基金池 480/400
+        # + 月度图 300/260(冒烟数据含月度数据)
+        assert html.count("class='chart-box'") == 4
+        assert html.count("data-dh='480' data-mh='400'") == 2
+        assert "data-dh='300' data-mh='260'" in html
