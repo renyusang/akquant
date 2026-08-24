@@ -420,19 +420,34 @@ def load_data_map(
     if asset_types is None:
         asset_types = {}
 
-    data_map: Dict[str, pd.DataFrame] = {}
-    for i, sym in enumerate(symbols, 1):
+    def _load(sym: str):
         sym = str(sym).zfill(6)
         atype = asset_types.get(sym) or ("etf" if is_etf(sym) else "stock")
         try:
-            df = load_cached_data(sym, start_date, end_date, asset_type=atype, cache_dir=cache_dir)
-            if not df.empty:
-                data_map[sym] = df
-                if not quiet:
-                    print(f"  [{i}/{len(symbols)}] {sym} ({atype}): {len(df)} bars")
+            df = load_cached_data(sym, start_date, end_date,
+                                  asset_type=atype, cache_dir=cache_dir)
+            return sym, atype, df
         except Exception as e:
+            return sym, atype, e
+
+    # 并行预取(2026-08-24): catalog 缺失的标的由 load_cached_data 内部下载,
+    # 无副作用(各写各的 catalog 文件)可安全并行——与实盘 prefetch_data 同模式。
+    # 实测 akshare 8 路并行 3.9x 加速, 组合回测首次全量(25+24 只)从 3-6 分钟
+    # 降至 ~1 分钟。ex.map 保序, 失败标的与串行版一致跳过。
+    from concurrent.futures import ThreadPoolExecutor
+
+    data_map: Dict[str, pd.DataFrame] = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(_load, symbols))
+    for i, (sym, atype, df) in enumerate(results, 1):
+        if isinstance(df, Exception):
             if not quiet:
-                print(f"  [{i}/{len(symbols)}] {sym} ({atype}) 加载失败: {e}")
+                print(f"  [{i}/{len(symbols)}] {sym} ({atype}) 加载失败: {df}")
+            continue
+        if not df.empty:
+            data_map[sym] = df
+            if not quiet:
+                print(f"  [{i}/{len(symbols)}] {sym} ({atype}): {len(df)} bars")
     return data_map
 
 

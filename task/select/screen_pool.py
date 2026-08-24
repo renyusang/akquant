@@ -336,22 +336,28 @@ def main() -> None:
     if red:
         print(f"  红线剔除 {len(red)} 只, 剩余 {len(candidates) - len(red)} 只")
 
-    # 数据准备: 缺失的下载到 .catalog(串行, 首次较慢)
-    print("数据准备(缺失自动下载到 .catalog)...")
+    # 数据准备: 缺失的并行下载到 .catalog(2026-08-24 由串行改 8 路线程池;
+    # 下载无副作用各写各文件可并行, 失败标的标记 skip 与串行版一致)
+    print("数据准备(缺失自动下载到 .catalog, 8 路并行)...")
+    from concurrent.futures import ThreadPoolExecutor
     from data_utils import load_cached_data
-    missing = []
-    for i, c in enumerate(candidates, 1):
-        if not os.path.exists(os.path.join(CATALOG_DIR, c["symbol"],
-                                           "data.parquet")):
-            missing.append(c)
-            try:
-                load_cached_data(c["symbol"], args.in_start, args.out_end,
-                                 asset_type=c["asset_type"])
-            except Exception as e:
-                print(f"  [跳过] {c['symbol']} 数据下载失败: {e}")
-                c["skip"] = True
-        if i % 20 == 0:
-            print(f"  数据检查 {i}/{len(candidates)}", flush=True)
+    missing = [c for c in candidates
+               if not os.path.exists(os.path.join(CATALOG_DIR, c["symbol"],
+                                                  "data.parquet"))]
+
+    def _prepare(c: dict):
+        try:
+            load_cached_data(c["symbol"], args.in_start, args.out_end,
+                             asset_type=c["asset_type"])
+        except Exception as e:
+            c["skip"] = True
+            return f"  [跳过] {c['symbol']} 数据下载失败: {e}"
+        return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for msg in ex.map(_prepare, missing):
+            if msg:
+                print(msg)
     if missing:
         print(f"  新下载 {len(missing)} 只")
 

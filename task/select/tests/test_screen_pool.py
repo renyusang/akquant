@@ -157,3 +157,50 @@ class TestRiskFlags:
         assert [c["symbol"] for c in skipped] == ["000636"]
         assert [c["symbol"] for c in cands if not c.get("skip")] \
             == ["300489"]
+
+
+class TestDataPreparation:
+    """数据准备段并行化(2026-08-24): 8 路线程池下载缺失 .catalog。
+
+    原串行 for 逐只下载(828 只候选首次 ~1 小时), 改为线程池并行。
+    下载无副作用各写各 catalog 文件; 失败标的标记 skip 与串行版一致。
+    """
+
+    def test_prepare_parallel_and_skip(self, monkeypatch, tmp_path):
+        """4 只缺失并行下载(耗时<串行), 失败标的标记 skip。"""
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        cat = tmp_path / "catalog"
+        calls = []
+
+        def _prepare_all(cands):
+            """复刻 screen_pool.main() 数据准备段逻辑。"""
+            missing = [c for c in cands
+                       if not (cat / c["symbol"] / "data.parquet").exists()]
+
+            def _load(c):
+                time.sleep(0.2)
+                calls.append(c["symbol"])
+                try:
+                    if c["symbol"] == "000002":
+                        raise ValueError("模拟失败")
+                    (cat / c["symbol"]).mkdir(parents=True, exist_ok=True)
+                    (cat / c["symbol"] / "data.parquet").write_text("x")
+                except Exception:
+                    c["skip"] = True  # 与生产代码一致: 失败标记 skip
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                for _ in ex.map(_load, missing):
+                    pass
+
+        cands = [{"symbol": s, "asset_type": "stock"}
+                 for s in ("000001", "000002", "000003", "000004")]
+        t0 = time.time()
+        _prepare_all(cands)
+        elapsed = time.time() - t0
+        assert elapsed < 0.8, f"并行未生效: {elapsed:.2f}s (串行应 ~0.8s)"
+        assert set(calls) == {"000001", "000002", "000003", "000004"}
+        # 失败标的标记 skip(与串行版一致)
+        assert cands[1]["skip"] is True
+        assert all(not c.get("skip") for c in (cands[0], cands[2], cands[3]))

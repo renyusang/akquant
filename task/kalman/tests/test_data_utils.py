@@ -62,3 +62,65 @@ class TestNetworkTimeout:
         monkeypatch.setattr(data_utils, "download_data", _fail)
         with pytest.raises(ValueError):
             daily_signal.download_with_cache("000001", data_years=2)
+
+
+class TestLoadDataMapParallel:
+    """load_data_map 并行预取(2026-08-24): 8 路线程池下载缺失 catalog。
+
+    与实盘 prefetch_data 同模式: 下载无副作用可并行; ex.map 保序;
+    失败标的跳过(与串行版一致)。
+    """
+
+    def _df(self, sym):
+        import numpy as np
+        return pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-01", "2026-01-02"]),
+            "open": [1.0, 2.0], "high": [1.5, 2.5],
+            "low": [0.5, 1.5], "close": [1.2, 2.2],
+            "volume": [100, 200], "symbol": [sym, sym],
+        })
+
+    def test_parallel_speedup(self, monkeypatch):
+        """4 只各耗时 0.3s → 总耗时显著小于串行 1.2s(并行生效)。"""
+        import time
+
+        def _slow(sym, *a, **k):
+            time.sleep(0.3)
+            return self._df(sym)
+
+        monkeypatch.setattr(data_utils, "load_cached_data", _slow)
+        t0 = time.time()
+        m = data_utils.load_data_map(["000001", "000002", "000003", "000004"])
+        assert time.time() - t0 < 1.0, "并行未生效"
+        assert set(m.keys()) == {"000001", "000002", "000003", "000004"}
+
+    def test_failure_skipped(self, monkeypatch):
+        """单只失败 → 跳过, 其余正常返回(与串行版一致)。"""
+
+        def _fail_if(sym, *a, **k):
+            if sym == "000002":
+                raise ValueError("模拟失败")
+            return self._df(sym)
+
+        monkeypatch.setattr(data_utils, "load_cached_data", _fail_if)
+        m = data_utils.load_data_map(["000001", "000002", "000003"], quiet=True)
+        assert set(m.keys()) == {"000001", "000003"}
+
+    def test_symbols_normalized_and_asset_types(self, monkeypatch):
+        """symbol 补零 + asset_types 映射传给 load_cached_data。"""
+        calls = []
+
+        def _spy(sym, start_date, end_date, asset_type, cache_dir):
+            calls.append((sym, asset_type))
+            return self._df(sym)
+
+        monkeypatch.setattr(data_utils, "load_cached_data", _spy)
+        data_utils.load_data_map(
+            ["1", "510050"], asset_types={"000001": "stock", "510050": "etf"},
+            quiet=True)
+        assert ("000001", "stock") in calls
+        assert ("510050", "etf") in calls
+
+    def test_empty_input(self, monkeypatch):
+        """空列表 → 空 dict。"""
+        assert data_utils.load_data_map([]) == {}
