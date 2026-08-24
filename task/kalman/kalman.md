@@ -555,6 +555,9 @@ bash run_daily.sh                  # crontab 已默认开启 --deploy
 - ETF: 上证50/沪深300/中证500/中证1000/创业板50/科创板50/科创创业50/创业板/黄金/消费/证券/医疗/军工/光伏/新能源车/银行/新能源/半导体/煤炭/有色金属/恒生科技/纳斯达克/5G通信/红利
 - 维护节奏: 季度动态重跑 screen_pool.py 全池筛选，踢垫底、补新候选（见 `task/select/overall_status.md`）
 
+### 数据下载挂起 (2026-08-24)
+**问题**: akshare(含 `akquant.utils.fetch_akshare_symbol`)底层 requests 无显式超时——网络挂起时进程无限等待, 8-24 daily_signal 在 20/49 处卡死 10 分钟(CPU 0.4%, 单独下载同一股票仅需 3.8s)。**修复**: `data_utils.py` 模块导入时 `socket.setdefaulttimeout(30)`——socket 级默认超时覆盖全部下载路径(股票/ETF/sina/em), 挂起 30s 抛 `socket.timeout` → `download_with_cache` 捕获后回退缓存数据(有缓存)或报错(无缓存), 不再无限等待。正常下载实测 ~4s, 30s 足够宽裕。新增 4 个测试(共 211 全绿)。
+
 ## 注意事项
 
 1. 买入信号在当日收盘后生成，**次交易日开盘价成交**，涨停时跳过

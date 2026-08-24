@@ -8,12 +8,21 @@
 """
 
 import os
+import socket
 from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
 from akquant.data import ParquetDataCatalog
 from akquant.utils import fetch_akshare_symbol
+
+# 网络超时兜底(2026-08-24): akshare(含 akquant.utils.fetch_akshare_symbol)
+# 底层 requests 无显式超时——网络挂起时进程无限等待(8-24 曾卡 10 分钟)。
+# socket 级默认超时覆盖全部下载路径(股票/ETF/sina/em), 挂起 30s 抛
+# socket.timeout → 调用方(download_with_cache)捕获后走缓存/报错。
+# 正常下载实测 ~4s, 30s 足够宽裕; 无重试需求(偶发抖动重跑即可)。
+_NETWORK_TIMEOUT = 30.0
+socket.setdefaulttimeout(_NETWORK_TIMEOUT)
 
 TASK_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(TASK_DIR, ".cache")
