@@ -9,3 +9,6 @@ actual_fills.json
 unlimited_report.html
 backups/
 __pycache__/
+
+# 配置备份(不入库, 与实盘 .bak 一致)
+*.bak_*
