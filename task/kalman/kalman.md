@@ -248,6 +248,8 @@ strategy:                     # 共享策略参数
   atr_adaptive_exit_enabled: true   # NATR自适应退出宽度(2026-08-04,默认启用)
   exit_atr_factor: 1.0              # 退出阈值=max(0.5%, 1.0×NATR),高波动期放宽
   sar_exit_enabled: false           # SAR跟踪止损(实证无效:0.5%回归先触发)
+  mfi_filter_enabled: true          # MFI超买过滤(2026-08-25启用,修复超买后组合+57.1pp)
+  mfi_overbought: 70.0              # MFI>70抑制买入(资金超买追高过滤)
 
 stock:                        # 股票池
   initial_cash: 300000
@@ -538,6 +540,12 @@ bash run_daily.sh                  # crontab 已默认开启 --deploy
 ---
 
 ## 配置变更记录
+
+### MFI 超买过滤启用 (2026-08-25)
+**变更**: 实盘 `stocks.yaml` 与无限仓位 `unlimited.yaml` 同步启用 `mfi_filter_enabled: true, mfi_overbought: 70`（备份 `stocks.yaml.bak_20260825` / `unlimited.yaml.bak_20260825`）。
+**依据**: 修复回测超买漏洞后（2026-08-24）的**真实基线**组合回测——MFI 超买过滤 **+57.1pp（53.9%→111.0%）、夏普 0.59→1.04、回撤 -23.1%→-13.4%**（两次独立复核一致）。旧研究（2026-08-05，超买虚增基线）曾判定"组合层面 -23.2pp 有害"——负效应建立在虚假的超买持仓上（实盘从不超买，daily_signal 两阶段下单有 pending 名额检查）；修复后过滤掉的追高单被质量更高的候选替换，收益质量提升而非数量减少（交易 799 vs 783 基本不变）。
+**机制**: MFI>70 视为资金超买（实证快速反转率 71.6% vs MFI<30 时 16.7%），抑制买入信号。
+**其他机制复测**（修复后基线, 均维持不启用）: ADX 门控 +2.1pp/回撤 -18.3%（温和改善）、转涨确认2 +6.0pp（交易 +200 笔）、min_hold/SAR 完全持平（SAR 仍被 0.5% 回归罩住）、RSI -7.4pp、转涨确认3 -5.8pp、BBANDS 挤压 -2.1pp。
 
 ### 资金池调整 (2026-08-21)
 **变更**: 股票池 `stock.initial_cash` ¥200,000 → **¥300,000**（备份 `stocks.yaml.bak_20260821`）。ETF 池不变（¥100,000）。

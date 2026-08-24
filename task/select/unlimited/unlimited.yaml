@@ -17,6 +17,8 @@ strategy:
   kalman_q_vel: 1.0e-05
   kalman_r: 0.01
   lot_based_position: true
+  mfi_filter_enabled: true      # 2026-08-25 与实盘同步启用(修复超买后组合+57.1pp)
+  mfi_overbought: 70.0
   sar_exit_enabled: false
   stop_loss_pct: 0.05
   trend_bear_pct: 0.3
