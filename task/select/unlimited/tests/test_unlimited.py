@@ -107,3 +107,49 @@ class TestNormalizedPnl:
         # 总资金 = 3×200×100 = 60000; 浮动 = 10×600 = 6000 → 10%
         assert total == pytest.approx(6000.0)
         assert norm == pytest.approx(0.10)
+
+
+class TestTradesTable:
+    """已完成交易配对表(2026-08-25 新增, 对齐实盘口径)。"""
+
+    def _trades(self):
+        return pd.DataFrame([{
+            "entry_date": "2026-08-21", "exit_date": "2026-08-25",
+            "symbol": "300502", "name": "新易盛", "shares": 100,
+            "entry_price": 445.15, "exit_price": 405.0, "pnl": -4068.0,
+            "pnl_pct": -9.1, "fee": 53.05, "reason": "止损(-7.4%)",
+        }, {
+            "entry_date": "2026-08-21", "exit_date": "2026-08-25",
+            "symbol": "300373", "name": "扬杰科技", "shares": 300,
+            "entry_price": 94.58, "exit_price": 95.0, "pnl": 89.0,
+            "pnl_pct": 0.3, "fee": 37.33, "reason": "价格回归(偏离-2.4%)",
+        }])
+
+    def test_table_structure(self):
+        """配对表: 汇总(笔数/盈利/胜率/总盈亏) + 表格含盈亏/收益率/持有天数。"""
+        trades = self._trades()
+        html = ur._trades_table(trades, {}, pd.DataFrame())
+        assert "共 2 笔" in html
+        assert "盈利 1 笔" in html
+        assert "胜率 50%" in html
+        assert "¥-3,979" in html  # 总盈亏 -4068+89
+        assert "-9.1%" in html and "+0.3%" in html
+        assert "持有天数" in html
+        assert "table-wrap" in html  # 滚动容器
+
+    def test_empty(self):
+        """无交易 → 占位文案。"""
+        html = ur._trades_table(
+            pd.DataFrame(), {}, pd.DataFrame())
+        assert "暂无已完成交易" in html
+
+    def test_name_fallback(self):
+        """trades 无 name 列时从其他源取名称。"""
+        trades = self._trades().drop(columns=["name"])
+        elog = pd.DataFrame([{
+            "symbol": "300502", "name": "新易盛", "action": "buy",
+            "exec_date": "2026-08-21", "exec_price": 445.15,
+            "shares": 100, "status": "executed",
+        }])
+        html = ur._trades_table(trades, {}, elog)
+        assert "新易盛" in html

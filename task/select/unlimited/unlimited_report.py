@@ -359,6 +359,9 @@ def build_unlimited_report() -> None:
                                 border=0, justify="center", escape=False)
                  if len(det_df) else "<p>暂无交易</p>")
 
+    # 已完成交易配对表(2026-08-25 新增, 对齐实盘)
+    trades_table = _trades_table(trades, positions, elog)
+
     # ---- 组装 HTML ----
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     html = f"""<!DOCTYPE html><html lang='zh-CN'>
@@ -371,6 +374,7 @@ max-width:1400px;margin:0 auto;padding:20px;background:#f5f5f5;color:#333;overfl
 h1{{color:#1a1a1a;border-bottom:3px solid #1f77b4;padding-bottom:10px}}
 h2{{color:#2c3e50;margin-top:40px;border-bottom:2px solid #ddd;padding-bottom:8px}}
 .positive{{color:#2ca02c}}.negative{{color:#d62728}}
+.summary-text{{font-size:14px;color:#555;margin:10px 0;padding:10px;background:white;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.05)}}
 .metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
 margin:20px 0;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1)}}
 .mcard{{padding:16px 12px;text-align:center;border-right:1px solid #eee;border-bottom:1px solid #eee}}
@@ -454,6 +458,9 @@ oninput='filterTables(this.value)'>
 <h2>信号状态（每只标的最近信号 + 未成交订单）</h2>
 <div class='table-wrap'>{sig_table}</div>
 
+<h2>已完成交易</h2>
+{trades_table}
+
 <h2>交易明细</h2>
 <div class='table-wrap'>{det_table}</div>
 
@@ -485,6 +492,39 @@ def _name_of(sym, positions, elog, trades):
         if len(m):
             return str(m.iloc[-1].get("name", sym))
     return sym
+
+
+def _trades_table(trades, positions, elog):
+    """已完成交易配对表(2026-08-25 新增, 对齐实盘 live_report 口径)。
+
+    trades.csv 为已平仓卖出记录: 入场/出场日期、入场/出场价、股数、
+    盈亏(含费)、收益率、持有天数。
+    """
+    if len(trades) == 0:
+        return "<p>暂无已完成交易</p>"
+    sells = trades.sort_values("exit_date", ascending=False).copy()
+    total_pnl = float(sells["pnl"].sum()) if "pnl" in sells.columns else 0.0
+    wins = int((sells["pnl"] > 0).sum()) if "pnl" in sells.columns else 0
+    sells["持有天数"] = (
+        pd.to_datetime(sells["exit_date"]) - pd.to_datetime(sells["entry_date"])
+    ).dt.days
+    sells["名称"] = sells["symbol"].apply(
+        lambda s: _name_of(str(s).zfill(6), positions, elog, sells))
+    disp = sells[["名称", "symbol", "entry_date", "exit_date", "shares",
+                  "entry_price", "exit_price", "pnl", "pnl_pct", "持有天数"]].copy()
+    disp.columns = ["名称", "代码", "入场日期", "出场日期", "股数",
+                    "入场价", "出场价", "盈亏", "收益率", "持有天数"]
+    disp["盈亏"] = disp["盈亏"].apply(
+        lambda x: f"<span class='{'positive' if float(x) > 0 else 'negative'}'>{float(x):+,.0f}</span>")
+    disp["收益率"] = disp["收益率"].apply(
+        lambda x: f"<span class='{'positive' if float(x) > 0 else 'negative'}'>{float(x):+.1f}%</span>")
+    summary = (f"<div class='summary-text'>共 {len(sells)} 笔 | 盈利 {wins} 笔 | "
+               f"胜率 {wins / len(sells) * 100:.0f}% | 总盈亏 "
+               f"<span class='{'positive' if total_pnl > 0 else 'negative'}'>"
+               f"¥{total_pnl:+,.0f}</span></div>")
+    table = disp.to_html(index=False, classes="data-table trades-table",
+                         border=0, justify="center", escape=False)
+    return summary + f"<div class='table-wrap'>{table}</div>"
 
 
 if __name__ == "__main__":
