@@ -47,9 +47,10 @@ class TestEquityCurvePriceHistory:
             {"000001": {"2026-07-20": 10.0}})
         # 现金 91000 + 1000股×当日收盘10 = 101,000
         day20 = eq[eq["date"] == "2026-07-20"]["equity"].iloc[-1]
-        assert day20 == pytest.approx(101000.0)
-        # 若误用当前价会是 106,000
-        assert day20 != pytest.approx(106000.0)
+        # 现金 91000 - 买入费5.09(佣金5+过户0.09) + 1000股×当日收盘10
+        assert day20 == pytest.approx(100994.91)
+        # 若误用当前价会是 105,994.91
+        assert day20 != pytest.approx(105994.91)
 
     def test_missing_history_falls_back_current(self, monkeypatch, tmp_path):
         """price_history 缺该日 → 回退当前价。"""
@@ -64,7 +65,7 @@ class TestEquityCurvePriceHistory:
         eq = live_report._build_equity_curve(
             trades, {}, {"000001": 15.0}, 100000.0, {})  # 无历史
         day20 = eq[eq["date"] == "2026-07-20"]["equity"].iloc[-1]
-        assert day20 == pytest.approx(106000.0)  # 91000 + 1000×15
+        assert day20 == pytest.approx(105994.91)  # 91000 - 5.09 + 1000×15
 
     def test_price_change_does_not_drift_history(self, monkeypatch, tmp_path):
         """当前价变化不影响历史权益点(修复核心)。"""
@@ -134,8 +135,10 @@ class TestMonthlyHeatmap:
         # 7 月 +2.0% / 8 月 -3.9%: 值仍正确渲染
         assert "+2.0%" in html
         assert "-3.9%" in html
-        # 全年列 = 各月之和
-        assert "-1.9%" in html
+        # 全年列 = 复合年收益(2026-08-25 起, 非算术和): 1.02×0.961-1 = -2.0%,
+        # 并显示金额(各月 amount 之和 = 2000 + (-2000) = 0)
+        assert "-2.0%" in html
+        assert "¥-2,000" in html
 
     def test_empty_equity_returns_empty(self):
         """无月度数据 → 空字符串(边界; eq 实际总是 DatetimeIndex)。"""
@@ -438,8 +441,8 @@ class TestEquityCurvePool:
             "pnl_pct": 10.0, "fee": 0.0, "reason": "x",
         }])
 
-    POS = {"000001": {"name": "a", "shares": 100, "avg_cost": 10.0},
-           "510050": {"name": "b", "shares": 1000, "avg_cost": 1.0}}
+    POS = {"000001": {"name": "a", "shares": 100, "avg_cost": 10.0501},
+           "510050": {"name": "b", "shares": 1000, "avg_cost": 1.00501}}
     PM = {"000001": 12.0, "510050": 1.2}
 
     def test_stock_pool_only(self, monkeypatch, tmp_path):
@@ -449,12 +452,12 @@ class TestEquityCurvePool:
             trades, self.POS, self.PM, 300000.0, pool="stock")
         assert raw["equity"].iloc[0] == pytest.approx(300000.0)
         eq = raw.groupby("date")["equity"].last()
-        # 7-02: 现金299,000 + 000001持仓100×当前价12 = 300,200(ETF事件被过滤)
-        assert eq["2026-07-02"] == pytest.approx(300200.0)
-        # 7-04 卖出+1100: 300,100(持仓已清)
+        # 7-02: 现金298,994.99 + 000001持仓100×当前价12 = 300,194.99(ETF事件被过滤)
+        assert eq["2026-07-02"] == pytest.approx(300194.99)
+        # 7-04 卖出后: equity = 初始 + realized(pnl=100) + 0 持仓 = 300,100
         assert eq["2026-07-04"] == pytest.approx(300100.0)
-        # 最终快照: 300,100 + positions 股票持仓100×12 = 301,300
-        assert eq.iloc[-1] == pytest.approx(301300.0)
+        # 最终快照: 300,000 + 100 + 持仓市值1200 - 含费成本1005.01 = 300,294.99
+        assert eq.iloc[-1] == pytest.approx(300294.99)
 
     def test_etf_pool_only(self, monkeypatch, tmp_path):
         """基金池: 只含 ETF 事件, 股票事件不进入; 无 ETF 卖出日无行。"""
@@ -463,11 +466,11 @@ class TestEquityCurvePool:
             trades, self.POS, self.PM, 100000.0, pool="etf")
         assert raw["equity"].iloc[0] == pytest.approx(100000.0)
         eq = raw.groupby("date")["equity"].last()
-        # 7-02: 现金99,000 + 510050持仓1000×1.2 = 100,200
-        assert eq["2026-07-02"] == pytest.approx(100200.0)
+        # 7-02: 初始 + 市值1200 - 含费成本1005.01 = 100,194.99
+        assert eq["2026-07-02"] == pytest.approx(100194.99)
         assert "2026-07-04" not in eq.index  # 无 ETF 事件
-        # 最终快照: 99,000 + ETF持仓1000×1.2 = 100,200
-        assert eq.iloc[-1] == pytest.approx(100200.0)
+        # 最终快照: 100,000 + 0 + 市值1200 - 含费成本1005.01 = 100,194.99
+        assert eq.iloc[-1] == pytest.approx(100194.99)
 
     def test_merged_includes_both(self, monkeypatch, tmp_path):
         """pool=None(合并): 两池事件都计入, 初始=总初始。"""
@@ -476,9 +479,10 @@ class TestEquityCurvePool:
             trades, self.POS, self.PM, 400000.0)
         assert raw["equity"].iloc[0] == pytest.approx(400000.0)
         eq = raw.groupby("date")["equity"].last()
-        assert eq["2026-07-02"] == pytest.approx(400400.0)  # 双池事件
-        assert eq["2026-07-04"] == pytest.approx(400300.0)
-        assert eq.iloc[-1] == pytest.approx(401500.0)
+        assert eq["2026-07-02"] == pytest.approx(400389.98)  # 双池事件(含2笔买入费)
+        assert eq["2026-07-04"] == pytest.approx(400294.99)  # realized=100
+        # 最终快照: 400,000 + 100 + 市值2400 - 含费成本2010.02 = 400,489.98
+        assert eq.iloc[-1] == pytest.approx(400489.98)
 
 
 class TestBuildReportPoolTraces:
@@ -519,3 +523,77 @@ class TestBuildReportPoolTraces:
         assert html.count("class='chart-box'") == 4
         assert html.count("data-dh='480' data-mh='400'") == 2
         assert "data-dh='300' data-mh='260'" in html
+
+
+class TestEquityCurveFees:
+    """权益曲线扣手续费(2026-08-25): 与卡片总盈亏口径一致。
+
+    原裸价重建不含费 → 曲线终点比卡片(已实现+浮动)高 ~764 元,
+    月度收益/全年列与总盈亏口径不一致(7月-1.5%+8月+1.7%算术和+0.2%
+    显示正, 总盈亏却是负)。
+    """
+
+    def test_buy_fee_deducted(self, monkeypatch, tmp_path):
+        """买入事件扣手续费: 曲线终点 = 初始 - 买入(含费) + 市值。"""
+        rows = [{
+            "signal_date": "2026-07-01", "exec_date": "2026-07-02",
+            "symbol": "000001", "name": "测试", "action": "buy",
+            "target_pct": 0.19, "shares": 1000, "signal_reason": "x",
+            "exec_price": 10.0, "status": "executed", "reason": "",
+        }]
+        pd.DataFrame(rows).to_csv(tmp_path / "execution_log.csv", index=False)
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        trades = pd.DataFrame(columns=["exit_date", "symbol", "shares", "exit_price"])
+        eq = live_report._build_equity_curve(
+            trades, {}, {"000001": 10.0}, 100000.0)
+        # 含费: 佣金5 + 过户0.1 = 5.1 → 现金 89994.9; 事件点市值 10000
+        # → 7-02 事件点 = 99994.9(最终快照用 positions 参数, 空则无市值)
+        day = eq[eq["date"] == "2026-07-02"]["equity"].iloc[-1]
+        assert day == pytest.approx(99994.9)
+
+    def test_sell_fee_deducted(self, monkeypatch, tmp_path):
+        """卖出后 equity = 初始 + trades pnl(权威含费, 不再重算卖出费)。"""
+        rows = [
+            {"signal_date": "2026-07-01", "exec_date": "2026-07-02",
+             "symbol": "000001", "name": "a", "action": "buy",
+             "target_pct": 0.19, "shares": 1000, "signal_reason": "x",
+             "exec_price": 10.0, "status": "executed", "reason": ""},
+            {"signal_date": "2026-07-03", "exec_date": "2026-07-04",
+             "symbol": "000001", "name": "a", "action": "sell",
+             "target_pct": 0.0, "shares": 1000, "signal_reason": "x",
+             "exec_price": 11.0, "status": "executed", "reason": ""},
+        ]
+        pd.DataFrame(rows).to_csv(tmp_path / "execution_log.csv", index=False)
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        # pnl = (11-10)×1000 - 卖出费16.11 = 983.89(含费权威)
+        trades = pd.DataFrame([{
+            "entry_date": "2026-07-01", "exit_date": "2026-07-04",
+            "symbol": "000001", "name": "a", "shares": 1000,
+            "entry_price": 10.0, "exit_price": 11.0, "pnl": 983.89,
+            "pnl_pct": 9.8, "fee": 16.11, "reason": "x",
+        }])
+        eq = live_report._build_equity_curve(
+            trades, {}, {"000001": 11.0}, 100000.0)
+        # 卖出后无持仓: equity = 100,000 + 983.89
+        assert eq["equity"].iloc[-1] == pytest.approx(100983.89)
+
+    def test_yearly_compound_not_sum(self):
+        """全年列 = 复合年收益(2026-08-25 修复, 原为各月 pct 算术和)。
+
+        7 月 -1.5%、8 月 +1.42% → 算术和 -0.08%, 复合 -0.098%——
+        复合 = 区间真实收益, 与算术和不同(修复核心)。"""
+        eq = pd.Series(
+            [394000.0, 399608.0],
+            index=pd.to_datetime(["2026-07-31", "2026-08-31"]))
+        m = live_report._monthly_returns(eq, 400000.0)
+        f = 1.0
+        for _, r in m.iterrows():
+            f *= (1 + r["pct"] / 100)
+        comp = (f - 1) * 100
+        arith = m["pct"].sum()
+        # 复合 = 区间真实收益
+        assert comp == pytest.approx((399608.0 / 400000.0 - 1) * 100)
+        # 复合与算术和不同(修复点)
+        assert abs(comp - arith) > 0.01
+
+
