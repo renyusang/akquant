@@ -35,6 +35,11 @@ strategy:
   sar_exit_enabled: false       # SAR跟踪止损(机制性失效: 追赶慢于回归阈值, 永不触发)
   mfi_filter_enabled: true      # MFI超买过滤(2026-08-25启用, 修复超买后组合+57.1pp)
   mfi_overbought: 70.0          # MFI>70抑制买入(资金超买追高过滤)
+  trailing_stop_pct: 0.05       # 峰值回撤止盈(2026-08-27启用: 修复引擎下+24.1pp最优)
+                                # 持仓峰值回撤≥5%卖出(移动止盈, 趋势中不干预)
+  # ma_exit_enabled: true       # 均线止盈(可选, 默认关): +61.6pp但回撤-19%(-9.6%→-19.0%),
+  # ma_exit_period: 10          # 夏普1.57→1.25, 年度5/7年改善无大幅回吐(2026-08-27研究)
+                                # 需更高收益可启用; 风险调整最优仍为 trailing 5%
 
 # 股票池
 stock:

@@ -95,6 +95,20 @@ class KalmanStrategy(Strategy):
     )
     mfi_overbought = FloatParam(70.0, ge=50.0, le=95.0, title="MFI超买阈值")
     mfi_period = IntParam(14, ge=5, le=30, title="MFI周期")
+    trailing_stop_pct = FloatParam(
+        0.0, ge=0.0, le=0.5, title="峰值回撤止盈(持仓峰值回撤≥该比例卖出, 0=禁用)")
+    target_profit_pct = FloatParam(
+        0.0, ge=0.0, le=1.0, title="固定目标利润止盈(盈利≥该比例卖出, 0=禁用)")
+    max_hold_bars = IntParam(
+        0, ge=0, le=120, title="最大持仓K线数(0=禁用。持有超过N根强制卖出, 时间止盈)")
+    ma_exit_enabled = BoolParam(
+        False, title="均线跟踪止盈(收盘跌破均线卖出, 趋势跟踪离场)")
+    ma_exit_period = IntParam(10, ge=5, le=30, title="均线止盈周期(默认10)")
+    trailing_atr_factor = FloatParam(
+        0.0, ge=0.0, le=5.0, title="吊灯止盈NATR倍数(峰值回撤≥k×NATR卖出, 0=禁用)")
+    adx_exit_enabled = BoolParam(False, title="ADX衰减止盈(趋势衰竭卖出)")
+    adx_exit_peak_min = FloatParam(25.0, ge=10.0, le=50.0, title="ADX止盈峰值门槛")
+    adx_exit_decay = FloatParam(0.8, ge=0.5, le=0.95, title="ADX止盈衰减比例")
 
     # 0.3.20 引擎要求的方法(Python 基类缺失,需子类提供空实现)
     def _flush_pending_order_events(self, *_args: Any, **_kwargs: Any) -> None:
@@ -141,6 +155,15 @@ class KalmanStrategy(Strategy):
         self.mfi_filter_enabled = bool(p("mfi_filter_enabled"))
         self.mfi_overbought = float(p("mfi_overbought"))
         self.mfi_period = max(5, int(p("mfi_period")))
+        self.trailing_stop_pct = float(p("trailing_stop_pct"))
+        self.target_profit_pct = float(p("target_profit_pct"))
+        self.max_hold_bars = max(0, int(p("max_hold_bars")))
+        self.ma_exit_enabled = bool(p("ma_exit_enabled"))
+        self.ma_exit_period = max(5, int(p("ma_exit_period")))
+        self.trailing_atr_factor = float(p("trailing_atr_factor"))
+        self.adx_exit_enabled = bool(p("adx_exit_enabled"))
+        self.adx_exit_peak_min = float(p("adx_exit_peak_min"))
+        self.adx_exit_decay = float(p("adx_exit_decay"))
 
         # ---- SignalEngine 实例（按 symbol 管理） ----
         self._engines: Dict[str, SignalEngine] = {}
@@ -204,6 +227,12 @@ class KalmanStrategy(Strategy):
                 mfi_filter_enabled=self.mfi_filter_enabled,
                 mfi_overbought=self.mfi_overbought,
                 mfi_period=self.mfi_period,
+                trailing_stop_pct=self.trailing_stop_pct,
+                target_profit_pct=self.target_profit_pct,
+                trailing_atr_factor=self.trailing_atr_factor,
+                adx_exit_enabled=self.adx_exit_enabled,
+                adx_exit_peak_min=self.adx_exit_peak_min,
+                adx_exit_decay=self.adx_exit_decay,
             )
             # 用历史数据预热指标窗口(不含当前 bar,当前 bar 由 update 增量喂入)
             if (
@@ -346,6 +375,37 @@ class KalmanStrategy(Strategy):
                 )
 
         elif pos > 0:
+            # 时间止盈(2026-08-27 研究): 持有超过 max_hold_bars 根强制卖出
+            # held 用基类 _hold_bars[symbol](该标的自身 bar 数, 修正 2026-08-27:
+            # 原用全局 _bar_count 在多 symbol 轮转下高估 ~10 倍)
+            if self.max_hold_bars > 0:
+                held = int(getattr(self, "_hold_bars", {}).get(symbol, 0))
+                if held > self.max_hold_bars and result["signal"] != "buy":
+                    self.close_position(symbol)
+                    self._opened_count = max(0, self._opened_count - 1)
+                    self._trade_count += 1
+                    self.log(
+                        f"[时间止盈] {bar.timestamp_iso} | "
+                        f"持仓{held}根>{self.max_hold_bars}根, 强制卖出 | "
+                        f"入场={self._entry_prices.get(symbol, 0):.2f} "
+                        f"现价={close_price:.2f}"
+                    )
+                    self._entry_prices.pop(symbol, None)
+                    return
+            # 均线跟踪止盈(2026-08-27 研究): 收盘跌破均线卖出(趋势跟踪离场)
+            if self.ma_exit_enabled and result["signal"] != "buy":
+                ma = self._calc_ma_n(symbol, close_price, self.ma_exit_period)
+                if close_price < ma:
+                    self.close_position(symbol)
+                    self._opened_count = max(0, self._opened_count - 1)
+                    self._trade_count += 1
+                    self.log(
+                        f"[均线止盈] {bar.timestamp_iso} | "
+                        f"close¥{close_price:.2f}<MA{self.ma_exit_period}¥{ma:.2f} | "
+                        f"入场={self._entry_prices.get(symbol, 0):.2f}"
+                    )
+                    self._entry_prices.pop(symbol, None)
+                    return
             if result["signal"] == "sell":
                 if limit_down and close_price <= limit_down:
                     self.log(
@@ -457,6 +517,16 @@ class KalmanStrategy(Strategy):
         except Exception:
             pass
         return fallback, fallback
+
+    def _calc_ma_n(self, symbol: str, fallback: float, period: int) -> float:
+        """计算当前 MA(period)(均线止盈用, 2026-08-27)。数据不足返回 fallback。"""
+        try:
+            vals = self.get_history(period + 1, symbol, "close")
+            if len(vals) >= period:
+                return float(vals[-period:].mean())
+        except Exception:
+            pass
+        return fallback
 
 
 # ----------------------------------------------------------------------

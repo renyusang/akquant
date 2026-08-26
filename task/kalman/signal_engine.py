@@ -321,6 +321,18 @@ class SignalEngine:
         self.mfi_filter_enabled = bool(_p("mfi_filter_enabled", False))
         self.mfi_overbought = float(_p("mfi_overbought", 70.0))
         self.mfi_period = int(_p("mfi_period", 14))
+        # 峰值回撤止盈(2026-08-26 研究): 持仓峰值回撤 ≥ 该比例即卖出(0=禁用)
+        self.trailing_stop_pct = float(_p("trailing_stop_pct", 0.0))
+        # 固定目标利润止盈(2026-08-27 研究): 持仓盈利 ≥ 该比例即卖出(0=禁用)
+        self.target_profit_pct = float(_p("target_profit_pct", 0.0))
+        # Chandelier 吊灯止盈(2026-08-27 研究): 峰值回撤 ≥ k×NATR 卖出——
+        # 波动率自适应回撤宽度(高波动放宽防洗出/低波动收紧快锁利); 0=禁用
+        self.trailing_atr_factor = float(_p("trailing_atr_factor", 0.0))
+        # ADX 衰减止盈(2026-08-27 研究): 持仓期 ADX 曾 ≥ 峰值门槛且当前
+        # < 峰值×衰减比例 → 趋势衰竭卖出
+        self.adx_exit_enabled = bool(_p("adx_exit_enabled", False))
+        self.adx_exit_peak_min = float(_p("adx_exit_peak_min", 25.0))
+        self.adx_exit_decay = float(_p("adx_exit_decay", 0.8))
 
         # ---- 卡尔曼滤波器 ----
         self._kf = KalmanFilter2D(
@@ -374,6 +386,11 @@ class SignalEngine:
         self._mfi_v: List[float] = []
         self._last_mfi: Optional[float] = None
 
+        # ---- 峰值回撤止盈(2026-08-26 研究) ----
+        self._peak_price: float = 0.0
+        # ADX 衰减止盈状态(2026-08-27)
+        self._adx_peak_since_entry: float = 0.0
+
         # 存储 params dict 供外部访问
         self.params = params
 
@@ -402,13 +419,18 @@ class SignalEngine:
     def set_position(self, has_position: bool, entry_price: float = 0.0) -> None:
         """设置当前持仓状态（由外部调用方管理）。
 
-        开仓时重置 SAR 跟踪止损状态(从入场价起算)。
+        开仓时重置 SAR 跟踪止损状态(从入场价起算)与峰值价格(止盈基准)。
         """
         if self.sar_exit_enabled and has_position and not self._has_position:
             self._sar_val = entry_price
             self._sar_ep = entry_price
             self._sar_af = self.sar_af_step
             self._prev_low = None
+        if has_position and not self._has_position:
+            # 峰值回撤止盈(2026-08-26): 开仓重置峰值基准
+            self._peak_price = entry_price if entry_price > 0 else 0.0
+            # ADX 衰减止盈(2026-08-27): 开仓重置 ADX 峰值
+            self._adx_peak_since_entry = 0.0
         self._has_position = has_position
         self._entry_price = entry_price
 
@@ -690,6 +712,14 @@ class SignalEngine:
         adx = self._last_adx if self.adx_enabled else None
         self._trend.update(close, ma20_cur, ma20_prev, adx)
 
+        # 峰值更新(持仓期, 峰值回撤止盈基准)
+        if self._has_position and close > self._peak_price:
+            self._peak_price = close
+        # ADX 峰值更新(持仓期, 衰减止盈基准)
+        if self._has_position and self._last_adx is not None:
+            self._adx_peak_since_entry = max(
+                self._adx_peak_since_entry, self._last_adx)
+
         # 评估信号
         signal, target_pct, reason = self._evaluate(
             close, filtered, velocity, self._prev_velocity
@@ -821,6 +851,47 @@ class SignalEngine:
             pnl = close / self._entry_price - 1.0
             if pnl < -self.stop_loss_pct:
                 return "sell", 0.0, f"止损({pnl * 100:.1f}%)"
+
+        # 固定目标利润止盈(2026-08-27 研究): 盈利 ≥ 阈值即锁定利润
+        if self.target_profit_pct > 0 and self._entry_price > 0:
+            pnl = close / self._entry_price - 1.0
+            if pnl >= self.target_profit_pct:
+                return "sell", 0.0, f"目标利润止盈({pnl * 100:.1f}%)"
+
+        # 峰值回撤止盈(2026-08-26 研究): 从持仓峰值回撤 ≥ 阈值即卖出,
+        # 保护浮盈(利润坐过山车); 优先级高于 SAR/价格回归
+        if self.trailing_stop_pct > 0 and self._peak_price > 0:
+            drawdown = (self._peak_price - close) / self._peak_price
+            if drawdown >= self.trailing_stop_pct:
+                return (
+                    "sell",
+                    0.0,
+                    f"峰值回撤止盈(峰值{self._peak_price:.2f}回撤{drawdown * 100:.1f}%)",
+                )
+
+        # Chandelier 吊灯止盈(2026-08-27 研究): 峰值回撤 ≥ k×NATR(波动率自适应)
+        if (self.trailing_atr_factor > 0 and self._peak_price > 0
+                and self._last_natr is not None):
+            threshold = self.trailing_atr_factor * self._last_natr
+            drawdown = (self._peak_price - close) / self._peak_price
+            if drawdown >= threshold:
+                return (
+                    "sell",
+                    0.0,
+                    f"吊灯止盈(峰值{self._peak_price:.2f}回撤{drawdown * 100:.1f}%"
+                    f"≥{threshold * 100:.1f}%={self.trailing_atr_factor}×NATR)",
+                )
+
+        # ADX 衰减止盈(2026-08-27 研究): 趋势衰竭(ADX 从高位回落)
+        if (self.adx_exit_enabled and self._last_adx is not None
+                and self._adx_peak_since_entry >= self.adx_exit_peak_min
+                and self._last_adx < self._adx_peak_since_entry * self.adx_exit_decay):
+            return (
+                "sell",
+                0.0,
+                f"ADX衰减止盈(峰值{self._adx_peak_since_entry:.1f}→"
+                f"{self._last_adx:.1f})",
+            )
 
         # SAR 跟踪止损(动态保护, 高于价格回归优先级)
         if self.sar_exit_enabled and self._sar_val > 0:
