@@ -425,16 +425,20 @@ class KalmanStrategy(Strategy):
             self._opened_count = max(0, self._opened_count - 1)
 
     def _clean_pending_sells(self, symbol: str) -> None:
-        """待成交卖出成交后释放名额(2026-08-24 超买修复配套)。
+        """待成交卖出登记维护(2026-08-24/26 超买修复配套)。
 
-        卖出下单时不释放名额(订单 T+1 才成交, 被拒则持仓保留——提前释放
-        会导致同日新买入使持仓净增)。成交后(持仓消失)再 -1 释放。
+        - 成交: 持仓消失 → 移除登记并释放名额(_opened_count -1)
+        - 被拒(订单消失且持仓保留, 如数据缺口): 移除登记但**不释放名额**
+          (该标的仍占名额)——防被拒订单使名额被永久占用(2026-08-26 补充;
+          名额检查无预释放, 卖出成交才释放, 此处兜底防挂账)
         """
         if symbol not in self._pending_sells:
             return
         if float(self.get_position(symbol)) <= 0:
-            del self._pending_sells[symbol]         # 持仓已清 = 卖出成交
+            del self._pending_sells[symbol]         # 成交 → 释放名额
             self._opened_count = max(0, self._opened_count - 1)
+        elif not self.get_open_orders(symbol):
+            del self._pending_sells[symbol]         # 被拒 → 移除登记(名额保留)
 
     # ------------------------------------------------------------------
     # MA20 计算

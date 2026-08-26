@@ -173,3 +173,129 @@ class TestPendingBuysLifecycle:
         assert s._opened_count == 4
         s._opened_count = max(0, s._opened_count - 1)
         assert s._opened_count == 3
+
+
+class TestSellThenBuySameDay:
+    """名额预释放(2026-08-25 修复): 待成交卖单计入可用名额。
+
+    场景: 满仓(3只) → 某日 3 只触发卖出 + 另 3 只触发买入(同日)——
+    修复后放行(T+1 卖出成交释放名额, 持仓 = 3-3+3 = 3 ≤ max);
+    修复前买入被拦(opened=3 >= 3), 只卖不买。
+    """
+
+    MAX_POS = 3
+
+    def _make_data(self, n_a=3, n_b=3, breakout=20, flip=35):
+        dates = pd.date_range("2026-01-01", periods=60, freq="B")
+
+        def _seq(phase2_gain, hold_gain):
+            # hold_gain: 第21-34根(买入后) A=1.02持续上涨(速度保持正防反转卖,
+            #            filtered跟随价格防回归卖) / B=1.0横盘(无持仓, 等待)
+            # phase2_gain: 第35根 A=0.85(-15%, 触发回归卖) / B=1.05(突破买)
+            close = np.full(60, 100.0)
+            close[breakout] = 100.0 * 1.05                      # 第20根 +5% 买入
+            for i in range(breakout + 1, flip):
+                close[i] = close[i - 1] * hold_gain
+            close[flip] = close[flip - 1] * phase2_gain
+            for i in range(flip + 1, 60):                       # 买入后持续上涨
+                close[i] = close[i - 1] * 1.02
+            return close
+
+        out = {}
+        for i in range(n_a):                                    # A型: 跌8% → 止损卖出
+            sym = f"{600000 + i:06d}"
+            c = _seq(0.85, 1.02)
+            out[sym] = pd.DataFrame({"date": dates, "open": c, "high": c * 1.01,
+                                     "low": c * 0.99, "close": c,
+                                     "volume": [1_000_000] * 60, "symbol": [sym] * 60})
+        for i in range(n_b):                                    # B型: 再涨5% → 突破买入
+            sym = f"{610000 + i:06d}"
+            c = _seq(1.05, 1.0)
+            out[sym] = pd.DataFrame({"date": dates, "open": c, "high": c * 1.01,
+                                     "low": c * 0.99, "close": c,
+                                     "volume": [1_000_000] * 60, "symbol": [sym] * 60})
+        return out
+
+    def _run(self, data_map):
+        fill_policy = make_fill_policy(
+            price_basis="open", temporal="next_event", bar_offset=1)
+        strategy = KalmanStrategy(
+            initial_cash=1000000, entry_threshold=0.02, exit_threshold=0.005,
+            stop_loss_pct=0.05, trend_filter_enabled=False,
+            single_position_pct=0.1, max_positions=self.MAX_POS,
+        )
+        return run_backtest(
+            data=data_map, strategy=strategy, symbols=list(data_map.keys()),
+            initial_cash=1000000, t_plus_one=True, fill_policy=fill_policy,
+            lot_size={s: 100 for s in data_map},
+            commission_rate=0.0003, stamp_tax_rate=0.001,
+            transfer_fee_rate=0.00001, min_commission=5.0,
+            show_progress=False)
+
+    def test_sell_frees_slot_for_same_day_buy(self):
+        """修复后: A 卖出 + B 同日买入放行, T+1 后持仓 = B 3 只 ≤ max。"""
+        dm = self._make_data()
+        r = self._run(dm)
+        pos = r.positions
+        # 全程同时持仓 ≤ max(含 T+1 过渡)
+        assert (pos > 0).sum(axis=1).max() <= self.MAX_POS
+        # 末仓 = B 型(610000-610002) 3 只(卖出+买入轮换后)
+        last = pos.iloc[-1]
+        held = [s for s in last.index if last[s] > 0]
+        assert set(held) == {"610000", "610001", "610002"}, f"末仓={held}"
+        # A 型全部卖出(600000-600002 不在末仓)
+        assert not any(s.startswith("600") for s in held)
+
+    def test_no_overbuy_across_cycle(self):
+        """轮换全程任意时刻持仓 ≤ max(预释放不造成超买)。"""
+        dm = self._make_data()
+        r = self._run(dm)
+        pos = r.positions
+        max_held = (pos > 0).sum(axis=1).max()
+        assert max_held <= self.MAX_POS
+
+
+class TestPendingSellsLifecycle:
+    """待成交卖单生命周期(2026-08-25 名额预释放配套)。"""
+
+    def _strategy(self, position=100.0, open_orders=True):
+        s = KalmanStrategy(max_positions=5)
+        s.get_position = lambda sym: position
+        s.get_open_orders = lambda sym=None: [1] if open_orders else []
+        return s
+
+    def test_filled_releases_slot(self):
+        """卖出成交(持仓消失) → 移除登记并释放名额。"""
+        s = self._strategy(position=0.0)
+        s._opened_count = 5
+        s._pending_sells = {"000001": 10.0}
+        s._clean_pending_sells("000001")
+        assert s._pending_sells == {}
+        assert s._opened_count == 4
+
+    def test_rejected_keeps_slot(self):
+        """卖出被拒(订单消失且持仓保留) → 移除登记但名额保留(撤销预释放)。"""
+        s = self._strategy(position=100.0, open_orders=False)
+        s._opened_count = 5
+        s._pending_sells = {"000001": 10.0}
+        s._clean_pending_sells("000001")
+        assert s._pending_sells == {}
+        assert s._opened_count == 5  # 不释放: 该标的仍占名额
+
+    def test_pending_keeps_slot(self):
+        """卖出订单仍挂起 → 登记保留, 名额预释放中。"""
+        s = self._strategy(position=100.0, open_orders=True)
+        s._opened_count = 5
+        s._pending_sells = {"000001": 10.0}
+        s._clean_pending_sells("000001")
+        assert s._pending_sells == {"000001": 10.0}
+        assert s._opened_count == 5
+
+    def test_other_symbols_untouched(self):
+        """清理只处理目标标的。"""
+        s = self._strategy(position=0.0)
+        s._opened_count = 5
+        s._pending_sells = {"000001": 10.0, "000002": 11.0}
+        s._clean_pending_sells("000001")
+        assert s._pending_sells == {"000002": 11.0}
+        assert s._opened_count == 4
