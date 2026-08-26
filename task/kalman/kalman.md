@@ -245,9 +245,9 @@ strategy:                     # 共享策略参数
   adx_filter_enabled: false   # ADX 趋势状态门控(2026-08-02新增,全池验证无增益)
   adx_filter_threshold: 20.0  # ADX<阈值视为震荡,锁定趋势方向(25 更严格)
   adx_filter_period: 14       # ADX 计算周期
-  atr_adaptive_exit_enabled: true   # NATR自适应退出宽度(2026-08-04,默认启用)
-  exit_atr_factor: 1.0              # 退出阈值=max(0.5%, 1.0×NATR),高波动期放宽
-  sar_exit_enabled: false           # SAR跟踪止损(实证无效:0.5%回归先触发)
+  atr_adaptive_exit_enabled: false  # NATR自适应退出(2026-08-26 关闭: 修复引擎下 -34.5pp)
+  exit_atr_factor: 1.0              # 退出阈值=max(0.5%, 1.0×NATR)(现关闭, 保留参数)
+  sar_exit_enabled: false           # SAR跟踪止损(机制性失效: 追赶慢于回归阈值, 永不触发)
   mfi_filter_enabled: true          # MFI超买过滤(2026-08-25启用,修复超买后组合+57.1pp)
   mfi_overbought: 70.0              # MFI>70抑制买入(资金超买追高过滤)
 
@@ -540,6 +540,12 @@ bash run_daily.sh                  # crontab 已默认开启 --deploy
 ---
 
 ## 配置变更记录
+
+### NATR 自适应退出关闭 (2026-08-26)
+**变更**: 实盘 `stocks.yaml` 与无限仓位 `unlimited.yaml` 同步关闭 `atr_adaptive_exit_enabled`（备份 `stocks.yaml.bak_20260826` / `unlimited.yaml.bak_20260826`）。
+**依据**: 修复引擎（超买+预释放回退）下重测 ATR——**关 ATR（MFI-only）+145.5%/1.36/-11.4% vs 当前基线（MFI+ATR）+111.0%/1.04/-13.4%**——**ATR 为 -34.5pp 负贡献**（两次复核一致）。8-04 启用依据（旧超买引擎 +14.1pp）因回测代码缺陷失真——超买引擎持仓 10-19 只时 ATR 放宽退出的代价被分散稀释, 修复引擎（严格 5 只）下单笔权重高, ATR 的"亏损单持有更久"系统性拖累收益（交易 799 vs 1118, 紧阈值快速止损→快速轮换→小赢利累积）。
+**SAR 同步验证**: `_update_sar` 调用 1550 次、SAR 卖出 0 次触发——机制性失效（AF 0.02 追赶慢于回归阈值, SAR 恒低于价格 5%+）, 维持关闭。
+**教训**: 回测代码正确性直接影响策略决策——超买漏洞/预释放引擎语义先后使 MFI/RSI/ATR 结论反转, 机制结论落地前必须验证回测引擎与实盘语义一致（已入记忆 `backtest-code-correctness`）。
 
 ### MFI 超买过滤启用 (2026-08-25)
 **变更**: 实盘 `stocks.yaml` 与无限仓位 `unlimited.yaml` 同步启用 `mfi_filter_enabled: true, mfi_overbought: 70`（备份 `stocks.yaml.bak_20260825` / `unlimited.yaml.bak_20260825`）。

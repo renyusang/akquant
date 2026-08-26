@@ -8,7 +8,7 @@ stock:
   max_positions: 99999
   single_position_pct: 0.2
 strategy:
-  atr_adaptive_exit_enabled: true
+  atr_adaptive_exit_enabled: false  # 2026-08-26 与实盘同步关闭(修复引擎下 -34.5pp)
   downtrend_entry: 0.03
   entry_threshold: 0.02
   exit_atr_factor: 1.0

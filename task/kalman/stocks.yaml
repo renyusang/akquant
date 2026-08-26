@@ -29,9 +29,10 @@ strategy:
   trend_confirm_bars: 1
   trend_bear_pct: 0.30
   downtrend_entry: 0.03
-  atr_adaptive_exit_enabled: true   # NATR自适应退出宽度(2026-08-04, 全池+组合验证最优)
-  exit_atr_factor: 1.0          # 退出阈值=max(0.5%, 1.0×NATR), 高波动期放宽避免被洗出
-  sar_exit_enabled: false       # SAR跟踪止损(实证无效: 0.5%回归先触发, 保持关闭)
+  atr_adaptive_exit_enabled: false  # 2026-08-26 关闭: 修复引擎下 -34.5pp(见 kalman.md);
+                                    # 8-04 启用依据(旧引擎+14.1pp)因回测代码缺陷失真
+  exit_atr_factor: 1.0          # 退出阈值=max(0.5%, 1.0×NATR)(现关闭, 保留参数)
+  sar_exit_enabled: false       # SAR跟踪止损(机制性失效: 追赶慢于回归阈值, 永不触发)
   mfi_filter_enabled: true      # MFI超买过滤(2026-08-25启用, 修复超买后组合+57.1pp)
   mfi_overbought: 70.0          # MFI>70抑制买入(资金超买追高过滤)
 
