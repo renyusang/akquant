@@ -894,3 +894,114 @@ class TestPrefetchData:
         monkeypatch.setattr(daily_signal, "CACHE_DIR", str(tmp_path / "nc"))
         assert daily_signal.prefetch_data([], 2, quiet=True) == 0
         assert calls == []
+
+
+class TestPlaceDeferredOrdersPool:
+    """阶段2下单修复(2026-08-27): 股票/ETF 分池名额 + _block 原始 target。
+
+    原 bug: ①placed_new 全局计数跨池串扰(股票下单挤占 ETF 名额);
+    ②_block 存 capped_pct(0.19), _auto_fill_pool 再乘 max_pct 双重 cap
+    (0.038) → 高价股补仓永远买不起 1 手、低价股补仓量减半。
+    """
+
+    def _deferred(self, sym, atype, dev, kind="new"):
+        return {"_deferred": {"kind": kind, "symbol": sym, "name": sym,
+                              "shares": 100, "price": 10.0,
+                              "target_pct": 0.19, "raw_target": 0.95,
+                              "reason": "x", "deviation": dev,
+                              "asset_type": atype}}
+
+    def _cfg(self, stock_max=2, etf_max=2):
+        return {"stock": {"initial_cash": 100000, "max_positions": stock_max,
+                          "single_position_pct": 0.2},
+                "etf": {"initial_cash": 100000, "max_positions": etf_max,
+                        "single_position_pct": 0.2}}
+
+    def _mock_log(self, monkeypatch, tmp_path):
+        """防污染(2026-08-27 教训): 隔离状态文件 + 拦截写入函数。"""
+        monkeypatch.setattr(orders, "PENDING_FILE", str(tmp_path / "pending.json"))
+        monkeypatch.setattr(daily_signal, "log_pending", lambda *a, **k: None)
+        monkeypatch.setattr(daily_signal, "log_skipped", lambda *a, **k: None)
+        monkeypatch.setattr(daily_signal, "add_pending_order",
+                            lambda *a, **k: None)
+
+    def test_pool_slots_independent(self, monkeypatch, tmp_path):
+        """股票池下单不挤占 ETF 池名额: 股票满 2 + ETF 满 2 各自下单。"""
+        self._mock_log(monkeypatch, tmp_path)
+        monkeypatch.setattr(daily_signal, "load_positions", lambda: {})
+        # 阶段 2 处理中 pending 会增长——mock 为空(不读真实 pending)
+        monkeypatch.setattr(orders, "load_pending", lambda: [])
+        results = [
+            self._deferred("000001", "stock", 0.05),
+            self._deferred("000002", "stock", 0.04),
+            self._deferred("510050", "etf", 0.03),
+            self._deferred("510300", "etf", 0.02),
+        ]
+        placed = []
+        monkeypatch.setattr(daily_signal, "add_pending_order",
+                            lambda *a, **k: placed.append(a[0]))
+        daily_signal._place_deferred_orders(results, self._cfg(), {})
+        assert set(placed) == {"000001", "000002", "510050", "510300"}
+        # 全部下单(各池独立名额) — 修复前股票 2 单使 ETF 被拦
+
+    def test_stock_exhausts_only_stock_slots(self, monkeypatch, tmp_path):
+        """股票池满额只拦股票, ETF 不受影响。"""
+        self._mock_log(monkeypatch, tmp_path)
+        monkeypatch.setattr(daily_signal, "load_positions", lambda: {})
+        monkeypatch.setattr(orders, "load_pending", lambda: [])
+        results = [
+            self._deferred("000001", "stock", 0.05),
+            self._deferred("000002", "stock", 0.04),
+            self._deferred("000003", "stock", 0.03),
+            self._deferred("510050", "etf", 0.06),   # 偏离最高但 ETF 池
+        ]
+        placed = []
+        monkeypatch.setattr(daily_signal, "add_pending_order",
+                            lambda *a, **k: placed.append(a[0]))
+        daily_signal._place_deferred_orders(results, self._cfg(stock_max=2, etf_max=1), {})
+        # ETF 名额 1 → 510050 下单; 股票名额 2 → 前 2 只下单、000003 拦截
+        assert set(placed) == {"000001", "000002", "510050"}
+        blocked = [r for r in results if r.get("_skipped")]
+        assert [b["_deferred"]["symbol"] for b in blocked] == ["000003"]
+
+    def test_block_keeps_raw_target(self, monkeypatch, tmp_path):
+        """_block 后 _target_pct 为原始(0.95), 非 capped(0.19)——双 cap 修复。"""
+        self._mock_log(monkeypatch, tmp_path)
+        monkeypatch.setattr(daily_signal, "load_positions", lambda: {})
+        monkeypatch.setattr(orders, "load_pending", lambda: [])
+        results = [self._deferred("000001", "stock", 0.05),
+                   self._deferred("000002", "stock", 0.04)]
+        daily_signal._place_deferred_orders(results, self._cfg(stock_max=1), {})
+        blocked = [r for r in results if r.get("_skipped")]
+        assert len(blocked) == 1
+        assert blocked[0]["_target_pct"] == 0.95  # 原始 target, 供 _auto_fill_pool 乘 max_pct
+
+
+class TestPendingNewSnapshot:
+    """pool_pending_new 本轮前快照(2026-08-27): 本轮新下的单不重复计数。
+
+    原实时读 pending → 本轮已下订单计入 pool_pending_new, 与 placed_new
+    重复 → 名额减半(股票池 3 名额只下 2 单, 光智等被误拦)。
+    """
+
+    def test_same_round_orders_not_double_counted(self, monkeypatch, tmp_path):
+        """本轮下 3 单(名额 3): 新下的单不占用 pool_pending_new。"""
+        monkeypatch.setattr(daily_signal, "log_pending", lambda *a, **k: None)
+        monkeypatch.setattr(daily_signal, "load_positions", lambda: {})
+        monkeypatch.setattr(orders, "load_pending", lambda: [])  # 本轮前无 pending
+        results = [
+            {"_deferred": {"kind": "new", "symbol": s, "name": s,
+                           "shares": 100, "price": 10.0, "target_pct": 0.19,
+                           "raw_target": 0.95, "reason": "x",
+                           "deviation": d, "asset_type": "stock"}}
+            for s, d in [("000001", 0.05), ("000002", 0.04), ("000003", 0.03)]
+        ]
+        placed = []
+        monkeypatch.setattr(daily_signal, "add_pending_order",
+                            lambda *a, **k: placed.append(a[0]))
+        daily_signal._place_deferred_orders(
+            results, {"stock": {"initial_cash": 100000, "max_positions": 3,
+                                "single_position_pct": 0.2}}, {})
+        # 名额 3(无持仓无遗留 pending) → 3 单全部下单(修复前只下 2)
+        assert set(placed) == {"000001", "000002", "000003"}
+        assert not any(r.get("_skipped") for r in results)

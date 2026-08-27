@@ -327,7 +327,8 @@ def evaluate_stock(
                 result["_deferred"] = {
                     "kind": "new", "symbol": symbol, "name": name,
                     "shares": buy_qty, "price": result["close"],
-                    "target_pct": capped_pct, "reason": result.get("reason", ""),
+                    "target_pct": capped_pct, "raw_target": result.get("target_pct", 0.95),
+                    "reason": result.get("reason", ""),
                     "deviation": dev, "asset_type": asset_type,
                 }
             else:
@@ -405,7 +406,7 @@ def evaluate_stock(
                         result["_deferred"] = {
                             "kind": "refill", "symbol": symbol, "name": name,
                             "shares": add_qty, "price": result["close"],
-                            "target_pct": capped_pct,
+                            "target_pct": capped_pct, "raw_target": result.get("target_pct", 0.95),
                             "reason": f"趋势翻转补仓: {result.get('reason', '')}",
                             "deviation": dev, "asset_type": asset_type,
                         }
@@ -454,13 +455,30 @@ def _place_deferred_orders(
 
     refills = [r for r in deferred if r["_deferred"]["kind"] == "refill"]
     news = [r for r in deferred if r["_deferred"]["kind"] == "new"]
-    refills.sort(key=lambda r: float(r["_deferred"].get("deviation", 0)),
-                 reverse=True)
-    news.sort(key=lambda r: float(r["_deferred"].get("deviation", 0)),
-              reverse=True)
-    candidates = refills + news
 
-    placed_new = 0  # 已下单的新建仓数(占用名额)
+    # 修复(2026-08-27): 股票/ETF 分池排序——原混合排序 + placed_new 全局
+    # 计数导致跨池名额串扰(股票池下单挤占 ETF 池名额, 如 8-27 股票 2 单
+    # 使 ETF 阶段 2 仅下 1 单, 证券/半导体ETF 被挤到 _auto_fill_pool 补入)。
+    # 各池独立排序(补仓优先 + 池内偏离降序), placed_new 分池计数。
+    def _sort_pool(items):
+        st = [r for r in items
+              if r["_deferred"].get("asset_type") == "stock"]
+        et = [r for r in items
+              if r["_deferred"].get("asset_type") != "stock"]
+        for g in (st, et):
+            g.sort(key=lambda r: float(r["_deferred"].get("deviation", 0)),
+                   reverse=True)
+        return st + et
+
+    candidates = (_sort_pool(refills) + _sort_pool(news))
+
+    # 修复(2026-08-27): pool_pending_new 统计**本轮开始前**的 pending(昨日
+    # 遗留防超买)——原实现实时读 pending, 本轮新下的单也计入 → 与 placed_new
+    # 重复计数使名额减半(实盘股票池 3 名额实际只下 2 单, 光智等被误拦)
+    from orders import load_pending as _load_pending
+    pre_pending = _load_pending()
+
+    placed_new = {"stock": 0, "etf": 0}  # 各池已下单新建数(分池占用名额)
     for r in candidates:
         d = r["_deferred"]
         symbol, name = d["symbol"], d["name"]
@@ -480,16 +498,14 @@ def _place_deferred_orders(
                 "max_positions", 5 if asset_type == "stock" else 3))
             # 已有 pending 中的新建单也占名额(防超买: 昨日下单未成交
             # 今日再下单 → 成交后持仓超限); 补仓单(已持仓)不占
-            from orders import load_pending as _lp
-            existing = _lp()
             pool_pending_new = sum(
-                1 for o in existing
+                1 for o in pre_pending
                 if (o["symbol"].startswith(etf_pfx)) == is_etf
                 and o.get("action") != "sell"
                 and o["symbol"] not in load_positions())
             if (max_pos > 0
-                    and _pool_positions() + placed_new + pool_pending_new
-                    >= max_pos):
+                    and _pool_positions() + placed_new[asset_type]
+                    + pool_pending_new >= max_pos):
                 _block(r, d, symbol, name, entry_date,
                        f"已达最大持仓数({max_pos})")
                 continue
@@ -520,13 +536,17 @@ def _place_deferred_orders(
             allocated_cash[asset_type] = (
                 allocated_cash.get(asset_type, 0.0) + d["shares"] * d["price"])
         if d["kind"] == "new":
-            placed_new += 1
+            placed_new[asset_type] += 1
 
 
 def _block(r, d, symbol, name, entry_date, reason: str) -> None:
     """两阶段下单被拦截: 标记 _skipped 并写执行日志(对齐原第5/6步拦截)。"""
     r["signal"] = "hold"
-    r["_target_pct"] = d["target_pct"]  # 保留原始仓位供 _auto_fill_pool 使用
+    # 修复(2026-08-27): _target_pct 存**原始** target_pct(未 cap)——原存
+    # _deferred 的 capped_pct(0.19), _auto_fill_pool 再乘 max_pct 形成
+    # 双重 cap(0.038) → 高价股(光智¥242)买不起 1 手被静默跳过、低价股
+    # (巨石)补仓量减半(200 股应为 500 股)
+    r["_target_pct"] = d.get("raw_target", d.get("target_pct", 0.95))
     r["target_pct"] = 0.0
     r["reason"] = reason
     r["_skipped"] = True
