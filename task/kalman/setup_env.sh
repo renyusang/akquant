@@ -3,8 +3,8 @@
 # 卡尔曼滤波策略 —— 隔离环境搭建脚本
 #
 # 支持两种方式:
-#   方式1 (推荐): 使用已有的 conda 环境
-#     bash setup_env.sh --conda akquant_test
+#   方式1 (推荐): 使用已有的 conda 环境 (默认 akquant_032, 生产环境 0.3.20)
+#     bash setup_env.sh --conda akquant_032
 #
 #   方式2: 创建独立 venv (需要 python3-venv)
 #     bash setup_env.sh
@@ -17,7 +17,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 MODE="${1:-venv}"
-CONDA_ENV="${2:-akquant_test}"
+CONDA_ENV="${2:-akquant_032}"
 
 if [ "$MODE" = "--conda" ]; then
     echo "=== 使用 conda 环境: ${CONDA_ENV} ==="

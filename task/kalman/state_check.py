@@ -94,7 +94,10 @@ def check_consistency() -> List[str]:
         if "exec_date" in executed.columns and prev_date:
             ex = executed["exec_date"]
             # exec_date 缺失(历史回填/旧数据)无法判定时点 → 保守视为窗口内
-            executed = executed[ex.isna() | (ex.astype(str) >= prev_date)]
+            # 修复(2026-08-28): 严格大于快照日期——快照在成交后保存,
+            # 当日成交已计入快照, >= 会双重计数(688347 华虹宏力 200→600 误报
+            # 净成交 +600 vs 实际 +400, 8-27 成交 200 股被重复计入)
+            executed = executed[ex.isna() | (ex.astype(str) > prev_date)]
         if not executed.empty:
             # shares 缺失(旧数据/无该列)无法比对数量 → 视为数量足够(存在即豁免)
             if "shares" in executed.columns:
@@ -156,10 +159,20 @@ def check_consistency() -> List[str]:
             if prev_pos and sym in curr_positions:
                 pass  # 已在持仓中，重复买入信号被拦截
             elif not prev_pos:
-                # 昨天买入但今天还在发买入信号 → 可能没执行
-                warnings.append(
-                    f"⚠️ {sym} 昨日买入信号未执行，今日再次买入 (检查 execution_log)"
-                )
+                # 待执行买入订单存在 → 信号已入队等成交, "未执行"警告不适用
+                # (修复 2026-08-28: 同日多次运行(--no-save 回归/补跑)时,
+                #  快照记录的 buy 与当日 signals.csv 最新 buy 为同一条信号,
+                #  原逻辑误报"昨日买入未执行"; 002916/301511 实际已在队列)
+                has_pending_buy = any(
+                    o["symbol"] == sym and o.get("action") != "sell"
+                    for o in curr_pending)
+                if has_pending_buy:
+                    pass
+                else:
+                    # 昨天买入但今天还在发买入信号 → 可能没执行
+                    warnings.append(
+                        f"⚠️ {sym} 昨日买入信号未执行，今日再次买入 (检查 execution_log)"
+                    )
 
     return warnings
 

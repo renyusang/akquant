@@ -411,6 +411,12 @@ class TestAutoFillAfterSell:
                 return yaml.safe_load(f)
 
         monkeypatch.setattr(daily_signal, "load_config", _fixed_config)
+        # 日志隔离(2026-08-28): _auto_fill_pool 经 log_pending 写执行日志,
+        # 不拦截会污染生产 execution_log.csv(301511 8-4 测试行反复出现)
+        monkeypatch.setattr(daily_signal, "log_pending",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(daily_signal, "log_skipped",
+                            lambda *a, **k: None)
         return portfolio
 
     @staticmethod
@@ -797,6 +803,26 @@ class TestDeferredOrderPlacement:
             # pending 仍只有 1 笔(未重复下单)
             assert len(orders.load_pending()) == 1
 
+    def test_slot_freed_by_prior_execution_before_scan(self, monkeypatch, tmp_path):
+        """2026-09-01 顺序调整回归: 先执行昨日订单再扫描——昨日卖出成交
+        释放名额发生在扫描前, 阶段 2 名额检查(实时读 positions)基于执行后
+        持仓 → 当日候选直接下单, 不再出现"拦截+补仓"两步(大族 9-1 场景)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            pool_pos = dict(self.STOCK_POOL)
+            pool_pos["000005"] = {"name": "标的E", "shares": 100,
+                                  "avg_cost": 10.0}   # 满仓 5 只
+            _setup_common(monkeypatch, tmp, pool_pos=pool_pos)
+            # 模拟执行昨日卖出成交(执行函数更新 positions → 名额释放)
+            del pool_pos["000005"]
+            results = [self._candidate("000006", "新候选", "new", dev=5.0)]
+            daily_signal._place_deferred_orders(results, self._cfg(), {})
+            # 直接下单, 不拦截
+            assert results[0]["signal"] == "buy"
+            assert "已达最大持仓数" not in results[0].get("reason", "")
+            pend = orders.load_pending()
+            assert len(pend) == 1
+            assert pend[0]["symbol"] == "000006"
+
     def test_buy_qty_zero_marks_hold(self, monkeypatch):
         """股价过高买不起 1 手(buy_qty=0) → signal 改 hold, 不落盘 buy。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1005,3 +1031,49 @@ class TestPendingNewSnapshot:
         # 名额 3(无持仓无遗留 pending) → 3 单全部下单(修复前只下 2)
         assert set(placed) == {"000001", "000002", "000003"}
         assert not any(r.get("_skipped") for r in results)
+
+
+class TestSellWithoutPositionDowngraded:
+    """无持仓卖出信号降级 hold(2026-08-28 修复)。
+
+    背景: 持仓在今日开盘已全部卖出, 收盘扫描又触发卖出信号——
+    原逻辑 signal 保持 sell, 打印 🔴 卖出 仓位 0%, 但无持仓不生成
+    订单, 展示误导(518880 黄金ETF 案例)。对齐 2026-08-12 买入侧
+    "买不起 1 手降级 hold" 修复: 落盘/快照/状态检查不误显卖出。
+    """
+
+    def test_sell_no_position_downgraded(self, monkeypatch):
+        """无持仓 + sell 信号 → 降级 hold, 不生成订单, 记 skipped(action=sell)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = _setup_common(
+                monkeypatch, tmp, signal="sell", target_pct=0.0,
+                last_close=100.0, pos=None, pool_pos={},
+            )
+            result = daily_signal.evaluate_stock(
+                STOCK, _make_config(), 2, {"stock": 0.0},
+            )
+            assert result["signal"] == "hold"
+            assert result["target_pct"] == 0.0
+            assert result["_skipped"] is True
+            assert "卖出信号忽略" in result["reason"]
+            assert calls["log_pending"] == []
+            assert len(calls["log_skipped"]) == 1
+            args, kwargs = calls["log_skipped"][0]
+            assert kwargs.get("action") == "sell"
+
+    def test_sell_with_position_still_queues(self, monkeypatch):
+        """有持仓 + sell 信号 → 正常生成待执行订单(不回归)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            pos = {"shares": 100, "avg_cost": 100.0,
+                   "first_buy_date": "2026-01-01", "name": "宁德时代"}
+            calls = _setup_common(
+                monkeypatch, tmp, signal="sell", target_pct=0.0,
+                last_close=100.0, pos=pos, pool_pos={"300750": pos},
+            )
+            result = daily_signal.evaluate_stock(
+                STOCK, _make_config(), 2, {"stock": 0.0},
+            )
+            assert result["signal"] == "sell"
+            assert result["shares"] == 100
+            assert calls["log_pending"] != []
+            assert calls["log_skipped"] == []

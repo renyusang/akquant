@@ -107,18 +107,46 @@ def log_failed(symbol: str, signal_date: str, reason: str) -> None:
 
 def log_skipped(
     symbol: str, name: str, signal_date: str, reason: str,
-    signal_reason: str = "",
+    signal_reason: str = "", action: str = "buy",
 ) -> None:
-    """记录被跳过的信号。signal_reason = 原始买入信号的触发原因。"""
+    """记录被跳过的信号。signal_reason = 原始信号的触发原因。"""
     df = _load()
     sym = str(symbol).zfill(6)
     new_row = pd.DataFrame([{
         "signal_date": signal_date, "exec_date": "", "symbol": sym,
-        "name": name, "action": "buy", "target_pct": 0, "shares": 0,
+        "name": name, "action": action, "target_pct": 0, "shares": 0,
         "signal_reason": signal_reason, "exec_price": "", "status": "skipped", "reason": reason,
     }])
     df = pd.concat([df, new_row], ignore_index=True)
     _save(df)
+
+
+def cleanup_stale_pending() -> int:
+    """清理执行日志中的陈旧 pending 行, 返回清理条数。
+
+    修复(2026-08-28): execution_log 非权威, 实际待执行以 pending_orders.json
+    为准。历史遗留 pending 行(已成交但状态未更新/测试污染/拦截误标)虚高
+    "待执行" 计数——持仓总览曾显示 27 待执行而实际队列为空。
+
+    规则: pending 行仅当 (symbol, signal_date, action) 与当前待执行订单
+    一致时保留, 其余删除(含空日期测试污染行)。
+    """
+    from orders import load_pending
+    df = _load()
+    stale_mask = df["status"] == "pending"
+    if df.empty or not stale_mask.any():
+        return 0
+    cur_keys = {
+        (str(o["symbol"]).zfill(6), str(o.get("signal_date", "")), o.get("action"))
+        for o in load_pending()
+    }
+    drop = df[stale_mask & ~df.apply(
+        lambda r: (str(r["symbol"]).zfill(6), str(r["signal_date"]), r["action"])
+        in cur_keys, axis=1)]
+    n = int(len(drop))
+    if n:
+        _save(df.drop(drop.index))
+    return n
 
 
 def get_pending_count() -> int:
@@ -135,3 +163,18 @@ def get_summary() -> str:
     pending = (df["status"] == "pending").sum()
     skipped = (df["status"] == "skipped").sum()
     return f"已成交 {executed} | 未成交 {failed} | 待执行 {pending} | 已跳过 {skipped}"
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="清理 execution_log 陈旧 pending 行(以 pending_orders.json 为准)")
+    parser.add_argument("--task-dir", default=TASK_DIR,
+                        help="状态目录(默认 kalman; unlimited 传 unlimited 目录)")
+    args = parser.parse_args()
+    if os.path.abspath(args.task_dir) != os.path.abspath(TASK_DIR):
+        EXEC_LOG = os.path.join(args.task_dir, "execution_log.csv")
+        import orders
+        orders.PENDING_FILE = os.path.join(args.task_dir, "pending_orders.json")
+    n = cleanup_stale_pending()
+    print(f"清理陈旧 pending {n} 条, 剩余待执行 {get_pending_count()} 条")

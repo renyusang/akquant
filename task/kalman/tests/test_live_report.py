@@ -98,6 +98,48 @@ class TestMonthlyReturns:
         assert m.loc["2026-07-31", "pct"] == pytest.approx(2.0)
         assert m.loc["2026-07-31", "amount"] == pytest.approx(2000.0)
 
+    def test_pool_monthly_sum_equals_total(self, monkeypatch, tmp_path):
+        """逐日重估修复(2026-08-31): 基金池最后事件 7-30、股票池 7-31 有事件,
+        原曲线月末点错位(基金缺 7-31 浮动重估)导致月度"股票+基金"≠总体;
+        逐日重估后各池月末点同日, 金额池和 = 总体(差值 < 1 元)。"""
+        rows = [
+            {"signal_date": "2026-07-29", "exec_date": "2026-07-30",
+             "symbol": "510000", "name": "测试ETF", "action": "buy",
+             "target_pct": 0.19, "shares": 1000, "signal_reason": "x",
+             "exec_price": 1.0, "status": "executed", "reason": ""},
+            {"signal_date": "2026-07-30", "exec_date": "2026-07-31",
+             "symbol": "000001", "name": "测试股", "action": "buy",
+             "target_pct": 0.19, "shares": 1000, "signal_reason": "x",
+             "exec_price": 1.0, "status": "executed", "reason": ""},
+        ]
+        pd.DataFrame(rows).to_csv(tmp_path / "execution_log.csv", index=False)
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        trades = pd.DataFrame(columns=["exit_date", "symbol", "shares", "exit_price"])
+        price_history = {
+            "510000": {"2026-07-30": 1.0, "2026-07-31": 1.05},
+            "000001": {"2026-07-31": 1.0},
+        }
+        price_map = {"510000": 1.05, "000001": 1.0}
+
+        def _eq(pool, cash):
+            df = live_report._build_equity_curve(
+                trades, {}, price_map, cash, price_history, pool=pool)
+            df["date"] = pd.to_datetime(df["date"])
+            return df.groupby("date")["equity"].last()
+
+        eq_all = _eq(None, 200000.0)
+        eq_stock = _eq("stock", 100000.0)
+        eq_etf = _eq("etf", 100000.0)
+        # 修复核心: 基金池曲线含 7-31 点(逐日重估, 修复前只有事件日 7-30)
+        assert pd.Timestamp("2026-07-31") in eq_etf.index
+        m_all = live_report._monthly_returns(eq_all, 200000.0)
+        m_stock = live_report._monthly_returns(eq_stock, 100000.0)
+        m_etf = live_report._monthly_returns(eq_etf, 100000.0)
+        d = pd.Timestamp("2026-07-31")
+        diff = (m_stock.loc[d, "amount"] + m_etf.loc[d, "amount"]
+                - m_all.loc[d, "amount"])
+        assert abs(diff) < 1.0
+
 
 class TestMonthlyHeatmap:
     """月度热力图(2026-08-19 修复): 表格须包横向滚动容器。
@@ -154,6 +196,32 @@ class TestMonthlyHeatmap:
         html = live_report._monthly_heatmap(eq, pd.DataFrame(), 100000.0)
         assert "+5.0%" in html
         assert "tscroll" in html
+
+    def test_pool_rows_added(self):
+        """传分池权益序列 → 每年渲染总体/股票/基金三行, 各池独立基准。
+
+        股票池 7 月: 309000/300000-1 = +3.0%; 基金池 7 月: 98000/100000-1 = -2.0%;
+        总体 7 月: 102000/100000-1 = +2.0% —— 三值互异可区分。"""
+        idx = pd.to_datetime(["2026-07-20", "2026-07-31", "2026-08-29"])
+        eq = pd.Series([100000.0, 102000.0, 98000.0], index=idx)
+        eq_stock = pd.Series([300000.0, 309000.0, 300000.0], index=idx)
+        eq_etf = pd.Series([100000.0, 98000.0, 103000.0], index=idx)
+        html = live_report._monthly_heatmap(
+            eq, pd.DataFrame(), 100000.0,
+            eq_stock, 300000.0, eq_etf, 100000.0)
+        assert "总体" in html and "股票" in html and "基金" in html
+        assert "+2.0%" in html   # 总体 7 月
+        assert "+3.0%" in html   # 股票池 7 月
+        assert "-2.0%" in html   # 基金池 7 月
+        # 全年列独立复合: 股票 300000/300000-1 = 0.0%, 基金 103000/100000-1 = +3.0%
+        assert "0.0%" in html
+        assert "+3.0%" in html
+
+    def test_pool_rows_backward_compatible(self):
+        """不传分池序列 → 仅"总体"行(与旧行为一致)。"""
+        html = live_report._monthly_heatmap(self._eq(), pd.DataFrame(), 100000.0)
+        assert "总体" in html
+        assert "股票" not in html and "基金" not in html
 
 
 class TestMobileAdaptation:
@@ -232,7 +300,7 @@ class TestBuildReportSmoke:
 
         # P2: 两个图表容器(主图 800→560, 月度 300→260) + 自适应脚本注入
         assert "class='chart-box' data-dh='800' data-mh='560'" in html
-        assert "class='chart-box' data-dh='300' data-mh='260'" in html
+        assert "class='chart-box' data-dh='320' data-mh='280'" in html
         assert "Plotly.relayout" in html
 
         # P3: 交易区滚动盒改为类(桌面 CSS 控制, 手机取消); 内联样式已移除
@@ -336,6 +404,27 @@ class TestSkippedBuys:
                     sig_rows=[(d10, "000001", 10.0, 9.7, "up")])
         assert live_report._get_skipped_buys([], {"000001": "测试"}) == []
 
+    def test_cross_weekend_skip_filtered(self, monkeypatch, tmp_path):
+        """跨周末(2026-08-31 修复): 2 天前(周四)的跳过在周一报告不显示——
+        与 _auto_fill_pool 仅当日候选的执行语义对齐; 候选若仍有效,
+        当日重新触发 buy 会生成新的当日 skipped 记录, 不丢失(长川 8-27 案例)。"""
+        d2 = self._d(2)
+        self._setup(monkeypatch, tmp_path,
+                    skips=[(d2, "000001", "已达最大持仓数(5)")],
+                    sig_rows=[(d2, "000001", 10.0, 9.7, "up"),
+                              (self._d(0), "000001", 9.0, 8.5, "down")])
+        assert live_report._get_skipped_buys([], {"000001": "测试"}) == []
+
+    def test_same_day_skip_shown(self, monkeypatch, tmp_path):
+        """当日被跳过 → 显示(1 天窗口下仅当日候选有效)。"""
+        today = self._d(0)
+        self._setup(monkeypatch, tmp_path,
+                    skips=[(today, "000001", "已达最大持仓数(5)")],
+                    sig_rows=[(today, "000001", 10.0, 9.7, "up")])
+        out = live_report._get_skipped_buys([], {"000001": "测试"})
+        assert len(out) == 1
+        assert out[0]["signal_date"] == today
+
     def test_removed_from_watchlist_filtered(self, monkeypatch, tmp_path):
         """不在当前 watchlist(旧池标的, 永不复扫) → 不显示, 即使跳过很近。"""
         y = self._d(1)
@@ -364,6 +453,25 @@ class TestSkippedBuys:
                     skips=[(y, "000001", "x")],
                     sig_rows=[(y, "000001", 9.0, 9.7, "up")])
         assert live_report._get_skipped_buys([], {"000001": "a"}) == []
+
+    def test_sort_by_date_then_deviation(self, monkeypatch, tmp_path):
+        """排序(2026-09-01): 最近日期在前, 同日期内偏离度降序。
+
+        构造: 今天两个(偏离 13.4% / 1.0%) + 2 天前一个(偏离 3.1%)。
+        预期: 今13.4% → 今1.0% → 2天前(日期倒序优先, 旧日期即使偏离
+        更大也排后)。"""
+        today, d2 = self._d(0), self._d(2)
+        self._setup(monkeypatch, tmp_path,
+                    skips=[(d2, "000003", "x"), (today, "000001", "x"),
+                           (today, "000002", "x")],
+                    sig_rows=[(d2, "000003", 10.0, 9.7, "up"),
+                              (today, "000001", 10.0, 9.9, "up"),
+                              (today, "000002", 11.0, 9.7, "up")])
+        out = live_report._get_skipped_buys(
+            [], {"000001": "a", "000002": "b", "000003": "c"}, within_days=10)
+        assert [s["symbol"] for s in out] == ["000002", "000001", "000003"]
+        # 同日期内按偏离降序(000002 偏离 > 000001)
+        assert out[0]["deviation"] > out[1]["deviation"]
 
     def test_latest_skip_wins(self, monkeypatch, tmp_path):
         """同一标的多次跳过 → 取最新一次记录。"""
@@ -519,10 +627,10 @@ class TestBuildReportPoolTraces:
         # col2 布局容器存在(两分池图并排)
         assert "class='col2'" in html or 'class="col2"' in html
         # chart-box 共 4 个: 主图 800/560 + 股票池 480/400 + 基金池 480/400
-        # + 月度图 300/260(冒烟数据含月度数据)
+        # + 月度图 320/280(冒烟数据含月度数据)
         assert html.count("class='chart-box'") == 4
         assert html.count("data-dh='480' data-mh='400'") == 2
-        assert "data-dh='300' data-mh='260'" in html
+        assert "data-dh='320' data-mh='280'" in html
 
 
 class TestEquityCurveFees:

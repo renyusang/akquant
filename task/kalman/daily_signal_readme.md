@@ -9,7 +9,7 @@
 ## 快速开始
 
 ```bash
-conda activate akquant_test
+conda activate akquant_032   # 生产环境 (akquant 0.3.20; 旧环境 akquant_test 为 0.2.22 回退环境)
 cd /home/renyu/project/opensrc/akquant/task/kalman
 
 python daily_signal.py          # 扫描全部股票

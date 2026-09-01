@@ -1,5 +1,6 @@
 """Tests for exec_log.py."""
 
+import json
 import os
 import tempfile
 
@@ -160,3 +161,64 @@ class TestLogExecutedAppend:
         df = exec_log._load()
         assert len(df[df["status"] == "executed"]) == 1
         assert len(df[df["status"] == "pending"]) == 0
+
+
+class TestCleanupStalePending:
+    """cleanup_stale_pending: 以 pending_orders.json 为准清理陈旧 pending(2026-08-28)。
+
+    背景: 历史遗留 pending 行(已成交未更新状态/测试污染/拦截误标)虚高
+    "待执行" 计数(实盘曾显示 27 而实际队列为空)。日志非权威,
+    实际待执行以 pending_orders.json 为准。
+    """
+
+    def _setup(self, tmp_path, monkeypatch):
+        import exec_log
+        monkeypatch.setattr(exec_log, "EXEC_LOG", str(tmp_path / "exec_log.csv"))
+        import orders
+        monkeypatch.setattr(orders, "PENDING_FILE", str(tmp_path / "pending.json"))
+        return exec_log
+
+    def test_removes_stale_keeps_current(self, tmp_path, monkeypatch):
+        """匹配当前订单的 pending 保留, 历史遗留/测试污染行删除。"""
+        exec_log = self._setup(tmp_path, monkeypatch)
+        json.dump([{"symbol": "002916", "name": "深南电路", "action": "buy",
+                    "shares": 300, "signal_price": 362.4,
+                    "signal_date": "2026-08-28", "target_pct": 0.19}],
+                  open(tmp_path / "pending.json", "w"))
+        pd.DataFrame([
+            # 匹配当前待执行订单 → 保留
+            {"signal_date": "2026-08-28", "exec_date": "", "symbol": "002916",
+             "name": "深南电路", "action": "buy", "target_pct": 0.19, "shares": 300,
+             "signal_reason": "速度反转(转多)", "exec_price": "", "status": "pending",
+             "reason": ""},
+            # 历史遗留(订单早已成交, 状态未更新) → 删除
+            {"signal_date": "2026-07-24", "exec_date": "", "symbol": "688041",
+             "name": "海光信息", "action": "sell", "target_pct": 0.0, "shares": 100,
+             "signal_reason": "止损(-7.0%)", "exec_price": "", "status": "pending",
+             "reason": "止损(-7.0%)"},
+            # 测试污染行(空日期, reason=x) → 删除
+            {"signal_date": "", "exec_date": "", "symbol": "000002",
+             "name": "000002", "action": "buy", "target_pct": 0.19, "shares": 100,
+             "signal_reason": "x", "exec_price": "", "status": "pending",
+             "reason": ""},
+        ]).to_csv(tmp_path / "exec_log.csv", index=False, encoding="utf-8-sig")
+
+        assert exec_log.cleanup_stale_pending() == 2
+        df = exec_log._load()
+        pending = df[df["status"] == "pending"]
+        assert len(pending) == 1
+        assert pending.iloc[0]["symbol"] == "002916"
+
+    def test_no_pending_rows_returns_zero(self, tmp_path, monkeypatch):
+        """无 pending 行 → 返回 0, 文件不变。"""
+        exec_log = self._setup(tmp_path, monkeypatch)
+        open(tmp_path / "pending.json", "w").write("[]")
+        pd.DataFrame([{
+            "signal_date": "2026-08-05", "exec_date": "2026-08-06",
+            "symbol": "600584", "name": "长电科技", "action": "buy",
+            "target_pct": 0.06, "shares": 100, "signal_reason": "",
+            "exec_price": 67.01, "status": "executed", "reason": "",
+        }]).to_csv(tmp_path / "exec_log.csv", index=False, encoding="utf-8-sig")
+
+        assert exec_log.cleanup_stale_pending() == 0
+        assert len(exec_log._load()) == 1

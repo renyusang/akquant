@@ -22,7 +22,10 @@ TASK_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 被跳过买入候选的显示窗口(天): 过期候选已失效(新买入需新信号),
 # 与 daily_signal _auto_fill_pool 只用当日候选的设计一致
-_SKIPPED_WINDOW_DAYS = 5
+# 2026-08-31: 5→1 —— 展示窗口与执行语义严格对齐, 跨周末(如周四→周一)
+# 不再残留"看起来像旧数据"的历史候选(长川 8-27 案例); 候选若仍有效,
+# 当日重新触发 buy 会生成新的当日 skipped 记录, 不会丢失。
+_SKIPPED_WINDOW_DAYS = 1
 
 
 # 图表高度自适应脚本(2026-08-19, P2): 窄屏(≤600px 宽或 ≤500px 高, 覆盖
@@ -244,23 +247,33 @@ def build_live_report():
     # 20 个点(7-20 首批成交至今仅 16 点)时月度收益整块空白。
     # 改为以"存在月度数据"为门槛(monthly 内部 dropna 已保护空数据)。
     monthly = _monthly_returns(eq, initial_cash)
+    # 分池月度收益(2026-08-31): 股票池/基金池各自月度序列, 与权益曲线同口径
+    monthly_stock = _monthly_returns(eq_stock, stock_cash)
+    monthly_etf = _monthly_returns(eq_etf, etf_cash)
     if len(monthly) > 0:
-        pct_v = monthly["pct"].values
-        amt_v = monthly["amount"].values
         fig2 = make_subplots(rows=1, cols=1, subplot_titles=("月度收益 (%)",))
-        mc = ["#d62728" if v < 0 else "#2ca02c" for v in pct_v]
-        fig2.add_trace(go.Bar(x=monthly.index, y=pct_v, name="月度收益",
-                       marker_color=mc,
-                       text=[f"{v:+.1f}%<br>¥{a:+,.0f}"
-                             for v, a in zip(pct_v, amt_v)],
-                       textposition="outside", textfont=dict(size=11)),
-                       row=1, col=1)
-        # y 轴按数据自动留白: 顶部 ≥1.5× 最高柱, 标签(两行)不被裁剪
-        pmax = float(max(pct_v)) if len(pct_v) else 0.0
-        pmin = float(min(pct_v)) if len(pct_v) else 0.0
+        # 三组柱并排: 总体 + 股票池 + 基金池
+        for name, m, color in (("总体", monthly, "#1f77b4"),
+                               ("股票", monthly_stock, "#ff7f0e"),
+                               ("基金", monthly_etf, "#2ca02c")):
+            pct_v = m["pct"].values
+            amt_v = m["amount"].values
+            fig2.add_trace(go.Bar(x=m.index, y=pct_v, name=name,
+                           marker_color=color,
+                           text=[f"{v:+.1f}%<br>¥{a:+,.0f}"
+                                 for v, a in zip(pct_v, amt_v)],
+                           textposition="outside", textfont=dict(size=10)),
+                           row=1, col=1)
+        # y 轴按三组数据自动留白: 顶部 ≥1.5× 最高柱, 标签(两行)不被裁剪
+        all_pct = pd.concat([monthly["pct"], monthly_stock["pct"],
+                             monthly_etf["pct"]])
+        pmax = float(all_pct.max()) if len(all_pct) else 0.0
+        pmin = float(all_pct.min()) if len(all_pct) else 0.0
         y_hi = max(pmax * 1.5, 0.5)
         y_lo = min(pmin * 1.5, -0.5)
-        fig2.update_layout(height=300, margin=dict(l=40, r=20, t=40, b=20), showlegend=False)
+        fig2.update_layout(barmode="group", height=320,
+                           margin=dict(l=40, r=20, t=40, b=20),
+                           legend=dict(orientation="h", y=1.08))
         fig2.update_yaxes(range=[y_lo, y_hi])
         chart2 = fig2.to_html(full_html=False, include_plotlyjs=False)
     else:
@@ -285,7 +298,8 @@ def build_live_report():
     pos_etf_html = _positions_table(etf_pos, name_map, "ETF", etf_cash)
     trades_html = _trades_table(trades, name_map)
     details_html = _trade_details(buys_log, trades, name_map)
-    monthly_table = _monthly_heatmap(eq, trades, initial_cash)
+    monthly_table = _monthly_heatmap(eq, trades, initial_cash,
+                                     eq_stock, stock_cash, eq_etf, etf_cash)
     pending_html = _pending_orders_html(name_map, stock_cash, etf_cash)
 
     # ---- 指标卡片 ----
@@ -346,7 +360,7 @@ def build_live_report():
 <details open><summary><h2>核心指标</h2></summary>{metrics}</details>
 <details open><summary><h2>权益走势</h2></summary>{_chart_box(chart1, 800, 560)}
 <div class='col2'><div><h4>股票池</h4>{chart_stock}</div><div><h4>基金池</h4>{chart_etf}</div></div></details>
-<details open><summary><h2>月度收益</h2></summary>{_chart_box(chart2, 300, 260)}{monthly_table}</details>
+<details open><summary><h2>月度收益</h2></summary>{_chart_box(chart2, 320, 280)}{monthly_table}</details>
 <details open><summary><h2>当前持仓</h2></summary>
 <div class='col2'><div><h3>股票</h3>{pos_stock_html}</div><div><h3>ETF</h3>{pos_etf_html}</div></div></details>
 <details open><summary><h2>待执行订单</h2></summary>{pending_html}</details>
@@ -504,32 +518,50 @@ def _build_equity_curve(trades, positions, price_map, initial_cash,
     events.sort(key=lambda e: e["date"])
 
     # 模拟持仓变化
-    cash = initial_cash
     holdings = {}
-    equity_rows = [{"date": events[0]["date"] if events else datetime.now().strftime("%Y-%m-%d"),
-                    "equity": initial_cash}]
+    # 交易日全集 = 事件日 ∪ 价格历史日(2026-08-31 修复: 分池月末点错位——
+    # 原曲线只在事件日有点, 基金池最后事件 7-30 时月末点缺 7-31 浮动重估,
+    # 月度收益"股票+基金" ≠ 总体(差 = 无事件日持仓浮动)。逐日重估后
+    # 各池月末点同日, 池和 = 总体逐日成立; 起点仍为首个事件日(月度
+    # 收益首月基准不变, 不引入历史空月份)。
+    price_days = set()
+    if price_history:
+        for sym_prices in price_history.values():
+            price_days.update(str(d)[:10] for d in sym_prices.keys())
+    trade_days = sorted(set(e["date"] for e in events) | price_days)
+    if events and trade_days:
+        trade_days = [d for d in trade_days if d >= events[0]["date"]]
+    if not trade_days:
+        trade_days = [datetime.now().strftime("%Y-%m-%d")]
+
+    events_by_date: Dict[str, List[Dict]] = {}
+    for e in events:
+        events_by_date.setdefault(e["date"], []).append(e)
+
+    equity_rows = [{"date": trade_days[0], "equity": initial_cash}]
 
     # 修复(2026-08-25): 口径统一为「已实现累计(trades pnl 权威) + 持仓浮动
     # (市值 - 含费成本)」——与卡片(已实现+浮动)逐项一致, 曲线终点与总盈亏
     # 严格相等。原裸价事件流+重算费用与 trades 记录存在口径差(重算卖出费
     # 707.87 vs 记录 619.55 等), 导致月度收益/全年列与总盈亏不一致。
     realized_cum = 0.0
-    for ev in events:
-        if ev["type"] == "buy":
-            # 持仓均价含买入费(佣金+过户), 与 positions.json avg_cost 同口径
-            fee = calc_fee(ev["shares"], ev["price"], "buy")
-            avg = ev["price"] + fee / ev["shares"]
-            if ev["symbol"] in holdings:
-                h = holdings[ev["symbol"]]
-                total_shares = h["shares"] + ev["shares"]
-                h["price"] = (h["shares"] * h["price"] + ev["shares"] * avg) / total_shares
-                h["shares"] = total_shares
-            else:
-                holdings[ev["symbol"]] = {"shares": ev["shares"], "price": avg}
-        elif ev["type"] == "sell":
-            if ev["symbol"] in holdings:
-                realized_cum += ev["pnl"]   # trades pnl 含全部费用
-                del holdings[ev["symbol"]]
+    for day in trade_days:
+        for ev in events_by_date.get(day, []):
+            if ev["type"] == "buy":
+                # 持仓均价含买入费(佣金+过户), 与 positions.json avg_cost 同口径
+                fee = calc_fee(ev["shares"], ev["price"], "buy")
+                avg = ev["price"] + fee / ev["shares"]
+                if ev["symbol"] in holdings:
+                    h = holdings[ev["symbol"]]
+                    total_shares = h["shares"] + ev["shares"]
+                    h["price"] = (h["shares"] * h["price"] + ev["shares"] * avg) / total_shares
+                    h["shares"] = total_shares
+                else:
+                    holdings[ev["symbol"]] = {"shares": ev["shares"], "price": avg}
+            elif ev["type"] == "sell":
+                if ev["symbol"] in holdings:
+                    realized_cum += ev["pnl"]   # trades pnl 含全部费用
+                    del holdings[ev["symbol"]]
 
         # 历史点市值用当日收盘价(修复 2026-08-13: 原用当前价导致
         # 历史月份收益随每日价格漂移), 缺失回退当前价
@@ -538,13 +570,13 @@ def _build_equity_curve(trades, positions, price_map, initial_cash,
         for s, h in holdings.items():
             px = None
             if price_history:
-                px = price_history.get(s, {}).get(ev["date"])
+                px = price_history.get(s, {}).get(day)
             if px is None or pd.isna(px):
                 px = price_map.get(s, h["price"])
             market_value += h["shares"] * float(px)
             cost_value += h["shares"] * h["price"]
         equity_rows.append({
-            "date": ev["date"],
+            "date": day,
             "equity": initial_cash + realized_cum + market_value - cost_value,
         })
 
@@ -559,10 +591,16 @@ def _build_equity_curve(trades, positions, price_map, initial_cash,
         for sym, p in positions.items()
         if _in_pool(sym)
     )
-    equity_rows.append({
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "equity": initial_cash + realized_cum + current_market - pos_cost,
-    })
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    # 2026-08-31: 逐日重估后 trade_days 可能已含今日(price_history 有今日价),
+    # 用 positions 口径快照**替换**今日点而非追加, 避免同日双点连线台阶
+    # (positions 为权威: 与卡片 final = 初始 + 已实现 + 浮动 严格一致)
+    if trade_days and trade_days[-1] == today_str:
+        equity_rows[-1] = {"date": today_str,
+                           "equity": initial_cash + realized_cum + current_market - pos_cost}
+    else:
+        equity_rows.append({"date": today_str,
+                            "equity": initial_cash + realized_cum + current_market - pos_cost})
 
     return pd.DataFrame(equity_rows)
 
@@ -817,8 +855,10 @@ def _get_skipped_buys(pending, name_map, within_days: int = _SKIPPED_WINDOW_DAYS
             "signal_date": skip_date,
         })
 
-    # 按偏离度降序
-    skipped.sort(key=lambda x: x["deviation"], reverse=True)
+    # 排序(2026-09-01): 最近日期在前; 相同日期内信号越强(偏离越大)越靠前。
+    # signal_date 为 "YYYY-MM-DD" 字符串, 字典序即时间序。
+    skipped.sort(key=lambda x: (x["signal_date"], x["deviation"]),
+                 reverse=True)
     return skipped
 
 
@@ -918,16 +958,31 @@ def _monthly_returns(eq, initial_cash):
     })
 
 
-def _monthly_heatmap(eq, trades, initial_cash):
-    """月度收益热力图。"""
+def _monthly_heatmap(eq, trades, initial_cash,
+                     eq_stock=None, stock_cash=None,
+                     eq_etf=None, etf_cash=None):
+    """月度收益热力图。每年渲染多行: 总体 + 股票池 + 基金池(可选)。
+
+    2026-08-31: 增加分池独立数据——与月度柱状图同口径,
+    每池首月以各自初始资金为基准(_monthly_returns)。
+    仅传 eq 时行为与原来一致(单"总体"行, 向后兼容)。
+    """
     # 修复(2026-08-12): 原门槛 len(eq) < 20 导致运行初期月度收益空白,
     # 统一以"存在月度数据"为门槛。
-    monthly = _monthly_returns(eq, initial_cash)
-    if len(monthly) < 1:
+    series = [("总体", eq, initial_cash)]
+    if eq_stock is not None and stock_cash is not None:
+        series.append(("股票", eq_stock, stock_cash))
+    if eq_etf is not None and etf_cash is not None:
+        series.append(("基金", eq_etf, etf_cash))
+    monthlies = [(name, _monthly_returns(e, c)) for name, e, c in series]
+    monthlies = [(n, m) for n, m in monthlies if len(m) >= 1]
+    if not monthlies:
         return ""
-    years = sorted(set(d.year for d in monthly.index), reverse=True)
+    all_pct = pd.concat([m["pct"] for _, m in monthlies])
+    years = sorted(set(d.year for _, m in monthlies for d in m.index),
+                   reverse=True)
     months = list(range(1, 13))
-    max_abs = max(abs(monthly["pct"].max()), abs(monthly["pct"].min()), 5.0)
+    max_abs = max(abs(all_pct.max()), abs(all_pct.min()), 5.0)
 
     html = ['<table class="data-table"><thead><tr><th>年份</th>']
     for m in months:
@@ -935,39 +990,47 @@ def _monthly_heatmap(eq, trades, initial_cash):
     html.append('<th>全年</th></tr></thead><tbody>')
 
     for y in years:
-        html.append(f'<tr><td><b>{y}</b></td>')
-        # 修复(2026-08-25): 全年列改为**复合年收益**(原为各月 pct 算术和,
-        # 数学错误——7 月 -1.5% + 8 月 +1.7% 显示 +0.2% 正数, 与总盈亏矛盾)
-        # 金额 = 各月 amount 之和(与单元格口径一致)
-        y_factor = 1.0
-        y_amount = 0.0
-        for m in months:
-            matches = [d for d in monthly.index if d.year == y and d.month == m]
-            if matches:
-                ret = float(monthly.loc[matches[0], "pct"])
-                if pd.notna(ret):
-                    amt = float(monthly.loc[matches[0], "amount"])
-                    intensity = min(abs(ret) / max_abs, 1.0)
-                    if ret > 0:
-                        bg = f"background-color:rgba(0,180,0,{intensity:.2f});"
+        for i, (name, monthly) in enumerate(monthlies):
+            html.append('<tr>')
+            # 第一行显示年份+池名, 后续行仅池名(缩进对齐)
+            if i == 0:
+                html.append(f'<td><b>{y}</b>'
+                            f'<br><span style="font-size:11px;color:#888">{name}</span></td>')
+            else:
+                html.append(f'<td><span style="font-size:11px;color:#888">'
+                            f'&nbsp;&nbsp;{name}</span></td>')
+            # 修复(2026-08-25): 全年列改为**复合年收益**(原为各月 pct 算术和,
+            # 数学错误——7 月 -1.5% + 8 月 +1.7% 显示 +0.2% 正数, 与总盈亏矛盾)
+            # 金额 = 各月 amount 之和(与单元格口径一致)
+            y_factor = 1.0
+            y_amount = 0.0
+            for m in months:
+                matches = [d for d in monthly.index if d.year == y and d.month == m]
+                if matches:
+                    ret = float(monthly.loc[matches[0], "pct"])
+                    if pd.notna(ret):
+                        amt = float(monthly.loc[matches[0], "amount"])
+                        intensity = min(abs(ret) / max_abs, 1.0)
+                        if ret > 0:
+                            bg = f"background-color:rgba(0,180,0,{intensity:.2f});"
+                        else:
+                            bg = f"background-color:rgba(220,0,0,{intensity:.2f});"
+                        html.append(
+                            f'<td class="heat-cell" style="{bg}">'
+                            f'<span style="color:#222;font-weight:bold;">{ret:+.1f}%</span>'
+                            f'<br><span style="color:#444;font-size:11px;">¥{amt:+,.0f}</span></td>')
+                        y_factor *= (1 + ret / 100)
+                        y_amount += amt
                     else:
-                        bg = f"background-color:rgba(220,0,0,{intensity:.2f});"
-                    html.append(
-                        f'<td class="heat-cell" style="{bg}">'
-                        f'<span style="color:#222;font-weight:bold;">{ret:+.1f}%</span>'
-                        f'<br><span style="color:#444;font-size:11px;">¥{amt:+,.0f}</span></td>')
-                    y_factor *= (1 + ret / 100)
-                    y_amount += amt
+                        html.append('<td class="heat-cell">-</td>')
                 else:
                     html.append('<td class="heat-cell">-</td>')
-            else:
-                html.append('<td class="heat-cell">-</td>')
-        y_ret = (y_factor - 1) * 100
-        cls = "positive" if y_ret > 0 else "negative" if y_ret < 0 else ""
-        # 2026-08-25: 全年列加金额(各月 amount 之和, 对齐单元格两行格式)
-        html.append(
-            f'<td><b><span class="{cls}">{y_ret:+.1f}%</span>'
-            f'<br><span style="color:#444;font-size:11px;">¥{y_amount:+,.0f}</span></b></td></tr>')
+            y_ret = (y_factor - 1) * 100
+            cls = "positive" if y_ret > 0 else "negative" if y_ret < 0 else ""
+            # 2026-08-25: 全年列加金额(各月 amount 之和, 对齐单元格两行格式)
+            html.append(
+                f'<td><b><span class="{cls}">{y_ret:+.1f}%</span>'
+                f'<br><span style="color:#444;font-size:11px;">¥{y_amount:+,.0f}</span></b></td></tr>')
 
     html.append('</tbody></table>')
     # 修复(2026-08-19): 14 列热力表(年份+12月+全年)固有宽度 ~880px,

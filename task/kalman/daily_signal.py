@@ -371,9 +371,24 @@ def evaluate_stock(
         if has_pos and pos_info:
             sell_shares = pos_info["shares"]
             add_pending_order(symbol, name, "sell", sell_shares, result["close"], entry_date, 0.0)
-            from exec_log import log_pending as _lp
-            _lp(symbol, name, "sell", 0, sell_shares, result["reason"], entry_date, result["reason"])
+            # 用模块级 log_pending(与买入分支一致)——原本地 import 绕过
+            # 测试 spy 且可向真实 execution_log 写入污染行(2026-08-28 修复)
+            log_pending(symbol, name, "sell", 0, sell_shares, result["reason"], entry_date, result["reason"])
             result["shares"] = sell_shares
+        else:
+            # 无持仓的卖出信号 → 降级 hold, 不生成订单
+            # (修复 2026-08-28: 原逻辑 signal 保持 sell 落盘 signals.csv,
+            #  扫描输出显示 🔴 卖出 仓位 0%, 实际无订单可执行, 展示误导;
+            #  对齐 2026-08-12 买入侧"买不起 1 手降级 hold"修复:
+            #  报告/快照/状态检查不会误显卖出信号)
+            sell_reason = result.get("reason", "")
+            result["signal"] = "hold"
+            result["_target_pct"] = result.get("target_pct", 0.0)
+            result["target_pct"] = 0.0
+            result["reason"] = f"无持仓, 卖出信号忽略 | {sell_reason}"
+            result["_skipped"] = True
+            log_skipped(symbol, name, entry_date, result["reason"],
+                        sell_reason, action="sell")
 
     # 7. 趋势翻转补仓: 持仓标的从下跌趋势→上涨,目标仓位从30%→95%
     if has_pos and result["signal"] == "hold" and result["target_pct"] > 0:
@@ -732,6 +747,31 @@ def main() -> None:
     # 主循环串行评估时全部缓存命中(下载无副作用可并行, 评估有副作用须串行)
     prefetch_data(all_watchlist, data_years, quiet=args.quiet)
 
+    # ---- 0.6 先执行昨日待执行订单, 再扫描(2026-09-01) ----
+    # 原顺序"扫描→执行→补仓": 昨日卖出成交释放的名额在扫描后才生效,
+    # 当日候选先被"已达最大持仓数"拦截, 再由 _auto_fill_pool 补入——
+    # 结果正确但流程绕两步, 且报告先显"被跳过"再显"补仓"。
+    # 先执行后扫描: 名额检查(_pool_positions 实时读 positions.json)基于
+    # 执行后的真实持仓, 昨日卖出释放的名额让当日候选直接下单。
+    # 资金时序正确: 昨日卖出今日开盘成交 → 资金今日到账 → 今日收盘生成
+    # 买入 → 明日开盘成交(T+2, 与 2026-08-26 名额预释放否决不冲突——
+    # 该否决针对"今日卖出信号未成交即释放名额", 此处是已成交的真实释放)。
+    # 今日新卖出信号仍不释放名额(名额延迟, 对齐资金正确性)。
+    positions_pre_exec = len(load_positions())
+    data_fresh = _check_data_freshness(all_watchlist, today)
+    if not data_fresh:
+        all_validation_issues.append({
+            "symbol": "*", "name": "全局", "check": "数据未更新",
+            "level": "warn", "detail": f"最新数据 < {today}，跳过待执行订单",
+        })
+        print(f"  ⚠️ 当日数据未就绪，跳过待执行订单（需 {today} 数据）")
+        from orders import load_pending
+        pending_count = len(load_pending())
+        if pending_count > 0:
+            print(f"  ⏳ {pending_count} 笔待执行订单等待数据更新后成交")
+    else:
+        _execute_today_pending(config, today)
+
     positions_before = len(load_positions())
     results = []
     allocated_cash: Dict[str, float] = {}  # 本轮已承诺资金 {pool: amount}
@@ -780,23 +820,9 @@ def main() -> None:
             append_signals_csv(valid)
             print(f"\n信号已保存: {SIGNALS_CSV} ({len(valid)} 条)")
 
-    # ---- 数据就绪后执行待处理订单 ----
-    data_fresh = _check_data_freshness(all_watchlist, today)
-    if not data_fresh:
-        all_validation_issues.append({
-            "symbol": "*", "name": "全局", "check": "数据未更新",
-            "level": "warn", "detail": f"最新数据 < {today}，跳过待执行订单",
-        })
-        print(f"  ⚠️ 当日数据未就绪，跳过待执行订单（需 {today} 数据）")
-        from orders import load_pending
-        pending_count = len(load_pending())
-        if pending_count > 0:
-            print(f"  ⏳ {pending_count} 笔待执行订单等待数据更新后成交")
-    else:
-        _execute_today_pending(config, today)
-
     # 持仓状态表 + 一致性检查 + 快照
     # 显示被跳过的买入信号
+    # (2026-09-01: 待执行订单执行已移至扫描前, 见"0.6 先执行昨日待执行订单")
     if skipped_buys and not args.quiet:
         print(f"\n  ⏸️ 被跳过 ({len(skipped_buys)} 笔，等仓位空出):")
         skipped_buys.sort(
@@ -820,15 +846,18 @@ def main() -> None:
     # 无条件调用保证"卖出成交后立即补仓"可靠触发(8-4 曾因触发条件未满足漏补)。
     positions_now_all = load_positions()
     positions_now = len(positions_now_all)
-    freed = positions_before - positions_now
-    if not args.quiet and (freed > 0 or skipped_buys):
-        print(f"\n  🔄 补仓检查: 总持仓 {positions_before}→{positions_now} "
-              f"(释放 {freed}), 被跳过候选 {len(skipped_buys)} 笔")
+    # 2026-09-01: 执行已移至扫描前——"释放"指执行昨日订单的净持仓变化
+    # (执行前 → 执行后), 补仓仅在仍有候选被拦截(池满无释放)时兜底触发
+    exec_delta = positions_before - positions_pre_exec
+    if not args.quiet and (exec_delta != 0 or skipped_buys):
+        print(f"\n  🔄 补仓检查: 执行净变化 {exec_delta:+d} "
+              f"({positions_pre_exec}→{positions_before}), "
+              f"被跳过候选 {len(skipped_buys)} 笔")
     if skipped_buys:
         etf_pfx = ("51", "15", "58", "56")
         for pool_name, pool_cfg_key in [("股票", "stock"), ("ETF", "etf")]:
             _auto_fill_pool(
-                skipped_buys, positions_before, positions_now_all,
+                skipped_buys, positions_pre_exec, positions_now_all,
                 config, pool_cfg_key, pool_name, etf_pfx, quiet=args.quiet,
             )
 

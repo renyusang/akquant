@@ -435,7 +435,11 @@ def _run_pool(
     strategy_params: Dict[str, Any],
     show_progress: bool = False,
 ) -> Optional[BacktestResult]:
-    """单池回测:T+1 开盘价执行,手续费置零(对齐旧基线)。"""
+    """单池回测:T+1 开盘价执行,真实手续费(佣金万3双边最低5元+印花税千1卖出+过户费万0.1)。
+
+    2026-09-01 更新 docstring: 原"手续费置零(对齐旧基线)"为过时注释——
+    实际费率与实盘 portfolio.calc_fee 一致(kalman.md 注意事项 12)。
+    """
     if not data_map or not symbols:
         return None
     # NextOpen:T日 on_bar 下单 → T+1 开盘价撮合(与实盘次日开盘成交一致)

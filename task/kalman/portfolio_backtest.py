@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from signal_engine import SignalEngine
 from data_utils import download_stock_data, download_etf_data, preprocess_data
+from portfolio import calc_fee   # 手续费口径唯一事实来源(2026-09-01 修复: 回测补齐费用)
 
 TASK_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(TASK_DIR, "stocks.yaml")
@@ -89,34 +90,104 @@ def prepare_data(config, start, end):
 
 
 # =============================================================================
-# 主回测循环
+# 主回测循环 + 纯函数(2026-09-01 抽取, 对齐实盘 daily_signal/orders 语义)
 # =============================================================================
-def run_backtest(start_date="20200101", end_date="20260724", config_path=None):
-    config = load_backtest_config(config_path)
+def _is_kcb(symbol: str) -> bool:
+    """科创板/创业板(20% 涨跌停): 688/300/301 前缀(对齐 orders.py:190)。"""
+    return symbol.startswith(("688", "300", "301"))
+
+
+def _pool_for(symbol: str) -> str:
+    """标的所属资金池("stock"/"etf")。"""
+    return "etf" if _is_etf(symbol) else "stock"
+
+
+def _prev_close_of(row_sym, idx: int, fallback: float) -> float:
+    """date 之前最近一个交易日的收盘价(实盘 prev_close=信号日收盘语义)。
+
+    修复(2026-09-01): 原用执行日当天收盘(未来信息, 涨停拦截基本失效);
+    订单被拦截保留多日时基准随每日行情更新, 与实盘 execute_pending_orders
+    每次执行时重算 prev_close 一致。数据首日(idx==0)兜底用订单信号价。
+    """
+    if idx > 0:
+        return float(row_sym["close"].iloc[idx - 1])
+    return fallback
+
+
+def _limit_blocked(action: str, open_price: float, prev_close: float,
+                   symbol: str) -> bool:
+    """涨停/跌停拦截(对齐 orders.py: 0.999/1.001 容差, buy 查涨停 sell 查跌停)。"""
+    lp = 0.20 if _is_kcb(symbol) else 0.10
+    if action == "buy" and open_price >= prev_close * (1 + lp) * 0.999:
+        return True
+    if action == "sell" and open_price <= prev_close * (1 - lp) * 1.001:
+        return True
+    return False
+
+
+def _merge_position(old: Dict[str, Any], shares: int, avg_cost: float) -> Dict[str, Any]:
+    """合并持仓(加权均价, 保留首次买入日)——对齐 portfolio.add_position。"""
+    total_shares = old["shares"] + shares
+    total_cost = old["shares"] * old["avg_cost"] + shares * avg_cost
+    return {
+        "shares": total_shares,
+        "avg_cost": total_cost / total_shares,
+        "first_buy": old["first_buy"],
+    }
+
+
+def _refill_qty(symbol: str, shares: int, close: float, target_pct: float,
+                pool_initial_cash: float, max_pct: float,
+                pool_cash: float) -> int:
+    """补仓股数(对齐 daily_signal evaluate_stock 第 7 步)。
+
+    target_value = 池初始现金×target_pct×max_pct; current_value = shares×close;
+    target > current×1.05 才补; add_qty 按整手取整(688→200 股);
+    资金不足或目标已达成返回 0(不补)。
+    """
+    target_value = pool_initial_cash * target_pct * max_pct
+    current_value = shares * close
+    if target_value <= current_value * 1.05:
+        return 0
+    add_value = target_value - current_value
+    lot = 200 if symbol.startswith("688") else 100
+    add_qty = int(add_value / close / lot) * lot
+    if add_qty <= 0 or add_qty * close > pool_cash:
+        return 0
+    return add_qty
+
+
+def _run_backtest_core(all_data: Dict[str, pd.DataFrame], dates: List,
+                       config: Dict[str, Any], stock_cfg: Dict[str, Any],
+                       etf_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """回测主体(无 I/O: 不打印/不写文件/不下载基准)。
+
+    2026-09-01 与实盘 daily_signal 语义对齐的 6 项修复:
+    ①涨停/跌停基准 = 前交易日收盘(信号日), 非执行日收盘
+    ②手续费: 买入 avg_cost 含费、卖出 pnl 减费(portfolio.calc_fee)
+    ③资金分池: 股票/ETF 池现金独立, 不跨池串用
+    ④名额检查: pending 排除卖单与已持仓标的补仓单(不占新增名额)
+    ⑤补仓模拟: hold+target_pct>0 按实盘公式生成 refill 订单, 成交合并持仓
+    ⑥T+1 信号日过滤(防御, 对齐 orders.py:172)
+
+    返回 dict: trades_df/equity_df/final_cash/final_positions/final_equity/
+    total_return/sharpe/max_dd/win_rate/initial_cash。
+    """
     strategy_params = config.get("strategy", {})
-
-    all_data, dates = prepare_data(config, start_date, end_date)
-
-    stock_cfg = _pool_config(config, "stock")
-    etf_cfg = _pool_config(config, "etf")
-
-    # 每个标的的 SignalEngine
     evaluators: Dict[str, SignalEngine] = {}
     warmup_days = 50
 
     # 持仓: {symbol: {shares, avg_cost, first_buy}}
     positions: Dict[str, Dict] = {}
 
-    # 待执行: [{symbol, action, shares, signal_price, signal_date, target_pct}]
+    # 待执行: [{symbol, action, shares, signal_price, signal_date, target_pct, kind}]
     pending: List[Dict] = []
 
     # 交易记录
     trades_log = []
     equity_curve = []
     initial_cash = stock_cfg["cash"] + etf_cfg["cash"]
-    cash_balance = initial_cash
-
-    print(f"回测 {len(dates)} 天 ({dates[0]} ~ {dates[-1]})...")
+    pool_cash = {"stock": stock_cfg["cash"], "etf": etf_cfg["cash"]}
 
     for di, date in enumerate(dates):
         if di < warmup_days:
@@ -142,51 +213,64 @@ def run_backtest(start_date="20200101", end_date="20260724", config_path=None):
                         evaluators[sym].update(c, ma20, ma20_prev, high=hh, low=ll, volume=vv)
             continue
 
-        # 执行待处理订单
+        # 执行待处理订单(T 日信号, T+1 开盘价成交)
         still_pending = []
         for order in pending:
             sym = order["symbol"]
             action = order["action"]
+            pool = _pool_for(sym)
             if sym not in all_data or date not in all_data[sym].index:
+                still_pending.append(order)
+                continue
+            # 修复 ⑥: T+1 信号日过滤(当天信号不执行, 等次日)
+            if order.get("signal_date", "") >= str(date)[:10]:
                 still_pending.append(order)
                 continue
             open_price = float(all_data[sym].loc[date, "open"])
 
-            # 涨跌停检查
-            is_kcb = sym.startswith("688") or sym.startswith("30")
-            lp = 0.20 if is_kcb else 0.10
-            prev_close = float(all_data[sym].loc[date, "close"]) if di > 0 else open_price
-            if action == "buy" and open_price >= prev_close * (1 + lp) * 0.999:
-                still_pending.append(order)
-                continue
-            if action == "sell" and open_price <= prev_close * (1 - lp) * 1.001:
+            # 修复 ①: 涨跌停基准 = 前交易日收盘(信号日), 非执行日收盘
+            row_sym = all_data[sym]
+            idx = row_sym.index.get_loc(date)
+            prev_close = _prev_close_of(
+                row_sym, idx, order.get("signal_price", open_price))
+            if _limit_blocked(action, open_price, prev_close, sym):
                 still_pending.append(order)
                 continue
 
             if action == "sell":
                 if sym in positions:
                     pos = positions.pop(sym)
-                    cash_back = open_price * pos["shares"]
-                    cash_balance += cash_back
+                    # 修复 ②: 卖出扣手续费, pnl 减费(对齐 portfolio.record_trade)
+                    fee_sell = calc_fee(pos["shares"], open_price, "sell")
+                    pool_cash[pool] += open_price * pos["shares"] - fee_sell
                     trades_log.append({
                         "date": date, "symbol": sym, "action": "sell",
                         "shares": pos["shares"], "price": open_price,
-                        "cost": pos["avg_cost"],
-                        "pnl": (open_price - pos["avg_cost"]) * pos["shares"],
+                        "cost": pos["avg_cost"], "fee": fee_sell,
+                        "pnl": (open_price - pos["avg_cost"]) * pos["shares"] - fee_sell,
                         "entry_date": pos["first_buy"],
                     })
-            else:  # buy
+            else:  # buy(含补仓 refill)
                 cost = open_price * order["shares"]
-                if cost <= cash_balance:
-                    cash_balance -= cost
-                    positions[sym] = {
-                        "shares": order["shares"],
-                        "avg_cost": open_price,
-                        "first_buy": date,
-                    }
+                # 修复 ②: 买入扣手续费, avg_cost 含费入成本
+                fee_buy = calc_fee(order["shares"], open_price, "buy")
+                if cost + fee_buy <= pool_cash[pool]:
+                    pool_cash[pool] -= cost + fee_buy
+                    avg_cost_new = (cost + fee_buy) / order["shares"]
+                    # 修复 ⑤: 合并持仓(加权均价, 保留首次买入日)
+                    if sym in positions:
+                        positions[sym] = _merge_position(
+                            positions[sym], order["shares"], avg_cost_new)
+                    else:
+                        positions[sym] = {
+                            "shares": order["shares"],
+                            "avg_cost": avg_cost_new,
+                            "first_buy": date,
+                        }
                     trades_log.append({
                         "date": date, "symbol": sym, "action": "buy",
                         "shares": order["shares"], "price": open_price,
+                        "cost": avg_cost_new, "fee": fee_buy,
                         "pnl": 0, "entry_date": "",
                     })
 
@@ -228,45 +312,66 @@ def run_backtest(start_date="20200101", end_date="20260724", config_path=None):
                 lot = 200 if sym.startswith("688") else 100
                 buy_qty = int(pool_cfg["cash"] * capped_pct / c / lot) * lot
 
-                # 检查池上限
+                # 修复 ④: 名额检查——pending 排除卖单(待卖释放)与已持仓标的
+                # 补仓单(不占新增名额), 对齐 daily_signal:294-295
                 pool_positions = sum(1 for s in positions if _is_etf(s) == _is_etf(sym))
-                pool_pending = sum(1 for o in pending if _is_etf(o["symbol"]) == _is_etf(sym))
+                pool_pending = sum(
+                    1 for o in pending
+                    if _is_etf(o["symbol"]) == _is_etf(sym)
+                    and o["action"] != "sell"
+                    and o["symbol"] not in positions
+                )
                 if pool_positions + pool_pending < pool_cfg["max_positions"]:
                     existing = next((o for o in pending if o["symbol"] == sym), None)
                     if existing is None and buy_qty > 0:
                         pending.append({
                             "symbol": sym, "action": "buy", "shares": buy_qty,
                             "signal_price": c, "signal_date": str(date)[:10],
-                            "target_pct": capped_pct,
+                            "target_pct": capped_pct, "kind": "new",
                         })
 
             elif signal == "sell":
                 if has_pos:
-                    existing = next(
-                        (o for o in pending if o["symbol"] == sym and o["action"] == "sell"),
-                        None,
-                    )
-                    if existing is None:
+                    # 修复 ⑤: 同 symbol 双订单清理(不同向替换, 对齐 orders.py
+                    # add_pending_order)——refill 单被拦截期间出现 sell 时
+                    # 移除该标的全部待执行, 仅保留卖出单
+                    pending = [o for o in pending if o["symbol"] != sym]
+                    pending.append({
+                        "symbol": sym, "action": "sell",
+                        "shares": positions[sym]["shares"],
+                        "signal_price": c, "signal_date": str(date)[:10],
+                        "target_pct": 0.0, "kind": "sell",
+                    })
+
+            elif has_pos and signal == "hold" and target_pct > 0:
+                # 修复 ⑤: 补仓(对齐 daily_signal 第 7 步)——持仓标的趋势
+                # 翻转/仓位不足时按目标仓位补足, 不占新增名额
+                pool_cfg = etf_cfg if _is_etf(sym) else stock_cfg
+                existing = next((o for o in pending if o["symbol"] == sym), None)
+                if existing is None:
+                    add_qty = _refill_qty(
+                        sym, positions[sym]["shares"], c, target_pct,
+                        pool_cfg["cash"], pool_cfg["max_pct"],
+                        pool_cash[_pool_for(sym)])
+                    if add_qty > 0:
                         pending.append({
-                            "symbol": sym, "action": "sell",
-                            "shares": positions[sym]["shares"],
+                            "symbol": sym, "action": "buy", "shares": add_qty,
                             "signal_price": c, "signal_date": str(date)[:10],
-                            "target_pct": 0.0,
+                            "target_pct": round(target_pct * pool_cfg["max_pct"], 4),
+                            "kind": "refill",
                         })
 
-        # 记录权益（现金 + 持仓市值）
+        # 记录权益(分池现金和 + 持仓市值)
         total_market = 0.0
         for sym, pos in positions.items():
             if sym in all_data and date in all_data[sym].index:
                 total_market += pos["shares"] * float(all_data[sym].loc[date, "close"])
-        total_equity = cash_balance + total_market
+        total_cash = pool_cash["stock"] + pool_cash["etf"]
+        total_equity = total_cash + total_market
         equity_curve.append({
-            "date": date, "equity": total_equity, "cash": cash_balance,
+            "date": date, "equity": total_equity, "cash": total_cash,
             "market": total_market, "positions": len(positions),
         })
-
-        if di % 200 == 0:
-            print(f"  {date}  持仓 {len(positions)}  权益 ¥{total_market:,.0f}")
 
     # 输出结果
     trades_df = pd.DataFrame(trades_log) if trades_log else pd.DataFrame()
@@ -275,7 +380,6 @@ def run_backtest(start_date="20200101", end_date="20260724", config_path=None):
     # 计算指标
     final_equity = equity_df["equity"].iloc[-1] if len(equity_df) > 0 else initial_cash
     total_return = (final_equity / initial_cash - 1) * 100
-
     daily_returns = equity_df["equity"].pct_change().dropna() if len(equity_df) > 1 else pd.Series()
     sharpe = (
         float(daily_returns.mean() / daily_returns.std() * np.sqrt(252))
@@ -285,9 +389,39 @@ def run_backtest(start_date="20200101", end_date="20260724", config_path=None):
     rolling_max = equity_df["equity"].cummax()
     drawdown = (equity_df["equity"] - rolling_max) / rolling_max
     max_dd = float(drawdown.min() * 100) if len(drawdown) > 0 else 0
-
     wins = len(trades_df[trades_df["pnl"] > 0]) if len(trades_df) > 0 else 0
     win_rate = wins / len(trades_df) * 100 if len(trades_df) > 0 else 0
+
+    return {
+        "trades_df": trades_df, "equity_df": equity_df,
+        "final_cash": total_cash, "final_positions": positions,
+        "final_equity": final_equity, "total_return": total_return,
+        "sharpe": sharpe, "max_dd": max_dd, "win_rate": win_rate,
+        "initial_cash": initial_cash,
+    }
+
+
+def run_backtest(start_date="20200101", end_date="20260724", config_path=None):
+    """组合回测入口: 数据准备 + _run_backtest_core + 打印/写文件/报告。"""
+    config = load_backtest_config(config_path)
+    all_data, dates = prepare_data(config, start_date, end_date)
+    stock_cfg = _pool_config(config, "stock")
+    etf_cfg = _pool_config(config, "etf")
+
+    print(f"回测 {len(dates)} 天 ({dates[0]} ~ {dates[-1]})...")
+    core = _run_backtest_core(all_data, dates, config, stock_cfg, etf_cfg)
+
+    trades_df = core["trades_df"]
+    equity_df = core["equity_df"]
+    final_equity = core["final_equity"]
+    initial_cash = core["initial_cash"]
+    total_return = core["total_return"]
+    sharpe = core["sharpe"]
+    max_dd = core["max_dd"]
+    win_rate = core["win_rate"]
+    cash_balance = core["final_cash"]
+    positions = core["final_positions"]
+    trades_log = trades_df.to_dict("records")
 
     print(f"\n{'='*60}")
     print(f"  投资组合回测结果")
@@ -304,8 +438,10 @@ def run_backtest(start_date="20200101", end_date="20260724", config_path=None):
     print(f"  最终持仓: {len(positions)} 只")
 
     # 保存CSV
-    trades_df.to_csv(os.path.join(TASK_DIR, "portfolio_trades.csv"), index=False, encoding="utf-8-sig")
-    equity_df.to_csv(os.path.join(TASK_DIR, "portfolio_equity.csv"), index=False, encoding="utf-8-sig")
+    trades_df.to_csv(os.path.join(TASK_DIR, "portfolio_trades.csv"),
+                     index=False, encoding="utf-8-sig")
+    equity_df.to_csv(os.path.join(TASK_DIR, "portfolio_equity.csv"),
+                     index=False, encoding="utf-8-sig")
 
     # 下载沪深300基准
     bench = None
@@ -337,13 +473,14 @@ def run_backtest(start_date="20200101", end_date="20260724", config_path=None):
                 "pnl_pct": (mkt_price / pos["avg_cost"] - 1) * 100,
             })
 
-    # 验证：最终权益 = 现金 + 持仓市值
+    # 验证: 最终权益 = 现金 + 持仓市值
     final_market = sum(p["value"] for p in final_positions)
     final_total = cash_balance + final_market
     print(f"  验证: 现金 ¥{cash_balance:,.0f} + 市值 ¥{final_market:,.0f} = ¥{final_total:,.0f}")
 
     # 生成HTML报告
-    _generate_report(equity_df, trades_df, bench, initial_cash, cash_balance, final_positions, positions)
+    _generate_report(equity_df, trades_df, bench, initial_cash, cash_balance,
+                     final_positions, positions)
     print(f"\n  报告: portfolio_trades.csv, portfolio_equity.csv, portfolio_report.html")
 
 
