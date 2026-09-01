@@ -146,10 +146,58 @@ def validate_pending_orders() -> List[Dict[str, Any]]:
     return issues
 
 
+def check_ex_rights(positions: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """持仓标的除权除息监控(2026-09-01 新增, 应对持仓无自动除权处理)。
+
+    数据源: akshare stock_fhps_detail_em(东方财富分红送配详情)。
+    检测: 除权除息日 ∈ [今天-3, 今天+7] 且方案进度=实施分配 → warn:
+      - 已过除权日(持仓未调整)→ "紧急: 已除权, 请 manage.py split 调整"
+      - 未来 7 天内 → "预警: 将除权, 实施后执行 split"
+    送转比例字段"送转股份-送转总比例"= 每 10 股送转股数(如 20 → 倍数 3)。
+    网络失败/接口变更静默跳过(尽力而为, 不阻断主流程)。
+    """
+    issues = []
+    try:
+        import akshare as ak
+    except ImportError:
+        return issues
+    today = datetime.now().date()
+    for sym, pos in (positions or {}).items():
+        try:
+            df = ak.stock_fhps_detail_em(symbol=sym)
+        except Exception:
+            continue
+        if df is None or df.empty or "除权除息日" not in df.columns:
+            continue
+        ex = pd.to_datetime(df["除权除息日"], errors="coerce").dropna()
+        for d in ex:
+            ex_date = d.date()
+            delta = (ex_date - today).days
+            if -3 <= delta <= 7:
+                row = df[pd.to_datetime(df["除权除息日"], errors="coerce") == d]
+                prog = str(row["方案进度"].iloc[0]) if len(row) else "?"
+                ratio_field = row["送转股份-送转总比例"].iloc[0] if len(row) else None
+                ratio_hint = ""
+                if pd.notna(ratio_field) and float(ratio_field) > 0:
+                    ratio_hint = (f", 送转比例 每10股送转{float(ratio_field):.0f}股"
+                                  f" → split 倍数 {1 + float(ratio_field) / 10:.1f}")
+                if delta < 0:
+                    detail = (f"已除权 {abs(delta)} 天(方案:{prog}{ratio_hint}), "
+                              f"持仓 {pos.get('shares', '?')} 股未调整 → 请执行 "
+                              f"python manage.py split {sym} <倍数> 调整持仓")
+                else:
+                    detail = (f"{delta} 天后除权(方案:{prog}{ratio_hint}), "
+                              f"实施后请执行 python manage.py split {sym} <倍数> 调整持仓")
+                issues.append({"symbol": sym, "name": pos.get("name", sym),
+                               "check": "除权除息", "level": "warn",
+                               "detail": detail})
+    return issues
+
+
 def run_all_checks(
     watchlist: list, quiet: bool = False
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """对所有监控股票执行数据校验 + 订单校验。
+    """对所有监控股票执行数据校验 + 订单校验 + 持仓除权监控。
 
     返回 (data_issues, order_issues)。
     """
@@ -168,6 +216,18 @@ def run_all_checks(
     if order_issues and not quiet:
         for issue in order_issues:
             print(f"  ⚠️ {issue['symbol']} {issue['name']}: [{issue['check']}] {issue['detail']}")
+
+    # 持仓除权监控(2026-09-01): 仅查持仓标的(网络调用, 失败静默)
+    try:
+        from portfolio import load_positions
+        ex_issues = check_ex_rights(load_positions())
+        all_issues.extend(ex_issues)
+        if ex_issues and not quiet:
+            for issue in ex_issues:
+                print(f"  ⚠️ {issue['symbol']} {issue['name']}: "
+                      f"[{issue['check']}] {issue['detail']}")
+    except Exception:
+        pass
 
     return all_issues, order_issues
 

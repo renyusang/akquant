@@ -333,6 +333,39 @@ def cmd_adjust(symbol: str, shares: int, cost: float) -> None:
           f"¥{old['avg_cost']:.2f}→¥{cost:.2f}")
 
 
+def cmd_split(symbol: str, ratio: float) -> None:
+    """持仓除权调整(送股/转增): shares×ratio, avg_cost÷ratio, 总成本不变。
+
+    用法(2026-09-01 新增, 应对除权无自动处理):
+      python manage.py split 002594 3      # 每 10 股送转 20 股 → ×3
+      python manage.py split 600000 1.5    # 每 10 股送转 5 股 → ×1.5
+    除权公告实施(除权除息日)后执行; 现金分红不改变股数, 无需 split。
+    """
+    positions = load_positions()
+    key = str(symbol).zfill(6)
+    if key not in positions:
+        print(f"⚠️ {symbol} 不在持仓中，请先用 add 添加")
+        return
+    if ratio <= 0 or ratio > 10:
+        print(f"⚠️ ratio 必须在 (0, 10] 区间(送转后股数倍数), 收到 {ratio}")
+        return
+    old = positions[key]
+    new_shares = int(old["shares"] * ratio)
+    if new_shares < 1:
+        print(f"⚠️ 调整后股数 {new_shares} < 1, 拒绝")
+        return
+    new_cost = old["avg_cost"] / ratio
+    old_cost_total = old["shares"] * old["avg_cost"]
+    positions[key]["shares"] = new_shares
+    positions[key]["avg_cost"] = new_cost
+    save_positions(positions)
+    new_cost_total = new_shares * new_cost
+    print(f"✅ 除权调整 {symbol} {old['name']}: {old['shares']}→{new_shares}股, "
+          f"¥{old['avg_cost']:.4f}→¥{new_cost:.4f} (总成本 "
+          f"¥{old_cost_total:,.2f}→¥{new_cost_total:,.2f}, 差额 ¥{new_cost_total-old_cost_total:,.2f})")
+    print(f"   提示: 现金分红不改变股数, 无需 split; 配股请用 adjust 手工调整")
+
+
 def cmd_restore(symbol: str) -> None:
     """从 trades.csv 恢复最近一笔已删除的持仓。"""
     if not os.path.exists(TRADES_FILE):
@@ -381,6 +414,10 @@ def main() -> None:
     p_restore = sub.add_parser("restore", help="从交易记录恢复持仓")
     p_restore.add_argument("symbol", help="股票代码")
 
+    p_split = sub.add_parser("split", help="持仓除权调整(送股/转增): shares×ratio, avg_cost÷ratio")
+    p_split.add_argument("symbol", help="股票代码")
+    p_split.add_argument("ratio", type=float, help="送转后股数倍数(每10股送转20股→3)")
+
     p_fill = sub.add_parser("fill", help="记录人工实际成交价(覆盖开盘价假设)")
     p_fill.add_argument("symbol", help="股票代码")
     p_fill.add_argument("action", help="buy 或 sell")
@@ -394,7 +431,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # 写操作前自动备份(影响持仓的操作;fill 只写 actual_fills,不备份)
-    if args.command in ("add", "remove", "adjust", "restore"):
+    if args.command in ("add", "remove", "adjust", "restore", "split"):
         try:
             from backup import create_backup
 
@@ -413,6 +450,8 @@ def main() -> None:
         cmd_adjust(args.symbol, args.shares, args.cost)
     elif args.command == "restore":
         cmd_restore(args.symbol)
+    elif args.command == "split":
+        cmd_split(args.symbol, args.ratio)
     elif args.command == "fill":
         cmd_fill(args.symbol, args.action, args.shares, args.price)
     elif args.command == "backups":
