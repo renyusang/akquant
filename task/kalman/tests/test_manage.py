@@ -112,6 +112,22 @@ class TestCheckExRights:
         assert len(issues) == 1
         assert "已除权" in issues[0]["detail"]
 
+    def test_cash_dividend_no_split(self, monkeypatch, tmp_path):
+        """纯现金分红(送转为空)→ 提示无需 split(2026-09-02 德福科技案例修复)。
+
+        原实现一律提示"执行 split", 对纯分红误导。"""
+        self._mock_ak(monkeypatch, [{
+            "除权除息日": (pd.Timestamp.now() + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+            "方案进度": "实施分配", "送转股份-送转总比例": None,
+            "现金分红-现金分红比例": 1.0,
+            "现金分红-现金分红比例描述": "10派1.00元(含税)",
+        }])
+        issues = validate.check_ex_rights({"600001": {"name": "测试", "shares": 100}})
+        assert len(issues) == 1
+        assert "无需 split" in issues[0]["detail"]
+        assert "10派1.00元" in issues[0]["detail"]
+        assert "split" not in issues[0]["detail"].replace("无需 split", "")
+
     def test_far_future_no_warn(self, monkeypatch, tmp_path):
         """30 天后除权 → 不在窗口, 无预警。"""
         self._mock_ak(monkeypatch, [{

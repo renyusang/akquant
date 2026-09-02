@@ -151,8 +151,9 @@ def check_ex_rights(positions: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     数据源: akshare stock_fhps_detail_em(东方财富分红送配详情)。
     检测: 除权除息日 ∈ [今天-3, 今天+7] 且方案进度=实施分配 → warn:
-      - 已过除权日(持仓未调整)→ "紧急: 已除权, 请 manage.py split 调整"
-      - 未来 7 天内 → "预警: 将除权, 实施后执行 split"
+      - 送转(送股/转增)> 0 → 提示 split 调整(含倍数)
+      - 纯现金分红(送转为空/0) → 提示"股数不变无需 split"(分红现金未自动入账,
+        修复 2026-09-02: 德福科技 10派1 案例——原提示"执行 split"对纯分红误导)
     送转比例字段"送转股份-送转总比例"= 每 10 股送转股数(如 20 → 倍数 3)。
     网络失败/接口变更静默跳过(尽力而为, 不阻断主流程)。
     """
@@ -176,18 +177,44 @@ def check_ex_rights(positions: Dict[str, Any]) -> List[Dict[str, Any]]:
             if -3 <= delta <= 7:
                 row = df[pd.to_datetime(df["除权除息日"], errors="coerce") == d]
                 prog = str(row["方案进度"].iloc[0]) if len(row) else "?"
-                ratio_field = row["送转股份-送转总比例"].iloc[0] if len(row) else None
-                ratio_hint = ""
-                if pd.notna(ratio_field) and float(ratio_field) > 0:
+                ratio_field = (row["送转股份-送转总比例"].iloc[0]
+                               if len(row) and "送转股份-送转总比例" in row.columns
+                               else None)
+                cash_field = (row["现金分红-现金分红比例"].iloc[0]
+                              if len(row) and "现金分红-现金分红比例" in row.columns
+                              else None)
+                has_split = pd.notna(ratio_field) and float(ratio_field) > 0
+                has_cash = pd.notna(cash_field) and float(cash_field) > 0
+                if has_split:
                     ratio_hint = (f", 送转比例 每10股送转{float(ratio_field):.0f}股"
                                   f" → split 倍数 {1 + float(ratio_field) / 10:.1f}")
-                if delta < 0:
-                    detail = (f"已除权 {abs(delta)} 天(方案:{prog}{ratio_hint}), "
-                              f"持仓 {pos.get('shares', '?')} 股未调整 → 请执行 "
-                              f"python manage.py split {sym} <倍数> 调整持仓")
+                    if delta < 0:
+                        detail = (f"已除权 {abs(delta)} 天(方案:{prog}{ratio_hint}), "
+                                  f"持仓 {pos.get('shares', '?')} 股未调整 → 请执行 "
+                                  f"python manage.py split {sym} <倍数> 调整持仓")
+                    else:
+                        detail = (f"{delta} 天后除权(方案:{prog}{ratio_hint}), "
+                                  f"实施后请执行 python manage.py split {sym} <倍数> "
+                                  f"调整持仓")
+                elif has_cash:
+                    cash_desc = (str(row["现金分红-现金分红比例描述"].iloc[0])
+                                 if len(row) and "现金分红-现金分红比例描述" in row.columns
+                                 else "现金分红")
+                    if delta < 0:
+                        detail = (f"已除息 {abs(delta)} 天(方案:{prog}, {cash_desc})——"
+                                  f"纯现金分红股数不变, 无需 split; 分红现金未自动入账"
+                                  f"(持仓 {pos.get('shares', '?')} 股, 影响小)")
+                    else:
+                        detail = (f"{delta} 天后除息(方案:{prog}, {cash_desc})——"
+                                  f"纯现金分红股数不变, 无需 split; 分红现金未自动入账"
+                                  f"(持仓 {pos.get('shares', '?')} 股, 影响小)")
                 else:
-                    detail = (f"{delta} 天后除权(方案:{prog}{ratio_hint}), "
-                              f"实施后请执行 python manage.py split {sym} <倍数> 调整持仓")
+                    if delta < 0:
+                        detail = (f"已除权 {abs(delta)} 天(方案:{prog}), 请人工确认"
+                                  f"送转/分红方案后处理")
+                    else:
+                        detail = (f"{delta} 天后除权(方案:{prog}), 请人工确认"
+                                  f"送转/分红方案后处理")
                 issues.append({"symbol": sym, "name": pos.get("name", sym),
                                "check": "除权除息", "level": "warn",
                                "detail": detail})
