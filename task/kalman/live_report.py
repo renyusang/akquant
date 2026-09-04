@@ -279,6 +279,9 @@ def build_live_report():
     else:
         chart2 = ""
 
+    # 环境趋势图(2026-09-04): up 占比逐日演化(空串时 _chart_box 不产生容器)
+    chart_up = _build_up_trend_fig()
+
     chart1 = fig1.to_html(full_html=False, include_plotlyjs=False)
     # 分池独立图(2026-08-21): 股票池/基金池各自权益+回撤, col2 并排
     chart_stock = _chart_box(
@@ -358,6 +361,8 @@ def build_live_report():
 <h1>实盘交易报告</h1>
 <p style='color:#666;font-size:14px'>交易区间: {start_date} ~ {end_date} | 初始资金: ¥{initial_cash:,.0f} | 生成时间: {now}</p>
 <details open><summary><h2>核心指标</h2></summary>{metrics}</details>
+<details open><summary><h2>环境趋势(up占比)</h2></summary>{_chart_box(chart_up, 300, 260)}
+<p style='margin:4px 0 0;color:#666;font-size:13px'>逐日 trend=up 占比(虚线: 60% 强势 / 40% 弱势分界)。数据源: signals.csv 当日信号。</p></details>
 <details open><summary><h2>权益走势</h2></summary>{_chart_box(chart1, 800, 560)}
 <div class='col2'><div><h4>股票池</h4>{chart_stock}</div><div><h4>基金池</h4>{chart_etf}</div></div></details>
 <details open><summary><h2>月度收益</h2></summary>{_chart_box(chart2, 320, 280)}{monthly_table}</details>
@@ -837,6 +842,55 @@ def _market_env_cards() -> str:
         cards.append(f"<div class='mcard'><span class='label'>ETF池up</span>"
                      f"<span class='value'>{et_up:.0f}%</span></div>")
     return "".join(cards)
+
+
+def _build_up_trend_fig() -> str:
+    """up 占比趋势图(2026-09-04): 逐日 trend=up 占比折线(总体/股票/ETF)。
+
+    配合环境状态栏观察趋势演化(如 8-27 67% → 9-3 22% 连续转弱);
+    60/40 分级参考虚线; signals < 2 天或无数据返回空串。
+    """
+    import plotly.graph_objects as go
+    sig_path = os.path.join(TASK_DIR, "signals.csv")
+    if not os.path.exists(sig_path):
+        return ""
+    try:
+        df = pd.read_csv(sig_path, dtype={"symbol": str})
+    except Exception:
+        return ""
+    if df.empty or "trend" not in df.columns or "date" not in df.columns:
+        return ""
+    df["symbol"] = df["symbol"].str.zfill(6)
+    is_etf = lambda s: str(s).startswith(("51", "15", "58", "56"))
+    daily_rows = []
+    for d, g in df.groupby("date"):
+        st = g[~g["symbol"].apply(is_etf)]
+        et = g[g["symbol"].apply(is_etf)]
+        daily_rows.append({
+            "date": d,
+            "all": float((g["trend"] == "up").mean() * 100),
+            "stock": float((st["trend"] == "up").mean() * 100) if len(st) else None,
+            "etf": float((et["trend"] == "up").mean() * 100) if len(et) else None,
+        })
+    daily = pd.DataFrame(daily_rows)
+    if len(daily) < 2:
+        return ""
+    x = pd.to_datetime(daily["date"])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=daily["all"], name="总体",
+                             line=dict(color="#1f77b4", width=2)))
+    fig.add_trace(go.Scatter(x=x, y=daily["stock"], name="股票",
+                             line=dict(color="#ff7f0e", width=1.5)))
+    fig.add_trace(go.Scatter(x=x, y=daily["etf"], name="ETF",
+                             line=dict(color="#2ca02c", width=1.5)))
+    # 分级参考线: 60% 强势下界 / 40% 弱势上界
+    fig.add_hline(y=60, line_dash="dot", line_color="#2ca02c", opacity=0.35)
+    fig.add_hline(y=40, line_dash="dot", line_color="#d62728", opacity=0.35)
+    fig.update_layout(height=280, margin=dict(l=40, r=20, t=40, b=20),
+                      yaxis=dict(range=[0, 100], title="up 占比 %",
+                                 ticksuffix="%"),
+                      legend=dict(orientation="h", y=1.12))
+    return fig.to_html(full_html=False, include_plotlyjs=False)
 
 
 def _get_skipped_buys(pending, name_map, within_days: int = _SKIPPED_WINDOW_DAYS):

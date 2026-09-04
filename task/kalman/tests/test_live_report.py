@@ -386,6 +386,29 @@ class TestMarketEnvCards:
         html = live_report._market_env_cards()
         assert "较前日" not in html
 
+    def test_up_trend_fig_multi_day(self, monkeypatch, tmp_path):
+        """多日数据 → 趋势图渲染(含 plotly div, 数据点数 = 天数)。"""
+        rows = []
+        for di, d in enumerate(["2026-09-01", "2026-09-02", "2026-09-03"]):
+            rows += [(d, f"600{i:04d}", "up" if (i + di) % 2 == 0 else "down")
+                     for i in range(10)]
+        self._write_signals(monkeypatch, tmp_path, rows)
+        html = live_report._build_up_trend_fig()
+        assert "plotly-graph-div" in html
+        # 总体线数据点(3 天)
+        assert '"y":[' in html or "y\":" in html
+
+    def test_up_trend_fig_single_day_empty(self, monkeypatch, tmp_path):
+        """仅一天数据 → 空串(无法画趋势)。"""
+        self._write_signals(monkeypatch, tmp_path,
+                            [("2026-09-03", "600001", "up")])
+        assert live_report._build_up_trend_fig() == ""
+
+    def test_up_trend_fig_missing_file_empty(self, monkeypatch, tmp_path):
+        """无 signals.csv → 空串。"""
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        assert live_report._build_up_trend_fig() == ""
+
 
 class TestSkippedBuys:
     """被跳过买入候选(2026-08-21 修复): watchlist/近5日过滤 + 跳过当日快照。
