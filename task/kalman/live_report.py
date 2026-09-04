@@ -316,7 +316,7 @@ def build_live_report():
     s_cls = "positive" if stock_total_pnl > 0 else "negative"
     e_cls = "positive" if etf_total_pnl > 0 else "negative"
 
-    metrics = f"""<h2>核心指标</h2>
+    metrics = f"""<h2>核心指标</h2>{_market_env_cards()}
 <div class='metrics'>
 <div class='mcard'><span class='label'>总收益率</span><span class='value {ret_cls}'>{total_ret:+.1f}%</span></div>
 <div class='mcard'><span class='label'>已实现盈亏</span><span class='value {rpnl_cls}'>¥{realized_pnl:+,.0f}</span></div>
@@ -774,6 +774,71 @@ def _pending_orders_html(name_map, stock_cash, etf_cash):
     return "\n".join(html_parts)
 
 
+def _market_env_cards() -> str:
+    """环境状态栏(2026-09-04): 当日信号 up 占比 + 分级 + 较前日变化。
+
+    数据源: signals.csv 当日 trend 统计(总体 + 股票池/ETF 池分池)。
+    分级: up≥60% 强势(绿) / 40-60% 中性(黄) / <40% 弱势(红)——趋势
+    策略环境友好度参考(弱势震荡下追突破损耗高, 低仓位是合理防御)。
+    无 signals 文件/异常时返回空串(不影响报告)。
+    """
+    sig_path = os.path.join(TASK_DIR, "signals.csv")
+    if not os.path.exists(sig_path):
+        return ""
+    try:
+        df = pd.read_csv(sig_path, dtype={"symbol": str})
+    except Exception:
+        return ""
+    if df.empty or "trend" not in df.columns or "date" not in df.columns:
+        return ""
+    df["symbol"] = df["symbol"].str.zfill(6)
+    dates = sorted(df["date"].unique())
+    if not dates:
+        return ""
+    today, prev = dates[-1], dates[-2] if len(dates) >= 2 else None
+    is_etf = lambda s: str(s).startswith(("51", "15", "58", "56"))
+
+    def _pct(d):
+        g = df[df["date"] == d]
+        if len(g) == 0:
+            return None, None, None
+        all_up = float((g["trend"] == "up").mean() * 100)
+        st = g[~g["symbol"].apply(is_etf)]
+        et = g[g["symbol"].apply(is_etf)]
+        st_up = float((st["trend"] == "up").mean() * 100) if len(st) else None
+        et_up = float((et["trend"] == "up").mean() * 100) if len(et) else None
+        return all_up, st_up, et_up
+
+    all_up, st_up, et_up = _pct(today)
+    if all_up is None:
+        return ""
+    prev_up, _, _ = _pct(prev) if prev else (None, None, None)
+    delta = all_up - prev_up if prev_up is not None else None
+
+    if all_up >= 60:
+        env_label, env_cls = "强势", "env-strong"
+    elif all_up >= 40:
+        env_label, env_cls = "中性", "env-mid"
+    else:
+        env_label, env_cls = "弱势", "env-weak"
+    delta_txt = f"{delta:+.0f}pp" if delta is not None else "-"
+    delta_cls = "positive" if (delta or 0) >= 0 else "negative"
+    delta_html = (f"<span class='env-delta {delta_cls}'>较前日 {delta_txt}</span>"
+                  if delta is not None else "")
+
+    cards = [
+        f"<div class='mcard {env_cls}'><span class='label'>环境状态(up占比)</span>"
+        f"<span class='value'>{all_up:.0f}% {env_label}{delta_html}</span></div>",
+    ]
+    if st_up is not None:
+        cards.append(f"<div class='mcard'><span class='label'>股票池up</span>"
+                     f"<span class='value'>{st_up:.0f}%</span></div>")
+    if et_up is not None:
+        cards.append(f"<div class='mcard'><span class='label'>ETF池up</span>"
+                     f"<span class='value'>{et_up:.0f}%</span></div>")
+    return "".join(cards)
+
+
 def _get_skipped_buys(pending, name_map, within_days: int = _SKIPPED_WINDOW_DAYS):
     """从 execution_log.csv + signals.csv 提取近期被跳过的买入候选。
 
@@ -1052,6 +1117,11 @@ h4{color:#777;margin:14px 0 4px;font-size:15px;border-left:3px solid #1f77b4;pad
 .mcard:nth-child(odd){background:#fafafa}
 .mcard .label{font-size:12px;color:#666;display:block}
 .mcard .value{font-size:20px;font-weight:bold;display:block;margin-top:4px}
+/* 环境状态栏(2026-09-04): up 占比分级——后定义覆盖 nth-child 背景 */
+.metrics .mcard.env-strong{background:#e8f5e9}
+.metrics .mcard.env-mid{background:#fff8e1}
+.metrics .mcard.env-weak{background:#ffebee}
+.env-delta{font-size:11px;font-weight:normal;display:block;margin-top:2px;color:#666}
 .positive{color:#2ca02c}.negative{color:#d62728}
 .data-table{width:max-content;min-width:max(640px,100%);border-collapse:separate;border-spacing:0;font-size:13px;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin:12px 0}
 /* 注: 不能有 overflow:hidden——它是 sticky 首列的祖先, 会使其失效 */

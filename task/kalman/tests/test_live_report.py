@@ -344,6 +344,49 @@ class TestBuildReportSmoke:
         assert n_box == n_plot
 
 
+class TestMarketEnvCards:
+    """环境状态栏(2026-09-04): up 占比分级 + 变化。"""
+
+    def _write_signals(self, monkeypatch, tmp_path, rows):
+        """rows: [(date, symbol, trend)]"""
+        df = pd.DataFrame(rows, columns=["date", "symbol", "trend"])
+        df.to_csv(tmp_path / "signals.csv", index=False)
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+
+    def test_weak_env_when_low_up_ratio(self, monkeypatch, tmp_path):
+        """up 11/49(22%) → 弱势(env-weak), 显示占比与分池。"""
+        rows = [("2026-09-03", f"{600000+i:06d}", "down") for i in range(38)]
+        rows += [("2026-09-03", f"6000{i:02d}", "up") for i in range(11)]
+        rows += [("2026-09-02", "600001", "up"), ("2026-09-02", "600002", "down")]
+        self._write_signals(monkeypatch, tmp_path, rows)
+        html = live_report._market_env_cards()
+        assert "env-weak" in html
+        assert "22% 弱势" in html
+        assert "股票池up" in html
+
+    def test_strong_env_when_high_up_ratio(self, monkeypatch, tmp_path):
+        """up 占比高 → 强势(env-strong), 较前日变化显示。"""
+        rows = [("2026-09-03", f"600{i:04d}", "up") for i in range(40)]
+        rows += [("2026-09-03", "510000", "down")]
+        rows += [("2026-09-02", "600001", "down"), ("2026-09-02", "600002", "down")]
+        self._write_signals(monkeypatch, tmp_path, rows)
+        html = live_report._market_env_cards()
+        assert "env-strong" in html
+        assert "较前日" in html
+
+    def test_missing_file_returns_empty(self, monkeypatch, tmp_path):
+        """无 signals.csv → 空串(不影响报告)。"""
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        assert live_report._market_env_cards() == ""
+
+    def test_single_day_no_delta(self, monkeypatch, tmp_path):
+        """仅一天数据 → 无"较前日"显示。"""
+        self._write_signals(monkeypatch, tmp_path,
+                            [("2026-09-03", "600001", "up")])
+        html = live_report._market_env_cards()
+        assert "较前日" not in html
+
+
 class TestSkippedBuys:
     """被跳过买入候选(2026-08-21 修复): watchlist/近5日过滤 + 跳过当日快照。
 
