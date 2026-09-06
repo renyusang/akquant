@@ -51,6 +51,10 @@ class KalmanStrategy(Strategy):
         False, title="大盘环境过滤(弱市禁止新开仓, 不影响持仓退出)")
     env_filter_enabled = BoolParam(
         False, title="环境调节(2026-09-06 研究: 弱市 up 占比低时提高新建仓偏离要求)")
+    volume_filter_enabled = BoolParam(
+        False, title="量比过滤(2026-09-06 研究: 缩量突破视为假突破, 跳过新建仓)")
+    volume_min_ratio = FloatParam(
+        0.8, ge=0.0, le=5.0, title="量比阈值(当日量/前5日均量, 低于此值跳过新建仓)")
     env_weak_threshold = FloatParam(
         0.35, ge=0.0, le=1.0, title="弱市 up 占比阈值(池内前一日 up 占比低于此值视为弱势)")
     env_strict_entry = FloatParam(
@@ -141,6 +145,8 @@ class KalmanStrategy(Strategy):
         self.env_strict_entry = float(p("env_strict_entry"))
         # 环境 up 占比映射 {date_str: up_pct(0-1)}, 回测层预计算传入
         self.env_up_map = dict(kwargs.get("env_up_map") or {})
+        self.volume_filter_enabled = bool(p("volume_filter_enabled"))
+        self.volume_min_ratio = float(p("volume_min_ratio"))
         self.use_velocity_signal = bool(p("use_velocity_signal"))
         self.trend_filter_enabled = bool(p("trend_filter_enabled"))
         self.trend_filter_confirm_bars = max(1, int(p("trend_filter_confirm_bars")))
@@ -373,6 +379,26 @@ class KalmanStrategy(Strategy):
                                 f"偏离{dev:.1%}<{self.env_strict_entry:.1%}"
                             )
                             return
+
+                # 量比过滤(2026-09-06 研究): 缩量突破(当日量/前5日均量 < 阈值)
+                # 快速反转率显著更高(摸底: 缩量 74% vs 放量 51%), 视为假突破
+                # 跳过新建仓(补仓/卖出不受影响)。
+                if self.volume_filter_enabled:
+                    _vol = getattr(bar, "volume", None)
+                    if _vol is not None:
+                        try:
+                            _vh = self.get_history(6, symbol, "volume")
+                        except Exception:
+                            _vh = []
+                        if len(_vh) >= 6 and sum(_vh[:-1]) > 0:
+                            _avg5 = sum(_vh[:-1]) / 5.0
+                            if _vol < _avg5 * self.volume_min_ratio:
+                                self.log(
+                                    f"[缩量突破跳过] {bar.timestamp_iso} {symbol} "
+                                    f"量比{_vol/_avg5:.2f}<"
+                                    f"{self.volume_min_ratio:.2f}"
+                                )
+                                return
                 if limit_up and close_price >= limit_up:
                     self.log(
                         f"[涨停跳过买入] {bar.timestamp_iso} {symbol} "
