@@ -5,7 +5,7 @@
 """
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -428,17 +428,82 @@ def _lot_size_map(symbols: list) -> Dict[str, int]:
     return {s: (200 if str(s).startswith("688") else 100) for s in symbols}
 
 
+def compute_env_up_map(all_data: Dict[str, pd.DataFrame], dates: List,
+                       strategy_params: Dict[str, Any]) -> Dict[str, float]:
+    """预计算每日池内 trend=up 占比(环境调节输入, 2026-09-06)。
+
+    与回测引擎同源: SignalEngine + 相同 trend 参数(warmup 50 天与策略一致),
+    逐日全池评估, 输出 {日期: up_pct(0-1)}。
+    仅趋势状态统计, 无下单/仓位副作用; 策略用 T-1 日值决策, 无前视。
+    限制: ADX 锁方向需要 history 预热, 预计算不传 high/low 使其不生效——
+    当前 stocks.yaml adx_filter 关闭, 趋势纯 MA20, 与策略一致。
+    """
+    from signal_engine import SignalEngine
+
+    def _trend_kw() -> Dict[str, Any]:
+        return {
+            "kalman_q_price": strategy_params.get("kalman_q_price", 0.0001),
+            "kalman_q_vel": strategy_params.get("kalman_q_vel", 1e-5),
+            "kalman_r": strategy_params.get("kalman_r", 0.01),
+            "trend_filter_enabled": strategy_params.get("trend_filter_enabled", False),
+            "trend_confirm_bars": strategy_params.get(
+                "trend_filter_confirm_bars", 1),
+            "recover_confirm_bars": strategy_params.get(
+                "trend_recover_confirm_bars", 1),
+            "trend_bear_pct": strategy_params.get("trend_bear_position_pct", 0.30),
+            "adx_filter_enabled": False,
+        }
+
+    evaluators: Dict[str, SignalEngine] = {}
+    warmup_days = 50
+    env_map: Dict[str, float] = {}
+    for di, date in enumerate(dates):
+        if di < warmup_days:
+            for sym in all_data:
+                if sym not in evaluators:
+                    evaluators[sym] = SignalEngine(**_trend_kw())
+                row = all_data[sym]
+                if date in row.index:
+                    idx = row.index.get_loc(date)
+                    if idx >= 20:
+                        ma20 = float(row["close"].iloc[max(0, idx - 19):idx + 1].mean())
+                        ma20_prev = float(row["close"].iloc[max(0, idx - 20):idx].mean())
+                        c = float(row["close"].iloc[idx])
+                        evaluators[sym].update(c, ma20, ma20_prev)
+            continue
+        up = total = 0
+        for sym in all_data:
+            row = all_data[sym]
+            if date not in row.index:
+                continue
+            idx = row.index.get_loc(date)
+            if idx < 20:
+                continue
+            ma20 = float(row["close"].iloc[max(0, idx - 19):idx + 1].mean())
+            ma20_prev = float(row["close"].iloc[max(0, idx - 20):idx].mean())
+            c = float(row["close"].iloc[idx])
+            result = evaluators[sym].update(c, ma20, ma20_prev)
+            if result.get("trend") == "up":
+                up += 1
+            total += 1
+        if total > 0:
+            env_map[str(date)[:10]] = up / total
+    return env_map
+
+
 def _run_pool(
     data_map: Dict[str, pd.DataFrame],
     symbols: list,
     initial_cash: float,
     strategy_params: Dict[str, Any],
     show_progress: bool = False,
+    env_up_map: Optional[Dict[str, float]] = None,
 ) -> Optional[BacktestResult]:
     """单池回测:T+1 开盘价执行,真实手续费(佣金万3双边最低5元+印花税千1卖出+过户费万0.1)。
 
     2026-09-01 更新 docstring: 原"手续费置零(对齐旧基线)"为过时注释——
     实际费率与实盘 portfolio.calc_fee 一致(kalman.md 注意事项 12)。
+    env_up_map: 每日池内 up 占比(2026-09-06 环境调节输入, None 不启用)。
     """
     if not data_map or not symbols:
         return None
@@ -446,6 +511,9 @@ def _run_pool(
     fill_policy = make_fill_policy(
         price_basis="open", temporal="next_event", bar_offset=1
     )
+    strategy_params = dict(strategy_params)
+    if env_up_map:
+        strategy_params["env_up_map"] = env_up_map
     strategy = KalmanStrategy(**strategy_params)
     return run_backtest(
         data=data_map,
@@ -765,6 +833,19 @@ def run_portfolio_backtest(
     etf_pct = float(etf_pool.get("single_position_pct", 0.20))
     total_cash = stock_cash + etf_cash
 
+    # 环境 up 占比(2026-09-06): env_filter_enabled 时预计算全池每日
+    # trend=up 占比供策略弱市调节(与实盘环境栏同口径, T-1 决策无前视)
+    env_up_map = None
+    if base_params.get("env_filter_enabled"):
+        _all_idx = {s: df.set_index("date")
+                    for s, df in {**stock_map, **etf_map}.items()}
+        _dates = sorted(set().union(*[set(d.index) for d in _all_idx.values()]))
+        print("预计算环境 up 占比序列...")
+        env_up_map = compute_env_up_map(_all_idx, _dates, base_params)
+        if env_up_map:
+            weak_days = sum(1 for v in env_up_map.values() if v < 0.35)
+            print(f"  环境序列 {len(env_up_map)} 天, 弱市(<35%) {weak_days} 天")
+
     print(
         f"\n组合回测 {start_date}~{end_date}: "
         f"股票 {len(stock_syms)} 只(¥{stock_cash:,.0f}) + "
@@ -775,7 +856,7 @@ def run_portfolio_backtest(
         _run_pool(
             stock_map, stock_syms, stock_cash,
             {**base_params, "single_position_pct": stock_pct, "max_positions": stock_max, "initial_cash": stock_cash},
-            show_progress,
+            show_progress, env_up_map,
         )
         if stock_syms
         else None
@@ -784,7 +865,7 @@ def run_portfolio_backtest(
         _run_pool(
             etf_map, etf_syms, etf_cash,
             {**base_params, "single_position_pct": etf_pct, "max_positions": etf_max, "initial_cash": etf_cash},
-            show_progress,
+            show_progress, env_up_map,
         )
         if etf_syms
         else None
