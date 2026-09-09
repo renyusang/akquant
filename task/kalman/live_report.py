@@ -772,11 +772,49 @@ def _pending_orders_html(name_map, stock_cash, etf_cash):
     else:
         _render_buy_block('📈 股票', buys_stock, skip_stock)
         _render_buy_block('📊 基金(ETF)', buys_etf, skip_etf)
+    # 消息面速览(2026-09-09): 待买入标的的新闻/公告要点(手动维护 news_notes.json)
+    buy_syms = sorted({o["symbol"] for o in buys} | {s["symbol"] for s in skipped})
+    news_html = _build_news_block(buy_syms)
+    if news_html:
+        html_parts.append(f'<div style="margin-top:12px"><h4>📰 消息面速览</h4>{news_html}</div>')
     html_parts.append('</div>')
 
     html_parts.append('</div>')  # close col2
 
     return "\n".join(html_parts)
+
+
+def _build_news_block(symbols: list) -> str:
+    """待买入标的消息面速览(2026-09-09 新增)。
+
+    数据源: news_notes.json(手动维护, 每日收盘后用妙想查询后更新)——
+    {symbol: {"date": "YYYY-MM-DD", "summary": "要点"}}。
+    无 notes 文件/标的无记录时返回空串(不影响报告)。
+    """
+    notes_path = os.path.join(TASK_DIR, "news_notes.json")
+    if not os.path.exists(notes_path):
+        return ""
+    try:
+        with open(notes_path, encoding="utf-8") as f:
+            notes = json.load(f)
+    except Exception:
+        return ""
+    parts = []
+    for sym in symbols:
+        key = str(sym).zfill(6)
+        if key not in notes:
+            continue
+        note = notes[key]
+        if not isinstance(note, dict) or not note.get("summary"):
+            continue
+        date_tag = f"<span style='color:#999;font-size:12px'>[{note.get('date', '')}]</span>"
+        warn = "⚠️" if "⚠️" in note["summary"] else "💡"
+        parts.append(
+            f"<p style='margin:6px 0;font-size:13px;background:#fafafa;"
+            f"padding:8px 10px;border-left:3px solid #1f77b4;border-radius:4px'>"
+            f"<b>{key}</b> {date_tag} {warn} {note['summary']}</p>"
+        )
+    return "".join(parts)
 
 
 def _pool_volume_stats(df_signals: pd.DataFrame):

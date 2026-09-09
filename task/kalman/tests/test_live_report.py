@@ -458,6 +458,35 @@ class TestMarketEnvCards:
         assert "环境状态" in html
 
 
+class TestNewsNotes:
+    """待买入消息面速览(2026-09-09): news_notes.json 驱动。"""
+
+    def test_news_block_shows_matching(self, monkeypatch, tmp_path):
+        """有 notes 的标的显示摘要(含日期/警示标记)。"""
+        (tmp_path / "news_notes.json").write_text(json.dumps({
+            "600001": {"date": "2026-09-09",
+                       "summary": "H1净利大增 ⚠️控股股东减持"},
+            "600002": {"date": "2026-09-09", "summary": "涨停机构买入"},
+        }), encoding="utf-8")
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        html = live_report._build_news_block(["600001", "600002", "600003"])
+        assert "600001" in html and "控股股东减持" in html
+        assert "600002" in html
+        assert "600003" not in html          # 无记录不显示
+        assert "⚠️" in html                  # 警示标记
+
+    def test_news_block_no_file(self, monkeypatch, tmp_path):
+        """无 news_notes.json → 空串。"""
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        assert live_report._build_news_block(["600001"]) == ""
+
+    def test_news_block_corrupt_file(self, monkeypatch, tmp_path):
+        """损坏 JSON → 空串(优雅降级)。"""
+        (tmp_path / "news_notes.json").write_text("{broken", encoding="utf-8")
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        assert live_report._build_news_block(["600001"]) == ""
+
+
 class TestSkippedBuys:
     """被跳过买入候选(2026-08-21 修复): watchlist/近5日过滤 + 跳过当日快照。
 
