@@ -304,6 +304,8 @@ def build_live_report():
     monthly_table = _monthly_heatmap(eq, trades, initial_cash,
                                      eq_stock, stock_cash, eq_etf, etf_cash)
     pending_html = _pending_orders_html(name_map, stock_cash, etf_cash)
+    # 持仓消息面(2026-09-10): 当前持仓标的的 news_notes 记录
+    pos_news_html = _build_news_block(list(positions.keys()))
 
     # ---- 指标卡片 ----
     stock_used = sum(p["value"] for p in stock_pos)
@@ -367,7 +369,8 @@ def build_live_report():
 <div class='col2'><div><h4>股票池</h4>{chart_stock}</div><div><h4>基金池</h4>{chart_etf}</div></div></details>
 <details open><summary><h2>月度收益</h2></summary>{_chart_box(chart2, 320, 280)}{monthly_table}</details>
 <details open><summary><h2>当前持仓</h2></summary>
-<div class='col2'><div><h3>股票</h3>{pos_stock_html}</div><div><h3>ETF</h3>{pos_etf_html}</div></div></details>
+<div class='col2'><div><h3>股票</h3>{pos_stock_html}</div><div><h3>ETF</h3>{pos_etf_html}</div></div>
+{f'<h4>📰 持仓消息面</h4>{pos_news_html}' if pos_news_html else ''}</details>
 <details open><summary><h2>待执行订单</h2></summary>{pending_html}</details>
 <details open><summary><h2>已完成交易</h2></summary>
 <div class='vscroll'>{trades_html}</div></details>
@@ -784,11 +787,22 @@ def _pending_orders_html(name_map, stock_cash, etf_cash):
     return "\n".join(html_parts)
 
 
+_SCORE_META = {
+    -2: ("强烈看空", "#b71c1c"),
+    -1: ("看空", "#d62728"),
+    0: ("中性", "#888"),
+    1: ("看多", "#2ca02c"),
+    2: ("强烈看多", "#1b5e20"),
+}
+
+
 def _build_news_block(symbols: list) -> str:
-    """待买入标的消息面速览(2026-09-09 新增)。
+    """消息面速览(2026-09-09 新增, 2026-09-10 增评分与持仓复用)。
 
     数据源: news_notes.json(手动维护, 每日收盘后用妙想查询后更新)——
-    {symbol: {"date": "YYYY-MM-DD", "summary": "要点"}}。
+    {symbol: {"date": "YYYY-MM-DD", "score": -2..2, "summary": "要点"}}。
+    score 评分: +2 强烈看多 / +1 看多 / 0 中性 / -1 看空 / -2 强烈看空
+    (基于消息面综合判断: 业绩/机构/订单为正面, 减持/质押/风险为负面)。
     无 notes 文件/标的无记录时返回空串(不影响报告)。
     """
     notes_path = os.path.join(TASK_DIR, "news_notes.json")
@@ -808,11 +822,19 @@ def _build_news_block(symbols: list) -> str:
         if not isinstance(note, dict) or not note.get("summary"):
             continue
         date_tag = f"<span style='color:#999;font-size:12px'>[{note.get('date', '')}]</span>"
+        try:
+            score = int(note.get("score", 0))
+            score = max(-2, min(2, score))
+        except (TypeError, ValueError):
+            score = 0
+        label, color = _SCORE_META.get(score, _SCORE_META[0])
         warn = "⚠️" if "⚠️" in note["summary"] else "💡"
         parts.append(
             f"<p style='margin:6px 0;font-size:13px;background:#fafafa;"
-            f"padding:8px 10px;border-left:3px solid #1f77b4;border-radius:4px'>"
-            f"<b>{key}</b> {date_tag} {warn} {note['summary']}</p>"
+            f"padding:8px 10px;border-left:3px solid {color};border-radius:4px'>"
+            f"<b>{key}</b> {date_tag} "
+            f"<span style='color:{color};font-weight:bold'>{label}</span> "
+            f"{warn} {note['summary']}</p>"
         )
     return "".join(parts)
 

@@ -462,18 +462,33 @@ class TestNewsNotes:
     """待买入消息面速览(2026-09-09): news_notes.json 驱动。"""
 
     def test_news_block_shows_matching(self, monkeypatch, tmp_path):
-        """有 notes 的标的显示摘要(含日期/警示标记)。"""
+        """有 notes 的标的显示摘要(含日期/警示标记/评分标签)。"""
         (tmp_path / "news_notes.json").write_text(json.dumps({
-            "600001": {"date": "2026-09-09",
+            "600001": {"date": "2026-09-09", "score": -1,
                        "summary": "H1净利大增 ⚠️控股股东减持"},
-            "600002": {"date": "2026-09-09", "summary": "涨停机构买入"},
+            "600002": {"date": "2026-09-09", "score": 2, "summary": "涨停机构买入"},
+            "600003": {"date": "2026-09-09", "score": 0, "summary": "中性消息"},
         }), encoding="utf-8")
         monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
         html = live_report._build_news_block(["600001", "600002", "600003"])
         assert "600001" in html and "控股股东减持" in html
         assert "600002" in html
-        assert "600003" not in html          # 无记录不显示
         assert "⚠️" in html                  # 警示标记
+        # 评分标签(2026-09-10): -1 看空 / +2 强烈看多 / 0 中性
+        assert "看空" in html
+        assert "强烈看多" in html
+        assert "中性" in html
+
+    def test_news_block_score_clamped(self, monkeypatch, tmp_path):
+        """score 越界(±9/非数字) → 钳制到 [-2, 2]。"""
+        (tmp_path / "news_notes.json").write_text(json.dumps({
+            "600001": {"date": "2026-09-09", "score": 9, "summary": "a"},
+            "600002": {"date": "2026-09-09", "score": -9, "summary": "b"},
+            "600003": {"date": "2026-09-09", "score": "x", "summary": "c"},
+        }), encoding="utf-8")
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        html = live_report._build_news_block(["600001", "600002", "600003"])
+        assert "强烈看多" in html and "强烈看空" in html and "中性" in html
 
     def test_news_block_no_file(self, monkeypatch, tmp_path):
         """无 news_notes.json → 空串。"""
