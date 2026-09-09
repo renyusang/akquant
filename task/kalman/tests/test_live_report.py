@@ -409,6 +409,54 @@ class TestMarketEnvCards:
         monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
         assert live_report._build_up_trend_fig() == ""
 
+    @staticmethod
+    def _make_cache(tmp_path, n_syms=12):
+        """构造 n 只标的 7 天缓存(后 2 日放量 2 倍, 末日小涨)。"""
+        dates = pd.bdate_range("2026-09-01", periods=7)
+        cache = tmp_path / ".cache"
+        cache.mkdir()
+        for i in range(n_syms):
+            sym = f"{600000 + i:06d}"
+            vol = [1000.0] * 5 + [2000.0] * 2
+            closes = [10.0 + i * 0.01] * 6 + [10.3 + i * 0.01]
+            pd.DataFrame({"date": dates, "volume": vol,
+                          "close": closes}).to_parquet(
+                cache / f"{sym}.parquet")
+        return dates, [f"{600000 + i:06d}" for i in range(n_syms)]
+
+    def test_volume_card_shown(self, monkeypatch, tmp_path):
+        """量能卡: 样本充足时显示量比×方向(后 2 日放量 2 倍 → 放量)。"""
+        dates, syms = self._make_cache(tmp_path)
+        rows = []
+        for d in dates:
+            for sym in syms:
+                rows.append((str(d.date()), sym, "up"))
+        self._write_signals(monkeypatch, tmp_path, rows)
+        html = live_report._market_env_cards()
+        assert "量能(池级)" in html
+        assert "放量" in html
+
+    def test_volume_card_insufficient_sample(self, monkeypatch, tmp_path):
+        """样本不足(2 只 < 门槛 10) → 无量能卡(其他卡正常)。"""
+        dates, syms = self._make_cache(tmp_path, n_syms=2)
+        rows = []
+        for d in dates:
+            for sym in syms:
+                rows.append((str(d.date()), sym, "up"))
+        self._write_signals(monkeypatch, tmp_path, rows)
+        html = live_report._market_env_cards()
+        assert "量能(池级)" not in html
+        assert "环境状态" in html
+
+    def test_volume_card_missing_cache(self, monkeypatch, tmp_path):
+        """无 .cache → 无量能卡(其他卡正常)。"""
+        self._write_signals(monkeypatch, tmp_path,
+                            [("2026-09-03", "600001", "up"),
+                             ("2026-09-04", "600001", "up")])
+        html = live_report._market_env_cards()
+        assert "量能(池级)" not in html
+        assert "环境状态" in html
+
 
 class TestSkippedBuys:
     """被跳过买入候选(2026-08-21 修复): watchlist/近5日过滤 + 跳过当日快照。

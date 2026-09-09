@@ -779,8 +779,56 @@ def _pending_orders_html(name_map, stock_cash, etf_cash):
     return "\n".join(html_parts)
 
 
+def _pool_volume_stats(df_signals: pd.DataFrame):
+    """池级量能统计(2026-09-09): 与 up 占比同池同口径。
+
+    返回 (vol_ratio, pool_ret_pct): 池量比 = Σ当日量 / Σ前5日均量;
+    池均涨跌 = 各标的当日涨跌幅均值(%). 数据不足/异常返回 None。
+    """
+    import glob as _glob
+    cache_dir = os.path.join(TASK_DIR, ".cache")
+    if not os.path.exists(cache_dir):
+        return None
+    dates = sorted(df_signals["date"].unique())
+    if not dates:
+        return None
+    today = dates[-1]
+    syms = df_signals[df_signals["date"] == today]["symbol"].tolist()
+    vol_today, vol_avg5, rets = [], [], []
+    for sym in syms:
+        path = os.path.join(cache_dir, f"{sym}.parquet")
+        if not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_parquet(path, columns=["date", "volume", "close"])
+        except Exception:
+            continue
+        df["date"] = pd.to_datetime(df["date"])
+        matches = df.index[df["date"] == pd.Timestamp(today)]
+        if len(matches) == 0:
+            continue  # 当日停牌/数据缺失
+        idx = matches[-1]
+        if idx < 5:
+            continue
+        v5 = float(df["volume"].iloc[idx - 5:idx].mean())
+        if v5 <= 0:
+            continue
+        vol_today.append(float(df["volume"].iloc[idx]))
+        vol_avg5.append(v5)
+        pc = float(df["close"].iloc[idx - 1])
+        if pc > 0:
+            rets.append(float(df["close"].iloc[idx]) / pc - 1)
+    if len(vol_today) < 10 or not rets:
+        return None
+    ratio = sum(vol_today) / sum(vol_avg5)
+    return ratio, float(np.mean(rets) * 100)
+
+
 def _market_env_cards() -> str:
     """环境状态栏(2026-09-04): 当日信号 up 占比 + 分级 + 较前日变化。
+
+    2026-09-09 增强: 量能卡——池量比×方向(放量上涨=拐点确认,
+    缩量反弹=乏力预警; 8-19 放量大跌/9-7 缩量反弹为实证案例)。
 
     数据源: signals.csv 当日 trend 统计(总体 + 股票池/ETF 池分池)。
     分级: up≥60% 强势(绿) / 40-60% 中性(黄) / <40% 弱势(红)——趋势
@@ -831,6 +879,31 @@ def _market_env_cards() -> str:
     delta_html = (f"<span class='env-delta {delta_cls}'>较前日 {delta_txt}</span>"
                   if delta is not None else "")
 
+    # 量能卡(2026-09-09): 池量比×方向——放量上涨=转强确认, 缩量反弹=乏力
+    vol_line = ""
+    vs = _pool_volume_stats(df)
+    if vs is not None:
+        ratio, pool_ret = vs
+        if ratio >= 1.05:
+            vol_tag = "放量"
+        elif ratio <= 0.95:
+            vol_tag = "缩量"
+        else:
+            vol_tag = "平量"
+        dir_tag = "涨" if pool_ret >= 0.3 else "跌" if pool_ret <= -0.3 else "平"
+        # 拐点确认提示: up 回升+放量上涨 或 缩量反弹预警
+        hint = ""
+        if vol_tag == "放量" and dir_tag == "涨" and all_up >= 35:
+            hint = "·转强确认"
+        elif vol_tag == "缩量" and dir_tag == "涨" and all_up < 35:
+            hint = "·反弹乏力⚠"
+        vol_line = (
+            f"<div class='mcard'><span class='label'>量能(池级)</span>"
+            f"<span class='value'>{vol_tag} {ratio:.2f}"
+            f"<br><span class='env-delta'>池均{pool_ret:+.1f}% {dir_tag}{hint}</span>"
+            f"</span></div>"
+        )
+
     cards = [
         f"<div class='mcard {env_cls}'><span class='label'>环境状态(up占比)</span>"
         f"<span class='value'>{all_up:.0f}% {env_label}{delta_html}</span></div>",
@@ -841,6 +914,7 @@ def _market_env_cards() -> str:
     if et_up is not None:
         cards.append(f"<div class='mcard'><span class='label'>ETF池up</span>"
                      f"<span class='value'>{et_up:.0f}%</span></div>")
+    cards.append(vol_line)
     return "".join(cards)
 
 
