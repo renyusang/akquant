@@ -458,6 +458,56 @@ class TestMarketEnvCards:
         assert "环境状态" in html
 
 
+class TestVolumeTrendFig:
+    """量能趋势图(2026-09-10): 池量比逐日演化。"""
+
+    def test_multi_day_rendered(self, monkeypatch, tmp_path):
+        """多日 cache + signals → 渲染(含 1.0 基线)。"""
+        import pandas as pd
+        dates = pd.bdate_range("2026-09-01", periods=10)
+        cache = tmp_path / ".cache"
+        cache.mkdir()
+        for i in range(12):
+            sym = f"{600000 + i:06d}"
+            vol = [1000.0] * 8 + [2000.0] * 2   # 末日放量
+            pd.DataFrame({"date": dates, "volume": vol,
+                          "close": [10.0] * 10}).to_parquet(
+                cache / f"{sym}.parquet")
+        rows = [(str(d.date()), f"{600000 + i:06d}") for d in dates
+                for i in range(12)]
+        pd.DataFrame(rows, columns=["date", "symbol"]).to_csv(
+            tmp_path / "signals.csv", index=False)
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        html = live_report._build_volume_trend_fig()
+        assert "plotly-graph-div" in html
+        # trace name 在 plotly JSON 中为 unicode 转义(池量比)
+        assert "\\u6c60\\u91cf\\u6bd4" in html
+
+    def test_insufficient_data_empty(self, monkeypatch, tmp_path):
+        """标的 < 10 或交易日不足 → 空串。"""
+        import pandas as pd
+        cache = tmp_path / ".cache"
+        cache.mkdir()
+        dates = pd.bdate_range("2026-09-01", periods=3)
+        for i in range(12):
+            sym = f"{600000 + i:06d}"
+            pd.DataFrame({"date": dates, "volume": [1000.0] * 3}).to_parquet(
+                cache / f"{sym}.parquet")
+        rows = [(str(d.date()), f"{600000 + i:06d}") for d in dates
+                for i in range(12)]
+        pd.DataFrame(rows, columns=["date", "symbol"]).to_csv(
+            tmp_path / "signals.csv", index=False)
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        assert live_report._build_volume_trend_fig() == ""
+
+    def test_no_cache_empty(self, monkeypatch, tmp_path):
+        """无 .cache → 空串。"""
+        (tmp_path / "signals.csv").write_text("date,symbol\n2026-09-10,600001\n",
+                                              encoding="utf-8")
+        monkeypatch.setattr(live_report, "TASK_DIR", str(tmp_path))
+        assert live_report._build_volume_trend_fig() == ""
+
+
 class TestNewsNotes:
     """待买入消息面速览(2026-09-09): news_notes.json 驱动。"""
 

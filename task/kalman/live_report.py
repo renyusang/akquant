@@ -281,6 +281,8 @@ def build_live_report():
 
     # 环境趋势图(2026-09-04): up 占比逐日演化(空串时 _chart_box 不产生容器)
     chart_up = _build_up_trend_fig()
+    # 量能趋势图(2026-09-10): 池量比逐日演化(与量能卡同口径)
+    chart_vol = _build_volume_trend_fig()
 
     chart1 = fig1.to_html(full_html=False, include_plotlyjs=False)
     # 分池独立图(2026-08-21): 股票池/基金池各自权益+回撤, col2 并排
@@ -365,6 +367,8 @@ def build_live_report():
 <details open><summary><h2>核心指标</h2></summary>{metrics}</details>
 <details open><summary><h2>环境趋势(up占比)</h2></summary>{_chart_box(chart_up, 300, 260)}
 <p style='margin:4px 0 0;color:#666;font-size:13px'>逐日 trend=up 占比(虚线: 60% 强势 / 40% 弱势分界)。数据源: signals.csv 当日信号。</p></details>
+<details open><summary><h2>量能趋势(池量比)</h2></summary>{_chart_box(chart_vol, 280, 240)}
+<p style='margin:4px 0 0;color:#666;font-size:13px'>逐日池量比 = Σ当日量/Σ前5日均量(实线灰=1.0 基线, 红点线=1.05 放量参考)。数据源: .cache 成交量。</p></details>
 <details open><summary><h2>权益走势</h2></summary>{_chart_box(chart1, 800, 560)}
 <div class='col2'><div><h4>股票池</h4>{chart_stock}</div><div><h4>基金池</h4>{chart_etf}</div></div></details>
 <details open><summary><h2>月度收益</h2></summary>{_chart_box(chart2, 320, 280)}{monthly_table}</details>
@@ -813,14 +817,12 @@ def _build_news_block(symbols: list) -> str:
             notes = json.load(f)
     except Exception:
         return ""
-    parts = []
-    for sym in symbols:
-        key = str(sym).zfill(6)
-        if key not in notes:
-            continue
-        note = notes[key]
+    is_etf = lambda s: str(s).startswith(("51", "15", "58", "56"))
+
+    def _render_one(key: str) -> str:
+        note = notes.get(key)
         if not isinstance(note, dict) or not note.get("summary"):
-            continue
+            return ""
         date_tag = f"<span style='color:#999;font-size:12px'>[{note.get('date', '')}]</span>"
         try:
             score = int(note.get("score", 0))
@@ -828,15 +830,31 @@ def _build_news_block(symbols: list) -> str:
         except (TypeError, ValueError):
             score = 0
         label, color = _SCORE_META.get(score, _SCORE_META[0])
-        warn = "⚠️" if "⚠️" in note["summary"] else "💡"
-        parts.append(
+        auto_tag = ("<span style='color:#aaa;font-size:11px'>[自动]</span> "
+                    if note.get("auto") else "")
+        warn = "⚠️" if "⚠️" in note["summary"] else ""
+        return (
             f"<p style='margin:6px 0;font-size:13px;background:#fafafa;"
             f"padding:8px 10px;border-left:3px solid {color};border-radius:4px'>"
             f"<b>{key}</b> {date_tag} "
             f"<span style='color:{color};font-weight:bold'>{label}</span> "
-            f"{warn} {note['summary']}</p>"
+            f"{auto_tag}{warn}{note['summary']}</p>"
         )
-    return "".join(parts)
+
+    # 分池(2026-09-10): 股票 / 基金 分组显示(两组都有内容时加小标题)
+    stock_parts, etf_parts = [], []
+    for sym in symbols:
+        key = str(sym).zfill(6)
+        html_one = _render_one(key)
+        if not html_one:
+            continue
+        (etf_parts if is_etf(key) else stock_parts).append(html_one)
+    if stock_parts and etf_parts:
+        return (f"<h5 style='margin:8px 0 4px;color:#555'>📈 股票</h5>"
+                f"{''.join(stock_parts)}"
+                f"<h5 style='margin:10px 0 4px;color:#555'>📊 基金(ETF)</h5>"
+                f"{''.join(etf_parts)}")
+    return "".join(stock_parts or etf_parts)
 
 
 def _pool_volume_stats(df_signals: pd.DataFrame):
@@ -976,6 +994,57 @@ def _market_env_cards() -> str:
                      f"<span class='value'>{et_up:.0f}%</span></div>")
     cards.append(vol_line)
     return "".join(cards)
+
+
+def _build_volume_trend_fig() -> str:
+    """池量比趋势图(2026-09-10): 逐日 Σ当日量/Σ前5日均量(与量能卡同口径)。
+
+    数据源: signals.csv 当日标的列表 + .cache 各标的 volume;
+    1.0 参考基线(放量>1 / 缩量<1)。<5 个交易日或无数据返回空串。
+    """
+    import plotly.graph_objects as go
+    sig_path = os.path.join(TASK_DIR, "signals.csv")
+    cache_dir = os.path.join(TASK_DIR, ".cache")
+    if not os.path.exists(sig_path) or not os.path.exists(cache_dir):
+        return ""
+    try:
+        sig = pd.read_csv(sig_path, dtype={"symbol": str})
+    except Exception:
+        return ""
+    if sig.empty or "symbol" not in sig.columns:
+        return ""
+    syms = sorted(set(sig["symbol"].str.zfill(6)))
+    # 各标的成交量序列 → 对齐到共同日期索引
+    vol_frames = []
+    for sym in syms:
+        path = os.path.join(cache_dir, f"{sym}.parquet")
+        if not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_parquet(path, columns=["date", "volume"])
+        except Exception:
+            continue
+        df["date"] = pd.to_datetime(df["date"])
+        vol_frames.append(df.set_index("date")["volume"].astype(float))
+    if len(vol_frames) < 10:
+        return ""
+    vol_df = pd.concat(vol_frames, axis=1)
+    total = vol_df.sum(axis=1, skipna=True).tail(120)   # 近 120 交易日
+    if len(total) < 6:
+        return ""
+    ratio = total / total.rolling(5).mean().shift(1)    # 当日/前5日均量
+    ratio = ratio.dropna()
+    if len(ratio) < 2:
+        return ""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=ratio.index, y=ratio.values, name="池量比",
+                             line=dict(color="#9467bd", width=2)))
+    fig.add_hline(y=1.0, line_dash="dot", line_color="#888", opacity=0.5)
+    fig.add_hline(y=1.05, line_dash="dot", line_color="#d62728", opacity=0.25)
+    fig.update_layout(height=280, margin=dict(l=40, r=20, t=40, b=20),
+                      yaxis=dict(title="量比(Σ当日/Σ前5日均量)"),
+                      legend=dict(orientation="h", y=1.12))
+    return fig.to_html(full_html=False, include_plotlyjs=False)
 
 
 def _build_up_trend_fig() -> str:

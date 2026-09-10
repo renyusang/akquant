@@ -875,6 +875,26 @@ def main() -> None:
     if not args.no_save:
         save_validation_log(all_validation_issues)
 
+    # 消息面自动更新(2026-09-10): 持仓 + 待买入(含被跳过候选)
+    # 人工/妙想记录(无 auto 标记)7 天内保留; 自动记录每日重抓
+    try:
+        from news_notes import auto_update_notes
+        from orders import load_pending as _lp
+        _watch_syms = list(load_positions().keys())
+        _watch_syms += [o["symbol"] for o in _lp() if o.get("action") == "buy"]
+        for r in results:
+            if r.get("_skipped"):
+                _watch_syms.append(r["symbol"])
+        _news_res = auto_update_notes(TASK_DIR, _watch_syms)
+        if not args.quiet and (_news_res["updated"] or _news_res["failed"]):
+            print(f"  📰 消息面: 更新 {len(_news_res['updated'])} 只, "
+                  f"保留 {len(_news_res['kept'])} 只"
+                  + (f", 失败 {len(_news_res['failed'])} 只"
+                     if _news_res["failed"] else ""))
+    except Exception as e:
+        if not args.quiet:
+            print(f"  ⚠️ 消息面更新异常: {e}")
+
     # 持仓状态表 + 实盘报告
     if not args.quiet:
         print_position_summary()
