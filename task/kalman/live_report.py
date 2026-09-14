@@ -37,13 +37,26 @@ _ADAPTIVE_CHART_JS = """
 (function(){
   if (typeof Plotly === 'undefined') return;  // CDN 加载失败时静默跳过
   var boxes = document.querySelectorAll('.chart-box[data-mh]');
-  if (!boxes.length) return;
   function apply(){
+    // 1) col2 自适应单列(2026-09-14): 浏览器缩放/窄窗时两列放不下——
+    //    子图不重绘宽度会被 body overflow-x:clip 裁剪("显示不全"),
+    //    容器宽 < 820px 时切单列(缩放场景媒体查询不可靠, 用实测宽度)。
+    var cols = document.querySelectorAll('.col2');
+    Array.prototype.forEach.call(cols, function(c){
+      var w = c.clientWidth;
+      var single = w > 0 && w < 820;
+      c.style.display = single ? 'block' : '';
+      Array.prototype.forEach.call(c.children, function(ch){
+        ch.style.width = single ? '100%' : '';
+      });
+    });
+    // 2) 图表宽度重绘 + 高度自适应
     var narrow = window.matchMedia('(max-width:600px)').matches
               || window.matchMedia('(max-height:500px)').matches;
     Array.prototype.forEach.call(boxes, function(box){
       var gd = box.querySelector('.plotly-graph-div');
       if (!gd || !gd.data) return;  // 图表未初始化(空容器)跳过
+      if (Plotly.Plots && Plotly.Plots.resize) Plotly.Plots.resize(gd);
       var h = parseInt(narrow ? box.getAttribute('data-mh')
                               : box.getAttribute('data-dh'), 10);
       if (h > 0 && gd.layout.height !== h) {
@@ -54,7 +67,7 @@ _ADAPTIVE_CHART_JS = """
   var timer = null;
   window.addEventListener('resize', function(){
     clearTimeout(timer);
-    timer = setTimeout(apply, 150);  // 防抖: 旋转屏幕/拖拽窗口
+    timer = setTimeout(apply, 150);  // 防抖: 旋转屏幕/拖拽窗口/浏览器缩放
   });
   apply();                // 脚本在 body 末尾, 解析到此图表已渲染
   setTimeout(apply, 400); // 兜底: 慢速设备上再校一次
@@ -184,9 +197,12 @@ def build_live_report():
     fig1 = make_subplots(rows=3, cols=1,
                          subplot_titles=("总权益(含沪深300对比)", "回撤(%)", "年度收益(%)"),
                          row_heights=[0.5, 0.25, 0.25], vertical_spacing=0.12)
+    # 2026-09-14: 权益线不用 fill="tozeroy"——y 轴 range 紧贴数据(38-41万),
+    # 而填充基线 0 在范围外; 若用户双击 autoscale, plotly 会把 0 计入范围
+    # → y 轴变成 [0, 峰值], 曲线被压缩成顶部平线("缩放比例不对")。
+    # 去掉 fill 后 autoscale 只含曲线范围。回撤子图的 fill 保留(数据含 0, 正确)。
     fig1.add_trace(go.Scatter(x=eq.index, y=eq, mode="lines", name="权益",
-                   line=dict(color="#1f77b4", width=1.5), fill="tozeroy",
-                   fillcolor="rgba(31,119,180,0.1)"), row=1, col=1)
+                   line=dict(color="#1f77b4", width=1.5)), row=1, col=1)
     if hs300_norm is not None:
         fig1.add_trace(go.Scatter(x=hs300_norm.index, y=hs300_norm.values, name="沪深300",
                        line=dict(color="#ff7f0e", dash="dash", width=1.2)), row=1, col=1)
@@ -634,9 +650,10 @@ def _build_pool_fig(eq_pool, pool: str, title: str):
     fig = make_subplots(rows=2, cols=1,
                         subplot_titles=(f"{title}权益", "回撤(%)"),
                         row_heights=[0.65, 0.35], vertical_spacing=0.12)
+    # 权益线不用 fill(2026-09-14 修复): 同主图——填充基线 0 在紧贴的
+    # y 轴范围外, autoscale 双击会把 0 计入导致曲线被压缩到顶部。
     fig.add_trace(go.Scatter(x=eq_pool.index, y=eq_pool, mode="lines",
-                   line=dict(color=color, width=1.5), fill="tozeroy",
-                   fillcolor="rgba(0,0,0,0.04)"), row=1, col=1)
+                   line=dict(color=color, width=1.5)), row=1, col=1)
     dd = (eq_pool - eq_pool.cummax()) / eq_pool.cummax() * 100
     fig.add_trace(go.Scatter(x=dd.index, y=dd.values, fill="tozeroy",
                    line=dict(color="#d62728", width=1)), row=2, col=1)

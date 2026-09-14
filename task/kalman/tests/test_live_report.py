@@ -249,6 +249,16 @@ class TestMobileAdaptation:
         assert "data-mh" in js and "data-dh" in js
         assert "addEventListener('resize'" in js
 
+    def test_adaptive_js_col2_single_column(self):
+        """浏览器缩放自适应(2026-09-14): col2 容器窄于 820px 切单列,
+        并对全部图表触发 Plotly.Plots.resize 重绘宽度(否则缩放后
+        图保持旧宽被 overflow-x:clip 裁剪, 显示不全)。"""
+        js = live_report._ADAPTIVE_CHART_JS
+        assert ".col2" in js and "clientWidth" in js
+        assert "820" in js                       # 单列阈值
+        assert "Plotly.Plots.resize" in js       # 宽度重绘
+        assert "display = single ? 'block'" in js
+
     def test_css_vscroll_rules(self):
         """vscroll: 桌面 600px 滚动盒; ≤600px 取消(避免三层嵌套滚动)。"""
         css = live_report._css()
