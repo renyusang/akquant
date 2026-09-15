@@ -131,7 +131,7 @@ def main() -> None:
 
     # 持仓总览 + 状态一致性 + 快照
     if not args.quiet:
-        ds.print_position_summary()
+        ds.print_position_summary(ds.CONFIG_FILE)
         state_check.print_check_result()
     state_check.save_snapshot()
 

@@ -1077,3 +1077,80 @@ class TestSellWithoutPositionDowngraded:
             assert result["shares"] == 100
             assert calls["log_pending"] != []
             assert calls["log_skipped"] == []
+
+
+# ---------------------------------------------------------------------------
+# 持仓总览: 上限须读取当前生效配置(2026-09-15 修复配置串台)
+# ---------------------------------------------------------------------------
+def _summary_positions(symbol: str, shares: int, avg_cost: float) -> dict:
+    return {symbol: {"name": "测试标的", "shares": shares,
+                     "avg_cost": avg_cost, "first_buy_date": "2026-09-07"}}
+
+
+class TestPositionSummaryConfig:
+    """修复前 print_position_summary 硬编码读 stocks.yaml:
+
+    unlimited 变体目录只有 unlimited.yaml → 文件缺失被静默吞掉 →
+    回退默认 cash=10万/max=20%, 显示"上限 ¥20,000"并把所有持仓误标
+    ⚠️超标(实际配置 10 亿/20%)。
+    """
+
+    def _setup(self, monkeypatch, tmp, positions):
+        monkeypatch.setattr(daily_signal, "load_positions", lambda: positions)
+        monkeypatch.setattr(daily_signal, "SIGNALS_CSV",
+                            os.path.join(tmp, "absent_signals.csv"))
+        import exec_log
+        import portfolio
+        monkeypatch.setattr(exec_log, "get_summary", lambda: "stub")
+        monkeypatch.setattr(exec_log, "get_pending_count", lambda: 0)
+        monkeypatch.setattr(portfolio, "get_trade_summary",
+                            lambda: {"count": 0, "wins": 0, "losses": 0,
+                                     "total_pnl": 0.0})
+
+    def test_uses_explicit_config_path(self, monkeypatch, capsys, tmp_path):
+        """显式传入 unlimited.yaml → 上限按 1e9*20%, 大持仓不误标超标。"""
+        cfg = tmp_path / "unlimited.yaml"
+        cfg.write_text("stock:\n  initial_cash: 1000000000.0\n"
+                       "  single_position_pct: 0.2\n", encoding="utf-8")
+        self._setup(monkeypatch, str(tmp_path),
+                    _summary_positions("002916", 300, 382.775))
+        daily_signal.print_position_summary(str(cfg))
+        out = capsys.readouterr().out
+        assert "上限 20% = ¥200,000,000" in out
+        assert "超标" not in out
+
+    def test_default_reads_module_config_file(self, monkeypatch, capsys, tmp_path):
+        """不传参时读 CONFIG_FILE(实盘 stocks.yaml 路径) → 行为不回归。"""
+        cfg = tmp_path / "stocks.yaml"
+        cfg.write_text("stock:\n  initial_cash: 300000\n"
+                       "  single_position_pct: 0.2\n", encoding="utf-8")
+        monkeypatch.setattr(daily_signal, "CONFIG_FILE", str(cfg))
+        self._setup(monkeypatch, str(tmp_path),
+                    _summary_positions("300750", 100, 400.0))
+        daily_signal.print_position_summary()
+        out = capsys.readouterr().out
+        assert "上限 20% = ¥60,000" in out
+        assert "超标" not in out
+
+    def test_flag_still_raised_when_over_cap(self, monkeypatch, capsys, tmp_path):
+        """配置可读且持仓超上限 → 仍正常标超标(防修复把告警关掉)。"""
+        cfg = tmp_path / "stocks.yaml"
+        cfg.write_text("stock:\n  initial_cash: 100000\n"
+                       "  single_position_pct: 0.2\n", encoding="utf-8")
+        self._setup(monkeypatch, str(tmp_path),
+                    _summary_positions("300750", 100, 400.0))  # 市值4万 > 上限2万
+        daily_signal.print_position_summary(str(cfg))
+        out = capsys.readouterr().out
+        assert "上限 20% = ¥20,000" in out
+        assert "⚠️超标" in out
+
+    def test_missing_config_no_fabricated_cap(self, monkeypatch, capsys, tmp_path):
+        """配置读不到时不显示臆造上限, 也不误标超标。"""
+        monkeypatch.setattr(daily_signal, "CONFIG_FILE",
+                            str(tmp_path / "nope.yaml"))
+        self._setup(monkeypatch, str(tmp_path),
+                    _summary_positions("300750", 100, 400.0))
+        daily_signal.print_position_summary()
+        out = capsys.readouterr().out
+        assert "上限未配置" in out
+        assert "超标" not in out

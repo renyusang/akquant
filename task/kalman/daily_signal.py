@@ -21,7 +21,7 @@ import argparse
 import os
 import sys
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import yaml
@@ -897,7 +897,7 @@ def main() -> None:
 
     # 持仓状态表 + 实盘报告
     if not args.quiet:
-        print_position_summary()
+        print_position_summary(args.config)
         print_check_result()
     save_snapshot()
 
@@ -1151,8 +1151,14 @@ def _execute_today_pending(config: Dict[str, Any], today: str = "") -> List[Dict
     return executed
 
 
-def print_position_summary() -> None:
-    """打印当前持仓总览和已实现盈亏，标记超标仓位。"""
+def print_position_summary(config_path: Optional[str] = None) -> None:
+    """打印当前持仓总览和已实现盈亏，标记超标仓位。
+
+    config_path: 池配置文件路径，默认取当前生效的 CONFIG_FILE。
+        unlimited 变体将 CONFIG_FILE 指向 unlimited.yaml，展示必须跟随，
+        否则配置读不到会静默回退默认上限(2026-09-15 修复: 此前硬编码
+        stocks.yaml，unlimited 显示"上限 ¥20,000"并误标全部持仓超标)。
+    """
     positions = load_positions()
     from portfolio import get_trade_summary
 
@@ -1163,18 +1169,23 @@ def print_position_summary() -> None:
         import yaml
         max_pct = 0.20
         cash = 100000
+        cfg_loaded = False
         try:
-            with open(os.path.join(TASK_DIR, "stocks.yaml")) as f:
+            with open(config_path or CONFIG_FILE) as f:
                 cfg = yaml.safe_load(f)
             stock_cfg = cfg.get("stock", {})
             cash = float(stock_cfg.get("initial_cash", 200000))
             max_pct = float(stock_cfg.get("single_position_pct", 0.20))
+            cfg_loaded = True
         except Exception:
             pass
         max_value = cash * max_pct
+        # 配置缺失时上限未知: 不显示臆造的上限, 也不误标超标
+        title = (f"持仓总览 (上限 {int(max_pct*100)}% = ¥{max_value:,.0f})"
+                 if cfg_loaded else "持仓总览 (上限未配置)")
 
         print(f"\n{'=' * 80}")
-        print(f"  {'持仓总览 (上限 ' + str(int(max_pct*100)) + '% = ¥' + f'{max_value:,.0f})':^72s}")
+        print(f"  {title:^72s}")
         print(f"{'=' * 80}")
         print(f"  {'代码':<8s} {'名称':<8s} {'股数':>6s} {'成本':>8s} {'市值':>10s} {'占比':>6s} {'浮动盈亏':>10s} {'收益率':>8s}")
         print(f"  {'-' * 72}")
@@ -1200,7 +1211,7 @@ def print_position_summary() -> None:
             pct = value / cash * 100 if cash > 0 else 0
             total_value += value
             total_pnl += pnl
-            flag = " ⚠️超标" if value > max_value * 1.01 else ""
+            flag = " ⚠️超标" if cfg_loaded and value > max_value * 1.01 else ""
             print(
                 f"  {sym:<8s} {pos['name']:<8s} {pos['shares']:>6d}  "
                 f"{pos['avg_cost']:>8.2f} {value:>10.0f} {pct:>5.1f}% {pnl:>+10.0f} {pnl_pct:>+7.1f}%{flag}"
