@@ -360,9 +360,14 @@ def evaluate_stock(
             result["signal"] = "hold"
             result["_target_pct"] = result.get("target_pct", 0.95)
             result["target_pct"] = 0.0
+            # 显示真实约束: 仓位预算(趋势仓位×单只上限)与 1 手成本。
+            # 2026-09-16 实盘案例: 688234 天岳先进 target=30% → 预算¥18,000
+            # < 科创板1手(200股)¥21,020 → 旧文案只显"单只上限¥60,000"
+            # (全额 cap), 掩盖了整手约束, 易误读为资金充足。
+            one_lot_cost = lot * result["close"]
             result["reason"] = (
-                f"资金不足(单只上限¥{cash * max_pct:,.0f}, "
-                f"股价¥{result['close']:.2f})")
+                f"资金不足(仓位预算¥{cash * capped_pct:,.0f} < 1手({lot}股)"
+                f"¥{one_lot_cost:,.0f}, 单只上限¥{cash * max_pct:,.0f})")
             result["_skipped"] = True
             log_skipped(symbol, name, entry_date, result["reason"],
                         buy_reason)

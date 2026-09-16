@@ -1154,3 +1154,42 @@ class TestPositionSummaryConfig:
         out = capsys.readouterr().out
         assert "上限未配置" in out
         assert "超标" not in out
+
+
+class TestInsufficientBudgetReason:
+    """整手买不进时, 拦截文案须暴露真实约束(2026-09-16 实盘修正)。
+
+    旧文案只显示"单只上限¥60,000"(全额单只 cap), 而实际约束是
+    仓位预算(趋势仓位 × 单只上限)不足 1 手——688234 天岳先进
+    target=30%、池资金 30 万 → 预算 ¥18,000 < 科创板 1 手 ¥21,020,
+    当日偏离 +8.7% 为全场最高候选却无法买入, 日志看起来却像资金充足。
+    """
+
+    def test_reason_shows_budget_and_one_lot_cost(self, monkeypatch):
+        stock = {"symbol": "688234", "name": "天岳先进", "type": "stock"}
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.30,
+                          last_close=105.10)
+            result = daily_signal.evaluate_stock(
+                stock, _make_config(cash=300000.0, max_pct=0.20), 2,
+                {"stock": 0.0})
+            reason = result["reason"]
+            assert result["signal"] == "hold"
+            assert result["_skipped"] is True
+            # 真实预算 = 30万 × 30%(趋势仓位) × 20%(单只上限)
+            assert "仓位预算¥18,000" in reason
+            # 科创板最小 200 股整手成本
+            assert "1手(200股)¥21,020" in reason
+            # 全额单只上限仍保留(便于对照), 但不再是唯一信息
+            assert "单只上限¥60,000" in reason
+
+    def test_reason_prefix_keeps_legacy_keyword(self, monkeypatch):
+        """仍以"资金不足"开头(既有下游/测试按该关键词识别)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _setup_common(monkeypatch, tmp, signal="buy", target_pct=0.95,
+                          last_close=500.0)
+            result = daily_signal.evaluate_stock(
+                STOCK, _make_config(cash=100000.0, max_pct=0.20), 2,
+                {"stock": 0.0})
+            assert "资金不足" in result["reason"]
+            assert "1手(100股)¥50,000" in result["reason"]
