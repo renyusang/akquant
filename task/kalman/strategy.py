@@ -16,7 +16,8 @@
 
 from typing import Any, Dict
 
-from akquant import Bar, BoolParam, FloatParam, IntParam, Strategy
+from akquant import (Bar, BoolParam, ChoiceParam, FloatParam, IntParam,
+                     Strategy)
 
 from signal_engine import SignalEngine
 
@@ -38,6 +39,12 @@ class KalmanStrategy(Strategy):
     # 预热期:run_backtest 读 warmup_bars(非 warmup_period),前 N bar 不调 on_bar
     warmup_bars = 40
     warmup_period = 40  # 兼容(部分接口读 warmup_period)
+
+    # 精确日界定时器(2026-09-17 名额优先级): 使 on_after_trading 在当日最后
+    # 一根 bar 之后触发(而非次日首事件), 此时下单与 bar 内下单成交时点一致
+    # (次日开盘)。不开则收盘单会顺延到 T+2。实测对结果与性能无影响
+    # (25 只 × 1000 bar: 88.49s→88.50s, 订单逐笔一致)。
+    enable_precise_day_boundary_hooks = True
 
     # === 内联参数声明(0.3.20:替代 PARAM_MODEL + __init__ 参数) ===
     kalman_q_price = FloatParam(1e-4, ge=1e-6, le=1.0, title="价格过程噪声")
@@ -75,6 +82,14 @@ class KalmanStrategy(Strategy):
         1.0, ge=0.0, le=1.0, title="单只仓位上限比例(组合回测用0.20)"
     )
     max_positions = IntParam(0, ge=0, le=100, title="池内最多持仓数(0=不限)")
+    priority_mode = ChoiceParam(
+        "arrival",
+        choices=["arrival", "arrival_deferred", "deviation", "uptrend_first"],
+        title="新建仓名额争抢优先级(2026-09-17 研究): arrival=引擎到达序"
+              "(兼容旧行为/冻结基线); arrival_deferred=条件同上但收盘统一分配"
+              "(隔离'下单时点'效应); deviation=偏离度降序(实盘口径); "
+              "uptrend_first=上升趋势优先再按偏离降序",
+    )
     initial_cash = FloatParam(100000.0, ge=0, title="初始资金")
     adx_filter_enabled = BoolParam(False, title="是否启用ADX趋势状态过滤")
     adx_filter_threshold = FloatParam(
@@ -156,6 +171,13 @@ class KalmanStrategy(Strategy):
         self.single_position_pct = float(p("single_position_pct"))
         self.max_positions = int(p("max_positions"))
         self.initial_cash = float(p("initial_cash"))
+        # 名额优先级(2026-09-17): ChoiceParam 不做运行时校验, 非法值显式回退
+        _pm = str(p("priority_mode")).strip().lower()
+        if _pm not in ("arrival", "arrival_deferred", "deviation",
+                       "uptrend_first"):
+            self.log(f"[priority_mode 非法: {_pm!r}, 回退 arrival]")
+            _pm = "arrival"
+        self.priority_mode = _pm
         self.adx_filter_enabled = bool(p("adx_filter_enabled"))
         self.adx_filter_threshold = float(p("adx_filter_threshold"))
         self.adx_filter_period = max(2, int(p("adx_filter_period")))
@@ -200,6 +222,14 @@ class KalmanStrategy(Strategy):
         # 最小持仓周期: 记录每标的的入场 bar 序号(加仓不重置)
         self._bar_count: int = 0
         self._entry_bars: Dict[str, int] = {}
+        # 当日新建仓候选缓冲(2026-09-17 名额优先级): priority_mode != "arrival"
+        # 时启用 —— on_bar 只登记, 收盘由 on_after_trading 统一排序下单。
+        #   {symbol: {"close","target_pct","bar_count","ts_iso",
+        #             "kalman_price","kalman_velocity","trend","dev"}}
+        self._entry_candidates: Dict[str, Dict[str, Any]] = {}
+        self._candidate_day: Any = None      # 缓冲所属交易日(用于过期丢弃)
+        self._flushed_day: Any = None        # 最近 flush 的交易日(幂等)
+        self._trend_warned: bool = False
 
     # ------------------------------------------------------------------
     # 公开属性（回测后可通过 result.strategy 访问）
@@ -408,31 +438,23 @@ class KalmanStrategy(Strategy):
                 # 修复(2026-08-24): 自维护持仓计数(含已下单未成交)检查名额。
                 # 不用 get_positions()——ctx.positions 快照在多 symbol 回测下
                 # stale(返回空导致超买漏洞); _opened_count 由下单/卖出维护。
-                if self.max_positions > 0 and self._opened_count >= self.max_positions:
-                    return
                 target_pct = result["target_pct"] * self.single_position_pct
-                # 按 initial_cash 固定金额下单(对齐 portfolio_backtest,无复利效应)
-                self.order_target_value(
-                    symbol=symbol,
-                    target_value=self.initial_cash * target_pct,
-                )
-                self._entry_prices[symbol] = close_price
-                self._entry_bars[symbol] = self._bar_count
-                self._pending_buys[symbol] = (close_price, self._bar_count)
-                self._opened_count += 1
-                self._trade_count += 1
-                self.log(
-                    f"[买入] {bar.timestamp_iso} | "
-                    f"价格={close_price:.2f} | "
-                    f"卡尔曼估计={result['kalman_price']:.2f} | "
-                    f"速度={result['kalman_velocity']:.6f} | "
-                    f"偏离={(close_price / result['kalman_price'] - 1) * 100:.2f}%"
-                    + (
-                        f" | 仓位={target_pct * 100:.0f}% 趋势={result['trend']}"
-                        if self.trend_filter_enabled
-                        else ""
-                    )
-                )
+                entry = self._make_entry(close_price, target_pct, result,
+                                         bar.timestamp_iso)
+                if self.priority_mode == "arrival" or not self._defer_entries():
+                    # 旧路径(冻结基线): 名额检查后立即下单, 逐笔不变
+                    if (self.max_positions > 0
+                            and self._opened_count >= self.max_positions):
+                        return
+                    self._place_entry(symbol, entry)
+                else:
+                    # 名额优先级路径(2026-09-17): 整手买不起的候选在实盘
+                    # 被 daily_signal 的 `if buy_qty > 0` 守卫丢弃(不占名额),
+                    # 回测此处对齐, 否则会形成"幽灵名额"挤掉其他候选
+                    if not self._affordable(symbol, entry):
+                        return
+                    self._queue_entry_candidate(
+                        symbol, entry, self._local_date_str(bar.timestamp))
 
         elif pos > 0:
             # 时间止盈(2026-08-27 研究): 持有超过 max_hold_bars 根强制卖出
@@ -559,6 +581,147 @@ class KalmanStrategy(Strategy):
             self._opened_count = max(0, self._opened_count - 1)
         elif not self.get_open_orders(symbol):
             del self._pending_sells[symbol]         # 被拒 → 移除登记(名额保留)
+
+    # ------------------------------------------------------------------
+    # 新建仓名额优先级(2026-09-17 研究): 当日缓冲 + 收盘统一排序下单
+    # ------------------------------------------------------------------
+    def _defer_entries(self) -> bool:
+        """是否走"收盘统一排序下单"(需精确日界定时器可用, 否则退回旧路径)。
+
+        定时器不可用时静默退回旧路径, 绝不会出现候选无人 flush 而不下单。
+        """
+        if self.priority_mode == "arrival":
+            return False
+        cfg = getattr(self, "runtime_config", None)
+        if not bool(getattr(cfg, "enable_precise_day_boundary_hooks", False)):
+            return False
+        return bool(getattr(self, "_trading_day_bounds", None))
+
+    @staticmethod
+    def _local_date_str(ts_ns: int) -> str:
+        """bar.timestamp(UTC 纳秒) → 北京时间日期(口径同 on_bar 内过滤)。"""
+        from datetime import datetime, timedelta, timezone
+        _ts = datetime.fromtimestamp(int(ts_ns) / 1e9, tz=timezone.utc)
+        return (_ts + timedelta(hours=8)).strftime("%Y-%m-%d")
+
+    def _make_entry(self, close_price: float, target_pct: float,
+                    result: Dict[str, Any], ts_iso: str) -> Dict[str, Any]:
+        """构造候选记录(旧/新路径共用同一份捕获值)。
+
+        ⚠️ 全部字段在 on_bar 时刻捕获: 收盘阶段 self._bar_count 已增大、
+        self.current_bar 属于别的标的, 任何重算都会漂移。
+        """
+        kp = float(result.get("kalman_price") or 0.0)
+        return {
+            "close": close_price,
+            "target_pct": target_pct,
+            "bar_count": self._bar_count,
+            "ts_iso": ts_iso,
+            "kalman_price": kp,
+            "kalman_velocity": float(result.get("kalman_velocity") or 0.0),
+            "trend": str(result.get("trend") or ""),
+            # 偏离度口径同 daily_signal (close/kalman_price - 1)
+            "dev": (close_price / kp - 1.0) if kp > 0 else 0.0,
+        }
+
+    def _affordable(self, symbol: str, entry: Dict[str, Any]) -> bool:
+        """整手可买性(复刻实盘 daily_signal 的 `if buy_qty > 0` 守卫)。
+
+        引擎 order_target_value 在 target_qty // lot * lot == 0 时静默不下单,
+        但旧路径仍计名额/交易数 → 幽灵名额(实测 12/422 且全在争抢日)。
+        新路径在此前置拦截, 与实盘语义对齐。
+        """
+        lot = 200 if str(symbol).startswith("688") else 100
+        qty = int(self.initial_cash * entry["target_pct"]
+                  / entry["close"] / lot) * lot
+        return qty > 0
+
+    def _queue_entry_candidate(self, symbol: str, entry: Dict[str, Any],
+                               day_key: Any) -> None:
+        """登记当日新建仓候选(不占名额、不冻结资金、不写 _entry_*)。
+
+        缓冲按交易日过期: 若 flush 因故未触发(timer 早退), 次日 on_bar 直接
+        丢弃并告警 —— 绝不在错误时点补下单。
+        """
+        if self._candidate_day is not None and self._candidate_day != day_key:
+            if self._entry_candidates:
+                self.log(f"[候选过期丢弃] {self._candidate_day} 有 "
+                         f"{len(self._entry_candidates)} 只候选未 flush")
+            self._entry_candidates = {}
+        self._candidate_day = day_key
+        self._entry_candidates[symbol] = entry
+
+    def _place_entry(self, symbol: str, entry: Dict[str, Any]) -> None:
+        """新建仓下单 + 记账(旧/新路径共用; 表达式与原 on_bar 内一致)。"""
+        target_pct = entry["target_pct"]
+        # 按 initial_cash 固定金额下单(对齐 portfolio_backtest,无复利效应)
+        self.order_target_value(
+            symbol=symbol,
+            target_value=self.initial_cash * target_pct,
+        )
+        self._entry_prices[symbol] = entry["close"]
+        self._entry_bars[symbol] = entry["bar_count"]
+        self._pending_buys[symbol] = (entry["close"], entry["bar_count"])
+        self._opened_count += 1
+        self._trade_count += 1
+        self.log(
+            f"[买入] {entry['ts_iso']} | "
+            f"价格={entry['close']:.2f} | "
+            f"卡尔曼估计={entry['kalman_price']:.2f} | "
+            f"速度={entry['kalman_velocity']:.6f} | "
+            f"偏离={(entry['close'] / entry['kalman_price'] - 1) * 100:.2f}%"
+            + (
+                f" | 仓位={target_pct * 100:.0f}% 趋势={entry['trend']}"
+                if self.trend_filter_enabled
+                else ""
+            )
+        )
+
+    def _entry_sort_key(self, entry: Dict[str, Any]) -> tuple:
+        """候选排序键(各模式唯一差异点)。
+
+        不加 symbol 做 tie-break: 依赖 sorted 稳定性 + dict 插入序 = 引擎到达
+        顺序 —— arrival_deferred 靠这个恒定键保持到达序。
+        """
+        if self.priority_mode == "arrival_deferred":
+            return (0,)                      # 恒定键 → 稳定排序保持插入序
+        if self.priority_mode == "uptrend_first":
+            return (0 if entry["trend"] == "up" else 1, -entry["dev"])
+        return (-entry["dev"],)
+
+    def on_after_trading(self, trading_date: Any, timestamp: int) -> None:
+        """当日收盘后统一排序下单(需 enable_precise_day_boundary_hooks=True)。
+
+        精确日界下本钩子在该交易日最后一根 bar 之后触发, fill_policy
+        (open/next_event/bar_offset=1) 的下一事件即次日开盘 → 与 on_bar 内下单
+        成交时点一致(T+1 语义不变)。
+        """
+        day_key = str(trading_date)
+        if self._flushed_day == day_key:
+            return                      # 幂等: shutdown 钩子会补发最后一日
+        self._flushed_day = day_key
+        cands = self._entry_candidates
+        self._entry_candidates = {}
+        self._candidate_day = None
+        if not cands:
+            return
+        if (self.priority_mode == "uptrend_first" and not self._trend_warned
+                and all(e["trend"] == "up" for e in cands.values())):
+            # 趋势过滤关闭时 TrendDetector 恒 up → 该模式静默退化为 deviation
+            self._trend_warned = True
+            self.log("[priority] 全部候选 trend=up(趋势过滤未启用?), "
+                     "uptrend_first 退化为 deviation")
+        for symbol in sorted(cands, key=lambda s: self._entry_sort_key(cands[s])):
+            if float(self.get_position(symbol)) > 0:
+                # 收盘单由引擎按当时持仓算 delta, 与 on_bar 时点不同 → 丢弃
+                self.log(f"[候选丢弃] {symbol} 收盘前已持仓, 跳过新建仓单")
+                continue
+            if (self.max_positions > 0
+                    and self._opened_count >= self.max_positions):
+                self.log(f"[名额已满跳过] {day_key} {symbol} "
+                         f"偏离{cands[symbol]['dev'] * 100:.2f}%")
+                continue
+            self._place_entry(symbol, cands[symbol])
 
     # ------------------------------------------------------------------
     # MA20 计算

@@ -34,3 +34,6 @@ state_snapshot.json
 # 部署敏感信息（含服务器密码）
 report_deploy.md
 actual_fills.json
+
+# 研究产物(脚本可重新生成)
+priority_signals.csv
