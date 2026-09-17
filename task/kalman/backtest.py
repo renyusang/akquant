@@ -794,10 +794,23 @@ def build_combined_report(
         f.write(full)
 
 
+def _resolve_end_date(end_date: Optional[str] = None) -> str:
+    """回测结束日期: None → 回测当天(2026-09-18 起)。
+
+    原默认是写死的未来/过去日期: CLI 曾用 "20241231"(不传 --end 会静默
+    截断到 2024 年底), 函数默认 "20261231"。实际右端仍取数据源上限
+    (.catalog 末根 bar), 故"当天"等价于"尽可能新"。
+    """
+    if end_date:
+        return end_date
+    from datetime import datetime
+    return datetime.now().strftime("%Y%m%d")
+
+
 def run_portfolio_backtest(
     config_path: Optional[str] = None,
     start_date: str = "20200101",
-    end_date: str = "20261231",
+    end_date: Optional[str] = None,
     show_progress: bool = False,
     save: bool = True,
     report: bool = True,
@@ -811,6 +824,7 @@ def run_portfolio_backtest(
     """
     from data_utils import load_watchlist_data
 
+    end_date = _resolve_end_date(end_date)
     task_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = config_path or os.path.join(task_dir, "stocks.yaml")
     with open(config_path, encoding="utf-8") as f:

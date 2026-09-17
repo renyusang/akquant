@@ -24,6 +24,7 @@
 """
 
 import argparse
+from datetime import datetime
 import os
 import sys
 import time
@@ -41,7 +42,8 @@ from strategy import KalmanStrategy
 # ---- 默认配置 ----
 SYMBOL_DEFAULT = "002594"
 START_DEFAULT = "20200101"
-END_DEFAULT = "20241231"
+# 结束日期默认 = 回测当天(2026-09-18 修正: 原为写死的 "20241231")
+END_DEFAULT = datetime.now().strftime("%Y%m%d")
 CASH_DEFAULT = 100000.0
 
 # ---- 预设参数网格 ----

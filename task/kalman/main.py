@@ -15,7 +15,7 @@
 参数:
     --symbol          股票代码（默认 002594 比亚迪）
     --start           起始日期 YYYYMMDD（默认 20200101）
-    --end             结束日期 YYYYMMDD（默认 20241231）
+    --end             结束日期 YYYYMMDD（默认: 回测当天）
     --adjust          复权方式 qfq/hfq/""（默认 qfq）
     --cash            初始资金（默认 100000）
     --plot-only       仅画图
@@ -35,6 +35,7 @@
 import argparse
 import os
 import sys
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 import pandas as pd
@@ -55,7 +56,10 @@ from backtest import (
 # ---- 默认配置 ----
 SYMBOL_DEFAULT = "002594"  # 比亚迪
 START_DEFAULT = "20200101"
-END_DEFAULT = "20241231"
+# 结束日期默认 = **回测当天**(2026-09-18 修正: 原为写死的 "20241231",
+# 不显式传 --end 会静默截断到 2024 年底 —— 实测组合回测因此少跑近两年)。
+# 实际右端仍取数据源上限(.catalog 末根 bar)。
+END_DEFAULT = datetime.now().strftime("%Y%m%d")
 ADJUST_DEFAULT = "qfq"
 CASH_DEFAULT = 100000.0
 
@@ -182,7 +186,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--end",
         default=END_DEFAULT,
-        help=f"结束日期 YYYYMMDD（默认: {END_DEFAULT}）",
+        help=f"结束日期 YYYYMMDD（默认: 回测当天 {END_DEFAULT}; 数据右端取 .catalog 末根 bar）",
     )
     parser.add_argument(
         "--adjust",
