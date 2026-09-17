@@ -639,7 +639,7 @@ bash run_daily.sh                  # crontab 已默认开启 --deploy
 **ETF 池交叉验证(2020-01~2026-08, 24 只)**: arrival +1.6%/0.07/-23.3% → arrival_deferred -10.4%/-0.07/-40.7% → deviation -20.5%/-0.18/-45.6% → uptrend_first -19.2%/-0.17/-47.0% → sizing_only **-7.0%/-0.00/-41.9%**。ETF 池整体无边际(全部接近或低于零), 且**排序效应不跨池成立**(deviation 在 ETF 上比到达序更差 -10.1pp, 与股票池的 +23.6pp 反向)—— 再次印证"排名规则无可靠增益"; 唯一跨池一致的是 **sizing_only 在两个池都最好**(股票 +64.1pp / ETF +13.5pp)。
 **结论**: **"上升趋势优先"证伪**(收益微增但风险调整后恶化, 且跨池不成立), 实盘保留现行偏离降序。排序规则的影响(±24pp 收益量级)远小于**语义对齐**(+74pp)与**仓位**(+64pp)。
 **下一步候选(本次最强信号)**: `sizing_only` —— 仅把下跌趋势建仓的 `trend_bear_position_pct` 由 0.30 调到 0.95(零代码改动)即 **+64.1pp 且夏普 +0.03**(回撤 -2.9pp)。**仓位杠杆显著大于排序杠杆**, 但它是仓位变更而非排序变更, 需按完整门槛(年度稳健/ETF 池复现/起始日敏感性/留一标的)单独立项后再动生产配置。
-**回归**: 新增 `tests/test_strategy_priority_mode.py` 15 例(含"arrival_deferred 必须保持到达序"——首版实现曾因排序键写错而退化为 deviation 排序, 靠收盘插桩诊断发现); 全套 335 通过。研究脚本 `task/kalman/study_priority.py`(产物 `priority_signals.csv` 不入库)。
+**回归**: 新增 `tests/test_strategy_priority_mode.py` 15 例(含"arrival_deferred 必须保持到达序"——首版实现曾因排序键写错而退化为 deviation 排序, 靠收盘插桩诊断发现); 全套 **338 通过**(基线 323 + 15)。研究脚本 `task/kalman/study_priority.py`(产物 `priority_signals.csv` 不入库)。
 **⚠️ 生产启用项在新语义下的复核(必须知道, 因对齐改变了基线)**: 新语义(deviation, 生产全开 = +276.1%/1.43/-14.7%)下逐项关停:
 
 | 项 | kalman.md 旧记载(旧语义) | 新语义实测 | 结论 |
