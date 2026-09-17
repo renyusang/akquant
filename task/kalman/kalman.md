@@ -347,37 +347,38 @@ python main.py --symbol 002594 --use-best
 
 ### 组合回测
 
-按照 `stocks.yaml` 的完整 watchlist 和资金池配置，模拟 `daily_signal.py` 的 T+1 开盘价执行逻辑，对股票+ETF 组合进行全量历史回测，生成详细 HTML 报告。
+按照 `stocks.yaml` 的完整 watchlist 和资金池配置，模拟 `daily_signal.py` 的 T+1 开盘价执行逻辑，对股票+ETF 组合进行全量历史回测，生成详细 HTML 报告。**入口是 `main.py --portfolio`**(`portfolio_backtest.py` 为旧脚本, 不参与机制结论)。
 
 ```bash
-# 默认参数（2020-01-01 ~ 2026-07-24，使用 stocks.yaml）
-python portfolio_backtest.py
+# 默认(读 stocks.yaml, 2020-01-01 起)
+python main.py --portfolio
 
-# 指定时间范围
-python portfolio_backtest.py --start 20230101 --end 20260724
-
-# 指定配置文件
-python portfolio_backtest.py --config my_stocks.yaml
-
-# 组合使用
-python portfolio_backtest.py --start 20240101 --end 20260724 --config my_stocks.yaml
+# 指定区间 + 跑完自动部署报告到服务器
+python main.py --portfolio --start 20200101 --end 20261231 --deploy
 ```
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--start` | `20200101` | 起始日期 YYYYMMDD |
-| `--end` | `20260724` | 结束日期 YYYYMMDD |
-| `--config` | `stocks.yaml` | 配置文件路径 |
+**数据右端 = `.catalog` 末根 bar**(当前 2026-08-24), 传 `--end 20261231` 也只能跑到该日。
+
+**当前基线(2026-09-18 实测, 语义=实盘口径)**:
+
+| 项 | 值 |
+|---|---|
+| 区间 | 2020-01-02 ~ 2026-08-24 (1610 天) |
+| 初始/最终 | ¥400,000 → **¥1,207,838**(股票池 1,128,334 + ETF 池 79,503) |
+| 总收益 / 夏普 / 最大回撤 | **+202.0% / 1.32 / -14.2%** |
+| 交易笔数 | 2121 |
+
+⚠️ **口径说明**: 自 2026-09-17 起 `priority_mode` 默认 `deviation`(池内偏离降序 = 实盘 `_place_deferred_orders` 同口径), 且整手买不起的候选不再占名额。**2026-09-17 之前记载的所有组合收益/夏普/回撤都是旧语义(arrival + 幽灵名额)口径**, 不可与新基线直接比较: 同一区间下旧语义股票池 +225.5%/1.64/-10.7% vs 新语义 +276.1%/1.43/-14.7%(收益更高但风险调整后更低, 详见"已修复问题"2026-09-17 条目)。复现旧数字需显式 `priority_mode: arrival`。
 
 **输出文件**：
 
 | 文件 | 说明 |
 |------|------|
-| `portfolio_report.html` | 交互式 HTML 报告（权益曲线、回撤、月度热力图、年度 TOP5、交易明细） |
-| `portfolio_trades.csv` | 全部交易记录 |
-| `portfolio_equity.csv` | 每日权益曲线 |
+| `report_portfolio.html` | 组合汇总报告(权益曲线、回撤、月度热力图、年度 TOP5、交易明细) |
+| `report_stock.html` / `report_etf.html` | 分池报告(含 K 线复盘 + 沪深300 对比) |
+| `portfolio_trades.csv` / `portfolio_equity.csv` / `portfolio_positions.csv` | 交易/权益/持仓明细 |
 
-**报告内容**：核心指标、最终持仓、权益走势图、年度汇总、月度收益热力图、年度盈亏 TOP5（股票/ETF 分开）、标的盈亏汇总、交易分析（T+1 配对）、交易明细。
+部署: `bash deploy.sh --backtest-only` → `http://119.29.88.84:8888/backtest/portfolio/report_portfolio.html`。
 
 ### Python API
 
