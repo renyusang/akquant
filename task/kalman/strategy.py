@@ -83,12 +83,13 @@ class KalmanStrategy(Strategy):
     )
     max_positions = IntParam(0, ge=0, le=100, title="池内最多持仓数(0=不限)")
     priority_mode = ChoiceParam(
-        "arrival",
+        "deviation",
         choices=["arrival", "arrival_deferred", "deviation", "uptrend_first"],
-        title="新建仓名额争抢优先级(2026-09-17 研究): arrival=引擎到达序"
-              "(兼容旧行为/冻结基线); arrival_deferred=条件同上但收盘统一分配"
-              "(隔离'下单时点'效应); deviation=偏离度降序(实盘口径); "
-              "uptrend_first=上升趋势优先再按偏离降序",
+        title="新建仓名额争抢优先级(2026-09-17 研究): deviation=偏离度降序"
+              "(默认, 与实盘 daily_signal 同口径); arrival=引擎到达序"
+              "(旧行为, 复现 2026-09-17 之前的基线数字用); arrival_deferred="
+              "到达序但收盘统一分配(研究对照臂); uptrend_first=上升趋势优先"
+              "再按偏离降序(已证伪)",
     )
     initial_cash = FloatParam(100000.0, ge=0, title="初始资金")
     adx_filter_enabled = BoolParam(False, title="是否启用ADX趋势状态过滤")
