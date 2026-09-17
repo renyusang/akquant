@@ -357,16 +357,37 @@ python main.py --portfolio
 python main.py --portfolio --start 20200101 --end 20261231 --deploy
 ```
 
-**数据右端 = `.catalog` 末根 bar**(当前 2026-08-24), 传 `--end 20261231` 也只能跑到该日。
+**数据右端 = `.catalog` 末根 bar**(2026-09-18 已刷新自选池至 2026-09-17; 刷新脚本见下), `--end` 默认取**回测当天**。
 
-**当前基线(2026-09-18 实测, 语义=实盘口径)**:
+**刷新 catalog**(2026-09-18, `load_cached_data` **只在缺失时下载、从不刷新**, 需手动全历史重下):
+```bash
+python - <<'PY'
+import os, sys, yaml, pandas as pd
+from datetime import datetime
+from data_utils import download_data, preprocess_data, get_catalog
+cfg = yaml.safe_load(open("stocks.yaml", encoding="utf-8")); wl = cfg["watchlist"]
+items = [(str(s["symbol"]).zfill(6), "stock") for s in wl.get("stocks", [])] + \
+        [(str(s["symbol"]).zfill(6), "etf") for s in wl.get("etfs", [])]
+cat = get_catalog(); today = datetime.now().strftime("%Y%m%d")
+for sym, typ in items:
+    df = preprocess_data(download_data(sym, asset_type=typ, start_date="20200101",
+                                       end_date=today, adjust="qfq"))
+    cat.write(sym, df)   # 覆盖写: {catalog}/{sym}/data.parquet
+PY
+```
+⚠️ 全历史重下会以**今日的 qfq 基准**重算复权, 近期有除权除息的标的其历史价格会整体微调 —— 刷新前后数字不完全可比。
+
+**当前基线(2026-09-18 数据至 2026-09-17, 语义 = 实盘口径)**:
 
 | 项 | 值 |
 |---|---|
-| 区间 | 2020-01-02 ~ 2026-08-24 (1610 天) |
-| 初始/最终 | ¥400,000 → **¥1,207,838**(股票池 1,128,334 + ETF 池 79,503) |
-| 总收益 / 夏普 / 最大回撤 | **+202.0% / 1.32 / -14.2%** |
-| 交易笔数 | 2121 |
+| 区间 | 2020-01-02 ~ 2026-09-17 (1622 天) |
+| 初始/最终 | ¥400,000 → **¥1,215,005** |
+| 总收益 / 夏普 / 最大回撤 | **+203.8% / 1.31 / -14.4%** |
+| 交易笔数 | 2145(股票池 1325 / ETF 池 820); 最大同时持仓 5/5(各池上限) |
+| 期末未平仓 | 7 只(股票 4: 德福/深南/铖昌/长电 + ETF 3: 512480/588000/515050) |
+
+> 数据刷新前(至 2026-08-24)同口径为 +202.0%/1.32/-14.2%; 差异(+1.8pp)来自新增 3 周行情与复权基准微调。
 
 ⚠️ **口径说明**: 自 2026-09-17 起 `priority_mode` 默认 `deviation`(池内偏离降序 = 实盘 `_place_deferred_orders` 同口径), 且整手买不起的候选不再占名额。**2026-09-17 之前记载的所有组合收益/夏普/回撤都是旧语义(arrival + 幽灵名额)口径**, 不可与新基线直接比较: 同一区间下旧语义股票池 +225.5%/1.64/-10.7% vs 新语义 +276.1%/1.43/-14.7%(收益更高但风险调整后更低, 详见"已修复问题"2026-09-17 条目)。复现旧数字需显式 `priority_mode: arrival`。
 
