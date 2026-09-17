@@ -82,6 +82,20 @@ class KalmanStrategy(Strategy):
         1.0, ge=0.0, le=1.0, title="单只仓位上限比例(组合回测用0.20)"
     )
     max_positions = IntParam(0, ge=0, le=100, title="池内最多持仓数(0=不限)")
+    prime_enabled = BoolParam(
+        False,
+        title="窗口前历史预热(2026-09-17 研究): 用回测窗口之前的真实历史"
+              "(prime_data)在首次 on_bar 调 process_history 预热引擎, 复现实盘"
+              "'2 年历史预热后才评估'的语义(否则每只标的冷启动)",
+    )
+    per_symbol_warmup_bars = IntParam(
+        0, ge=0, le=500,
+        title="按标的预热根数(2026-09-17 研究, 0=禁用): 框架 warmup_bars 是"
+              "**跨标的全局事件计数**(25 只池里 40 个事件≈1 个交易日), 每只"
+              "标的的冷启动期仍会被评估(产出大量速度反转型入场); 实盘用 2 年"
+              "历史预热、从不评估无历史标的。本参数 >0 时按标的自身 bar 数"
+              "抑制交易(引擎照常喂), 对齐实盘语义",
+    )
     priority_mode = ChoiceParam(
         "deviation",
         choices=["arrival", "arrival_deferred", "deviation", "uptrend_first"],
@@ -171,6 +185,10 @@ class KalmanStrategy(Strategy):
         self.downtrend_entry_threshold = float(p("downtrend_entry_threshold"))
         self.single_position_pct = float(p("single_position_pct"))
         self.max_positions = int(p("max_positions"))
+        self.per_symbol_warmup_bars = max(0, int(p("per_symbol_warmup_bars")))
+        self.prime_enabled = bool(p("prime_enabled"))
+        # 窗口前历史 {symbol: DataFrame}, 回测层加载传入(实盘语义: 有历史才评估)
+        self.prime_data = dict(kwargs.get("prime_data") or {})
         self.initial_cash = float(p("initial_cash"))
         # 名额优先级(2026-09-17): ChoiceParam 不做运行时校验, 非法值显式回退
         _pm = str(p("priority_mode")).strip().lower()
@@ -231,6 +249,8 @@ class KalmanStrategy(Strategy):
         self._candidate_day: Any = None      # 缓冲所属交易日(用于过期丢弃)
         self._flushed_day: Any = None        # 最近 flush 的交易日(幂等)
         self._trend_warned: bool = False
+        # 按标的 bar 计数(2026-09-17 预热研究): 框架 warmup_bars 是全局事件计数
+        self._symbol_bars: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # 公开属性（回测后可通过 result.strategy 访问）
@@ -283,6 +303,9 @@ class KalmanStrategy(Strategy):
                 adx_exit_decay=self.adx_exit_decay,
             )
             # 用历史数据预热指标窗口(不含当前 bar,当前 bar 由 update 增量喂入)
+            # 窗口前历史预热(2026-09-17 研究): 复现实盘"2 年历史预热后评估"
+            if self.prime_enabled and symbol in self.prime_data:
+                engine.process_history(self.prime_data[symbol])
             if (
                 self.adx_filter_enabled
                 or self.rsi_filter_enabled
@@ -344,6 +367,7 @@ class KalmanStrategy(Strategy):
         symbol: str = bar.symbol
         close_price: float = bar.close
         self._bar_count += 1
+        self._symbol_bars[symbol] = self._symbol_bars.get(symbol, 0) + 1
 
         self._clean_pending_buys(symbol)
         self._clean_pending_sells(symbol)
@@ -361,6 +385,14 @@ class KalmanStrategy(Strategy):
             close_price, ma20_cur, ma20_prev, high=bar.high, low=bar.low,
             volume=getattr(bar, "volume", None),
         )
+
+        # 按标的预热(2026-09-17 研究): 冷启动期只喂引擎、不做任何交易动作。
+        # 框架 warmup_bars 按全局事件计数(25 只池 ≈ 1 个交易日), 无法覆盖
+        # 每只标的自身的冷启动(实盘用 2 年历史预热, 从不评估无历史标的)。
+        if (self.per_symbol_warmup_bars > 0
+                and self._symbol_bars.get(symbol, 0)
+                <= self.per_symbol_warmup_bars):
+            return
 
         # 交易执行
         pos = float(self.get_position(symbol))
