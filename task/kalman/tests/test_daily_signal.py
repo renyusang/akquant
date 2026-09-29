@@ -27,9 +27,11 @@ def _make_engine_factory(signal: str, target_pct: float):
     class FakeEngine:
         def __init__(self, **kwargs):
             self._close = 0.0
+            self._peak = 0.0
 
-        def set_position(self, has, price):
-            pass
+        def set_position(self, has, price, peak_price=None):
+            # peak_price: 跨日峰值恢复(2026-09-28); 与真实 SignalEngine 签名保持一致
+            self._peak = float(peak_price) if peak_price else float(price or 0.0)
 
         def process_history(self, df):
             pass
@@ -53,6 +55,10 @@ def _make_engine_factory(signal: str, target_pct: float):
         @property
         def filtered_price(self):
             return self._close
+
+        @property
+        def peak_price(self):
+            return self._peak
 
     return FakeEngine
 

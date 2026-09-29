@@ -923,3 +923,66 @@ class TestEquityCurveFees:
         assert abs(comp - arith) > 0.01
 
 
+
+
+class TestGivebackKpi:
+    """浮盈回吐 KPI(2026-09-28 新增, 见 plan_profit_protection.md P1.2)。
+
+    把"买入时盈利、卖出时亏损"变成报告里可见的列:
+    持仓最高收盘 / 最大浮盈 / 已回吐 / ⚠️ 曾浮盈≥2% 已转亏 标记。
+    """
+
+    POS = {
+        "symbol": "000001", "name": "平安银行", "shares": 100, "cost": 10.0,
+        "price": 9.5, "value": 950.0, "pnl": -50.0, "pnl_pct": -5.0,
+        "first_buy": "2026-08-01",
+    }
+
+    def test_peak_and_giveback_from_history(self):
+        """首买后涨到 12 再跌回 9.5: 最大浮盈 +20%, 当前 -5%, 回吐 25pp, 标记转亏。"""
+        hist = {"000001": {"2026-08-01": 11.0, "2026-08-04": 12.0, "2026-08-05": 9.5}}
+        out = live_report._peak_giveback([dict(self.POS)], hist)[0]
+        assert out["peak"] == pytest.approx(12.0)
+        assert out["peak_profit_pct"] == pytest.approx(20.0)
+        assert out["giveback_pp"] == pytest.approx(25.0)
+        assert out["giveback_flag"] is True
+
+    def test_closes_before_first_buy_are_ignored(self):
+        """首买日之前的收盘价不得计入峰值(否则沿用上一轮持仓的高点)。"""
+        hist = {"000001": {"2026-07-01": 30.0, "2026-08-04": 11.0, "2026-08-05": 9.5}}
+        out = live_report._peak_giveback([dict(self.POS)], hist)[0]
+        assert out["peak"] == pytest.approx(11.0)
+        assert out["peak_profit_pct"] == pytest.approx(10.0)
+        assert out["giveback_flag"] is True          # 10% >= 2% 且当前为负
+
+    def test_no_history_falls_back_to_current_price(self):
+        """无缓存历史时回退当前价: 回吐 0, 不误报(报告仍可生成)。"""
+        out = live_report._peak_giveback([dict(self.POS)], {})[0]
+        assert out["peak"] == pytest.approx(9.5)
+        assert out["giveback_pp"] == pytest.approx(0.0)
+        assert out["giveback_flag"] is False
+
+    def test_never_profitable_holding_not_flagged(self):
+        """从未涨过成本(最大浮盈 <2%)不标记 —— 那是"从未浮盈"类, 不是回吐类。"""
+        hist = {"000001": {"2026-08-01": 10.1, "2026-08-05": 9.5}}
+        out = live_report._peak_giveback([dict(self.POS)], hist)[0]
+        assert out["peak_profit_pct"] == pytest.approx(1.0)
+        assert out["giveback_flag"] is False
+
+    def test_positions_table_renders_new_columns(self):
+        """持仓表出现新列 + ⚠️ 标记 + 汇总计数。"""
+        pos = live_report._peak_giveback([dict(self.POS)],
+                                         {"000001": {"2026-08-04": 12.0}})
+        html = live_report._positions_table(pos, {"000001": "平安银行"}, "股票", 1000.0)
+        for col in ("持仓最高收盘", "最大浮盈", "已回吐"):
+            assert col in html
+        assert "⚠️" in html
+        assert "曾浮盈≥2% 已转亏 1 只" in html
+
+    def test_positions_table_without_kpi_keys_is_backward_compatible(self):
+        """未先算回吐 KPI 时(旧调用方)仍能渲染, 新列留空且不抛错。"""
+        html = live_report._positions_table([dict(self.POS)], {"000001": "平安银行"},
+                                            "股票", 1000.0)
+        assert "pos-table" in html
+        assert "持仓最高收盘" in html
+        assert "曾浮盈≥2% 已转亏" not in html

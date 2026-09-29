@@ -40,6 +40,7 @@ from portfolio import (
     load_positions,
     record_trade,
     remove_position,
+    update_peaks,
 )
 from state_check import print_check_result, save_snapshot
 from backup import create_backup
@@ -50,6 +51,7 @@ TASK_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(TASK_DIR, "stocks.yaml")
 SIGNALS_CSV = os.path.join(TASK_DIR, "signals.csv")
 CACHE_DIR = os.path.join(TASK_DIR, ".cache")
+LOG_DIR = os.path.join(TASK_DIR, "logs")
 WARMUP_BARS = 40
 
 # signals.csv 列名
@@ -224,6 +226,12 @@ def evaluate_stock(
     symbol = stock["symbol"]
     name = stock.get("name", symbol)
     params = get_stock_params(stock, config)
+    # 峰值语义开关(2026-09-28, 见 plan_profit_protection.md §3/批次1):
+    #   peak_persist_enabled: 引擎恢复跨日峰值(修复后语义)
+    #   peak_shadow_enabled:  开关关闭时, 只记录"新语义会怎样"到 logs/peak_shadow.csv
+    # 两者都不传给 SignalEngine(否则未知 kwarg 报错)
+    peak_persist = bool(params.pop("peak_persist_enabled", False))
+    peak_shadow = bool(params.pop("peak_shadow_enabled", False))
 
     # 1. 获取数据
     asset_type = stock.get("type", "stock")
@@ -236,10 +244,15 @@ def evaluate_stock(
     has_pos = pos_info is not None
     shares = pos_info["shares"] if pos_info else 0
     avg_price = pos_info["avg_cost"] if pos_info else 0.0
+    # 跨日峰值(2026-09-28): 引擎每天重建, 不回填则峰值被重置为持仓成本,
+    # "峰值回撤止盈"退化为"-4% 成本止损"(见 plan_profit_protection.md §3)。
+    # 旧持仓文件无该字段时回退均价(保持原行为)。
+    peak_prev = float(pos_info.get("peak_close") or avg_price) if pos_info else 0.0
 
     # 3. 创建引擎并预热
     engine = SignalEngine(**params)
-    engine.set_position(has_pos, avg_price)
+    engine.set_position(has_pos, avg_price,
+                        peak_price=(peak_prev if peak_persist else None))
 
     if len(df) > WARMUP_BARS:
         engine.process_history(df.iloc[:-1])  # 除最后一天外的全部历史
@@ -262,6 +275,12 @@ def evaluate_stock(
     result["date"] = str(last.get("date", ""))[:10]
     result["shares"] = shares
     result["kalman_price"] = engine.filtered_price
+    # 跨日峰值台账(2026-09-28): 定义 = 持仓期内最高收盘, 与引擎开关无关地维护,
+    # 由 _persist_peaks 回写。独立于引擎计算, 避免开关关闭时把"当日收盘"误当峰值。
+    result["peak_price"] = max(peak_prev, close) if has_pos else 0.0
+    # 影子对照(2026-09-28): 峰值语义修复后, 今天是否会提前卖出?
+    if peak_shadow and has_pos and not result.get("error"):
+        result["_shadow"] = _peak_shadow(peak_prev, avg_price, close, result, params)
     result["error"] = None
 
     # 5. 过滤：已有待执行订单 / 超仓 / 资金不足 → 不生成买入信号
@@ -453,6 +472,101 @@ def evaluate_stock(
                                     allocated_cash.get(asset_type, 0.0) + add_qty * result["close"])
 
     return result
+
+
+def _peak_shadow(
+    peak_prev: float,
+    avg_cost: float,
+    close: float,
+    result: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """影子对照(2026-09-28): 修复后的峰值语义与当日实际信号的差异, **只记录不下单**。
+
+    两种语义的差异只可能来自"峰值回撤止盈"(其余规则都用 close 与成本, 与峰值无关):
+    - 现状(峰值每日重置): 峰值 = max(均价, 今日收盘) → 只在跌破 均价×(1-thr) 时触发;
+    - 修复后(峰值跨日):   峰值 = 持仓期最高收盘 → 可能远高于均价, 更早锁定浮盈。
+
+    在 `peak_persist_enabled=false` 期间, 本函数把"新语义今日会不会卖"写进
+    `logs/peak_shadow.csv`, 供影子期(计划 §7 批次1)人工复核后再切开关。
+    """
+    thr = float(params.get("trailing_stop_pct") or 0.0)
+    if thr <= 0 or peak_prev <= 0:
+        return {}
+    peak_new = max(peak_prev, close)
+    dd_new = (peak_new - close) / peak_new
+    would_sell = dd_new >= thr
+    # 止损(优先级 1)在新旧语义下相同, 先于峰值规则判定
+    stop_pct = float(params.get("stop_loss_pct") or 0.0)
+    pnl = (close / avg_cost - 1.0) if avg_cost > 0 else 0.0
+    preempted = stop_pct > 0 and pnl < -stop_pct
+    actual_sell = str(result.get("signal")) == "sell"
+    return {
+        "cost": avg_cost,
+        "peak_prev": peak_prev,
+        "peak_new": peak_new,
+        "dd_new_pct": dd_new * 100,
+        "thr_pct": thr * 100,
+        "would_sell_new": bool(would_sell and not preempted),
+        "preempted_by_stop": bool(preempted),
+        "actual_signal": result.get("signal"),
+        "actual_reason": str(result.get("reason") or ""),
+        "shadow_earlier": bool(would_sell and not preempted and not actual_sell),
+    }
+
+
+def _persist_peak_shadow(results: List[Dict[str, Any]], date_str: str) -> int:
+    """把影子对照追加到 logs/peak_shadow.csv, 返回"新语义会提前卖出"的条数。"""
+    rows = []
+    for r in results:
+        s = r.get("_shadow") or {}
+        if not s:
+            continue
+        rows.append({
+            "date": r.get("date") or date_str,
+            "symbol": r.get("symbol"),
+            "name": r.get("name"),
+            "cost": round(float(s["cost"]), 4),
+            "peak_prev": round(float(s["peak_prev"]), 4),
+            "peak_new": round(float(s["peak_new"]), 4),
+            "dd_new_pct": round(float(s["dd_new_pct"]), 2),
+            "thr_pct": round(float(s["thr_pct"]), 2),
+            "would_sell_new": s["would_sell_new"],
+            "preempted_by_stop": s["preempted_by_stop"],
+            "actual_signal": s["actual_signal"],
+            "actual_reason": s["actual_reason"],
+            "shadow_earlier": s["shadow_earlier"],
+        })
+    if not rows:
+        return 0
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = os.path.join(LOG_DIR, "peak_shadow.csv")
+    df = pd.DataFrame(rows)
+    header = not os.path.exists(path)
+    df.to_csv(path, mode="a", header=header, index=False, encoding="utf-8-sig")
+    return int(df["shadow_earlier"].sum())
+
+
+def _persist_peaks(results: List[Dict[str, Any]]) -> int:
+    """把当日评估后的峰值回写到 positions.json(2026-09-28 新增)。
+
+    `SignalEngine` 每天为每个标的重建, 跨日峰值只能由外部持久化 —— 否则
+    "峰值回撤止盈"每天从持仓成本重新起算, 退化为"-4% 成本止损"
+    (见 `plan_profit_protection.md` §3, 含实盘证据)。
+
+    只对**仍有持仓**的标的写入(卖出成交后 `remove_position` 会清掉整条记录),
+    且只增不减(`portfolio.update_peaks` 内部保证)。返回写入的标的数。
+    """
+    peaks: Dict[str, float] = {}
+    for r in results:
+        if r.get("error") or float(r.get("shares") or 0) <= 0:
+            continue
+        peak = r.get("peak_price")
+        if peak and float(peak) > 0:
+            peaks[str(r["symbol"])] = float(peak)
+    if peaks:
+        update_peaks(peaks)
+    return len(peaks)
 
 
 def _place_deferred_orders(
@@ -801,6 +915,16 @@ def main() -> None:
             })
             if not args.quiet:
                 print(f"  ❌ 错误: {e}")
+
+    # 阶段 1.5: 回写跨日峰值(2026-09-28)——峰值回撤止盈的基准必须跨日保持,
+    # 否则每天重建引擎时被重置为持仓成本(退化为 -4% 成本止损)
+    n_peaks = _persist_peaks(results)
+    n_shadow = _persist_peak_shadow(results, today)
+    if not args.quiet:
+        print(f"\n  [峰值台账] 已回写 {n_peaks} 只持仓的跨日峰值")
+        if n_shadow:
+            print(f"  [影子对照] 新语义下今日会**提前卖出** {n_shadow} 只 "
+                  f"(详见 logs/peak_shadow.csv; 未下单)")
 
     # 阶段 2: 统一排序下单(2026-08-12)——补仓优先, 新建按偏离度降序
     _place_deferred_orders(results, config, allocated_cash)

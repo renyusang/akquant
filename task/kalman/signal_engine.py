@@ -416,10 +416,20 @@ class SignalEngine:
     # ------------------------------------------------------------------
     # 持仓状态
     # ------------------------------------------------------------------
-    def set_position(self, has_position: bool, entry_price: float = 0.0) -> None:
+    def set_position(
+        self,
+        has_position: bool,
+        entry_price: float = 0.0,
+        peak_price: Optional[float] = None,
+    ) -> None:
         """设置当前持仓状态（由外部调用方管理）。
 
         开仓时重置 SAR 跟踪止损状态(从入场价起算)与峰值价格(止盈基准)。
+
+        `peak_price`(2026-09-28 新增): **跨日恢复峰值**。
+        实盘 `daily_signal` 每天重建引擎, 若不回填, 峰值会被重置为持仓成本,
+        使"峰值回撤止盈"退化为"-4% 成本止损"(见 `plan_profit_protection.md` §3)。
+        传 0/None/负值时保持原行为(峰值初值 = `entry_price`)。
         """
         if self.sar_exit_enabled and has_position and not self._has_position:
             self._sar_val = entry_price
@@ -428,11 +438,21 @@ class SignalEngine:
             self._prev_low = None
         if has_position and not self._has_position:
             # 峰值回撤止盈(2026-08-26): 开仓重置峰值基准
-            self._peak_price = entry_price if entry_price > 0 else 0.0
+            # 2026-09-28: 优先用外部恢复的跨日峰值(实盘), 否则用入场价(回测/新开仓)
+            restored = float(peak_price) if peak_price else 0.0
+            if restored > 0:
+                self._peak_price = restored
+            else:
+                self._peak_price = entry_price if entry_price > 0 else 0.0
             # ADX 衰减止盈(2026-08-27): 开仓重置 ADX 峰值
             self._adx_peak_since_entry = 0.0
         self._has_position = has_position
         self._entry_price = entry_price
+
+    @property
+    def peak_price(self) -> float:
+        """当前峰值基准(止盈用; 供实盘跨日持久化读取)。"""
+        return self._peak_price
 
     # ------------------------------------------------------------------
     # 预热

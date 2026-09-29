@@ -163,6 +163,8 @@ def build_live_report():
 
     # ---- 权益曲线（累积已实现盈亏 + 估算持仓市值） ----
     price_history = _get_price_history()
+    # 浮盈回吐 KPI(2026-09-28): 需在持仓表渲染前算好
+    pos_list = _peak_giveback(pos_list, price_history)
     equity_curve = _build_equity_curve(trades, positions, price_map,
                                        initial_cash, price_history)
     equity_curve["date"] = pd.to_datetime(equity_curve["date"])
@@ -482,6 +484,29 @@ def _get_price_history():
     return hist
 
 
+def _peak_giveback(pos_list, price_history):
+    """持仓期浮盈回吐 KPI(2026-09-28 新增; 见 `plan_profit_protection.md` P1.2)。
+
+    对每只持仓, 用**收盘价**取自 `first_buy_date`(含)以来的最高收盘 → 相对成本的
+    最大浮盈; 与当前收益率之差即"回吐"。口径与回测一致(收盘算信号, 实盘无盘中动作),
+    因此这个数字是**规则真正能保护的浮盈**上限。
+
+    标记 `giveback_flag`: 最大浮盈 >= 2% 且当前已 <= 0 —— 即用户观察到的
+    "买入时盈利, 卖出时亏损" 候选(报告里加 ⚠️ 前缀)。
+    """
+    for p in pos_list:
+        hist = price_history.get(p["symbol"]) or {}
+        fb = str(p.get("first_buy") or "")[:10]
+        closes = [float(c) for d, c in hist.items() if not fb or d >= fb]
+        peak = max(closes) if closes else float(p["price"])
+        cost = float(p["cost"])
+        p["peak"] = peak
+        p["peak_profit_pct"] = (peak / cost - 1) * 100 if cost else 0.0
+        p["giveback_pp"] = p["peak_profit_pct"] - float(p["pnl_pct"])
+        p["giveback_flag"] = p["peak_profit_pct"] >= 2.0 and float(p["pnl_pct"]) <= 0.0
+    return pos_list
+
+
 def _build_equity_curve(trades, positions, price_map, initial_cash,
                         price_history=None, pool=None):
     """从 execution_log.csv + trades.csv + positions.json 重建权益曲线。
@@ -675,9 +700,17 @@ def _positions_table(pos_list, name_map, label, pool_cash):
     total = sum(p["value"] for p in pos_list)
     total_pnl = sum(p["pnl"] for p in pos_list)
     pnl_cls = "positive" if total_pnl > 0 else "negative" if total_pnl < 0 else ""
-    summary = f"<div class='summary-text'>{label}: {len(pos_list)} 只 | 市值 ¥{total:,.0f} | 浮动 <span class='{pnl_cls}'>¥{total_pnl:+,.0f}</span></div>"
-    disp = df[["symbol", "name", "shares", "cost", "price", "value", "pnl", "pnl_pct"]].copy()
-    disp.columns = ["代码", "名称", "股数", "成本", "现价", "市值", "浮动盈亏", "收益率"]
+    flags = int(df["giveback_flag"].sum()) if "giveback_flag" in df.columns else 0
+    flag_txt = f" | <span class='giveback'>⚠️ 曾浮盈≥2% 已转亏 {flags} 只</span>" if flags else ""
+    summary = (f"<div class='summary-text'>{label}: {len(pos_list)} 只 | 市值 ¥{total:,.0f} | "
+               f"浮动 <span class='{pnl_cls}'>¥{total_pnl:+,.0f}</span>{flag_txt}</div>")
+    for k in ("peak", "peak_profit_pct", "giveback_pp"):
+        if k not in df.columns:            # 兼容直接调用(未先算回吐 KPI)的调用方
+            df[k] = float("nan")
+    disp = df[["symbol", "name", "shares", "cost", "price", "value", "pnl", "pnl_pct",
+               "peak", "peak_profit_pct", "giveback_pp"]].copy()
+    disp.columns = ["代码", "名称", "股数", "成本", "现价", "市值", "浮动盈亏", "收益率",
+                    "持仓最高收盘", "最大浮盈", "已回吐"]
     disp["成本"] = disp["成本"].apply(lambda x: f"{float(x):.2f}")
     disp["现价"] = disp["现价"].apply(lambda x: f"{float(x):.2f}")
     disp["市值"] = disp["市值"].apply(lambda x: f"{float(x):,.0f}")
@@ -685,6 +718,17 @@ def _positions_table(pos_list, name_map, label, pool_cash):
         lambda x: f"<span class='{'positive' if float(x)>0 else 'negative' if float(x)<0 else ''}'>{float(x):+,.0f}</span>")
     disp["收益率"] = disp["收益率"].apply(
         lambda x: f"<span class='{'positive' if float(x)>0 else 'negative' if float(x)<0 else ''}'>{float(x):+.1f}%</span>")
+    disp["持仓最高收盘"] = disp["持仓最高收盘"].apply(
+        lambda x: "" if pd.isna(x) else f"{float(x):.2f}")
+    disp["最大浮盈"] = disp["最大浮盈"].apply(
+        lambda x: "" if pd.isna(x) else f"<span class='positive'>{float(x):+.1f}%</span>")
+    disp["已回吐"] = disp["已回吐"].apply(
+        lambda x: "" if pd.isna(x) else f"<span class='negative'>{float(x):.1f}pp</span>")
+    if "giveback_flag" in df.columns:
+        disp["名称"] = [
+            ("⚠️ " if bool(f) else "") + str(n)
+            for n, f in zip(df["name"], df["giveback_flag"])
+        ]
     table = disp.to_html(index=False, classes="data-table pos-table", border=0, justify="center", escape=False)
     return summary + _wrap_table(table)
 
@@ -1396,7 +1440,7 @@ h4{color:#777;margin:14px 0 4px;font-size:15px;border-left:3px solid #1f77b4;pad
 .metrics .mcard.env-mid{background:#fff8e1}
 .metrics .mcard.env-weak{background:#ffebee}
 .env-delta{font-size:11px;font-weight:normal;display:block;margin-top:2px;color:#666}
-.positive{color:#2ca02c}.negative{color:#d62728}
+.positive{color:#2ca02c}.negative{color:#d62728}.giveback{color:#e67e22;font-weight:600}
 .data-table{width:max-content;min-width:max(640px,100%);border-collapse:separate;border-spacing:0;font-size:13px;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);margin:12px 0}
 /* 注: 不能有 overflow:hidden——它是 sticky 首列的祖先, 会使其失效 */
 /* 恢复 collapse 的细分隔线视觉(separate 下) */

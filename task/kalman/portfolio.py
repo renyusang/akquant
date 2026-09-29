@@ -67,7 +67,9 @@ def calc_fee(
 def load_positions() -> Dict[str, Dict[str, Any]]:
     """加载当前持仓。
 
-    返回 {symbol: {name, shares, avg_cost, first_buy_date}} 字典。
+    返回 {symbol: {name, shares, avg_cost, first_buy_date, peak_close}} 字典。
+    `peak_close`(2026-09-28 新增): 持仓期内最高收盘价, 供 SignalEngine 跨日恢复
+    "峰值回撤止盈"基准(缺失时由调用方回退为 avg_cost), 见 plan_profit_protection.md §3。
     损坏时告警并提示从备份恢复(不静默丢失)。
     """
     if not os.path.exists(POSITIONS_FILE):
@@ -106,11 +108,15 @@ def add_position(
         old = positions[key]
         total_cost = old["shares"] * old["avg_cost"] + shares * avg_cost
         total_shares = old["shares"] + shares
+        # 峰值跨日保留(2026-09-28): 加仓**不重置**峰值 —— 与回测一致
+        # (`signal_engine.set_position` 仅在 0→1 开仓时重置); 旧文件缺字段时回退均价
+        peak = old.get("peak_close") or old["avg_cost"]
         positions[key] = {
             "name": name,
             "shares": total_shares,
             "avg_cost": round(total_cost / total_shares, 3),
             "first_buy_date": old["first_buy_date"],
+            "peak_close": round(float(peak), 4),
         }
     else:
         positions[key] = {
@@ -118,8 +124,46 @@ def add_position(
             "shares": shares,
             "avg_cost": avg_cost,
             "first_buy_date": buy_date,
+            # 新开仓: 峰值初值 = 成交均价(含费), 等价回测的"峰值初值 = 入场价"
+            "peak_close": round(float(avg_cost), 4),
         }
     save_positions(positions)
+
+
+def update_peak(symbol: str, peak: float) -> None:
+    """更新单只持仓的跨日峰值(只增不减, 2026-09-28 新增)。
+
+    由 `daily_signal` 在每日评估后回写 `engine.peak_price`; 无持仓/值非法时静默跳过。
+    """
+    if not peak or peak <= 0:
+        return
+    positions = load_positions()
+    key = str(symbol).zfill(6)
+    if key not in positions:
+        return
+    cur = float(positions[key].get("peak_close") or 0.0)
+    if peak <= cur:
+        return
+    positions[key]["peak_close"] = round(float(peak), 4)
+    save_positions(positions)
+
+
+def update_peaks(peaks: Dict[str, float]) -> None:
+    """批量更新跨日峰值(一次读写, 2026-09-28 新增)。"""
+    if not peaks:
+        return
+    positions = load_positions()
+    changed = False
+    for sym, peak in peaks.items():
+        key = str(sym).zfill(6)
+        if key not in positions or not peak or peak <= 0:
+            continue
+        cur = float(positions[key].get("peak_close") or 0.0)
+        if float(peak) > cur:
+            positions[key]["peak_close"] = round(float(peak), 4)
+            changed = True
+    if changed:
+        save_positions(positions)
 
 
 def remove_position(symbol: str) -> Dict[str, Any]:

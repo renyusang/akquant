@@ -8,12 +8,14 @@
     python manage.py remove 002594             # 删除持仓
     python manage.py adjust 002594 500 90.00   # 调整股数和成本
     python manage.py restore 002594            # 从 trades.csv 恢复最近删除的持仓
+    python manage.py seed-peaks --dry-run      # 回填跨日峰值(2026-09-28 迁移)
 """
 
 import argparse
 import json
 import os
 import sys
+from typing import Dict
 
 import pandas as pd
 import yaml
@@ -358,12 +360,69 @@ def cmd_split(symbol: str, ratio: float) -> None:
     old_cost_total = old["shares"] * old["avg_cost"]
     positions[key]["shares"] = new_shares
     positions[key]["avg_cost"] = new_cost
+    # 除权峰值同步缩放(2026-09-28): 否则 peak_close 仍是除权前价格,
+    # 峰值回撤止盈会误判成"深度回撤"而立刻卖出(见 plan_profit_protection.md §3)
+    old_peak = old.get("peak_close")
+    if old_peak:
+        positions[key]["peak_close"] = round(float(old_peak) / ratio, 4)
     save_positions(positions)
     new_cost_total = new_shares * new_cost
     print(f"✅ 除权调整 {symbol} {old['name']}: {old['shares']}→{new_shares}股, "
           f"¥{old['avg_cost']:.4f}→¥{new_cost:.4f} (总成本 "
           f"¥{old_cost_total:,.2f}→¥{new_cost_total:,.2f}, 差额 ¥{new_cost_total-old_cost_total:,.2f})")
     print(f"   提示: 现金分红不改变股数, 无需 split; 配股请用 adjust 手工调整")
+
+
+def cmd_seed_peaks(dry_run: bool = False) -> None:
+    """回填跨日峰值 `peak_close`(2026-09-28 一次性迁移)。
+
+    背景: `peak_close` 是新字段, 存量持仓没有它 —— 若不回填, 修复上线首日
+    峰值仍从持仓成本起步, 历史高点丢失(高浮盈持仓得不到保护)。
+    取值 = max(该持仓 first_buy_date 以来缓存收盘价, 现有 peak_close, avg_cost)。
+
+    用法:
+      python manage.py seed-peaks --dry-run   # 先看
+      python manage.py seed-peaks             # 写入(自动先备份)
+    """
+    positions = load_positions()
+    if not positions:
+        print("无持仓")
+        return
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+    changed: Dict[str, Dict[str, float]] = {}
+    print(f"\n{'代码':<8}{'名称':<12}{'首买日':<12}{'成本':>9}{'历史最高收盘':>13}"
+          f"{'原峰值':>9}{'新峰值':>9}")
+    for key, p in sorted(positions.items()):
+        fb = str(p.get("first_buy_date") or "")[:10]
+        cost = float(p.get("avg_cost") or 0.0)
+        old_peak = float(p.get("peak_close") or 0.0)
+        hist_peak = 0.0
+        fpath = os.path.join(cache_dir, f"{key}.parquet")
+        if os.path.exists(fpath):
+            try:
+                df = pd.read_parquet(fpath, columns=["date", "close"])
+                dates = pd.to_datetime(df["date"]).astype(str).str[:10]
+                closes = df["close"].astype(float)
+                sel = closes[dates >= fb] if fb else closes
+                if len(sel):
+                    hist_peak = float(sel.max())
+            except Exception as e:
+                print(f"  ⚠️ {key} 缓存读取失败({e}), 跳过历史最高收盘")
+        new_peak = max(hist_peak, old_peak, cost)
+        print(f"{key:<8}{str(p.get('name', ''))[:10]:<12}{fb:<12}{cost:>9.3f}"
+              f"{hist_peak:>13.3f}{old_peak:>9.3f}{new_peak:>9.3f}")
+        if new_peak > old_peak + 1e-9:
+            changed[key] = {"old": old_peak, "new": new_peak}
+    if not changed:
+        print("\n✅ 无需回填(所有持仓峰值已是最新)")
+        return
+    if dry_run:
+        print(f"\n[dry-run] 将更新 {len(changed)} 只持仓的 peak_close, 未写入")
+        return
+    for key, v in changed.items():
+        positions[key]["peak_close"] = round(v["new"], 4)
+    save_positions(positions)
+    print(f"\n✅ 已回填 {len(changed)} 只持仓的 peak_close(峰值迁移完成)")
 
 
 def cmd_restore(symbol: str) -> None:
@@ -424,6 +483,11 @@ def main() -> None:
     p_fill.add_argument("shares", type=int, help="股数")
     p_fill.add_argument("price", type=float, help="实际成交价")
 
+    p_seed = sub.add_parser(
+        "seed-peaks",
+        help="回填跨日峰值 peak_close(2026-09-28 一次性迁移): 取缓存收盘价历史最高")
+    p_seed.add_argument("--dry-run", action="store_true", help="只打印不写入")
+
     p_backups = sub.add_parser("backups", help="列出所有备份")
     p_rollback = sub.add_parser("rollback", help="回滚到指定备份")
     p_rollback.add_argument("timestamp", nargs="?", default=None, help="备份时间戳 (默认最新)")
@@ -431,7 +495,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # 写操作前自动备份(影响持仓的操作;fill 只写 actual_fills,不备份)
-    if args.command in ("add", "remove", "adjust", "restore", "split"):
+    if args.command in ("add", "remove", "adjust", "restore", "split", "seed-peaks"):
         try:
             from backup import create_backup
 
@@ -452,6 +516,8 @@ def main() -> None:
         cmd_restore(args.symbol)
     elif args.command == "split":
         cmd_split(args.symbol, args.ratio)
+    elif args.command == "seed-peaks":
+        cmd_seed_peaks(dry_run=args.dry_run)
     elif args.command == "fill":
         cmd_fill(args.symbol, args.action, args.shares, args.price)
     elif args.command == "backups":
