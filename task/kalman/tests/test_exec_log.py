@@ -222,3 +222,68 @@ class TestCleanupStalePending:
 
         assert exec_log.cleanup_stale_pending() == 0
         assert len(exec_log._load()) == 1
+
+
+class TestSummaryFailedWindow:
+    """2026-09-29 修复: `未成交` 只统计近期失败行。
+
+    症状: execution_log 的 failed 行是永久记录, 2026-07-27 长江电力那笔让摘要
+    长期显示"未成交 1", 与"当次运行情况"无关地失真。
+    """
+
+    def _add_failed(self, symbol: str, signal_date: str) -> None:
+        exec_log.log_pending(symbol, "测试", "sell", 0.0, 100, "价格回归", signal_date)
+        exec_log.log_failed(symbol, signal_date, "无开盘价数据")
+
+    def test_old_failure_not_counted(self, mock_exec_log):
+        old = (pd.Timestamp.now() - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+        recent = (pd.Timestamp.now() - pd.Timedelta(days=3)).strftime("%Y-%m-%d")
+        self._add_failed("600900", old)
+        self._add_failed("002460", recent)
+        s = exec_log.get_summary()
+        assert f"未成交(近{exec_log.FAILED_WINDOW_DAYS}天) 1" in s
+
+    def test_only_old_failures_shows_zero(self, mock_exec_log):
+        old = (pd.Timestamp.now() - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+        self._add_failed("600900", old)
+        assert f"未成交(近{exec_log.FAILED_WINDOW_DAYS}天) 0" in exec_log.get_summary()
+
+    def test_window_is_configurable(self, mock_exec_log):
+        d = (pd.Timestamp.now() - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+        self._add_failed("600900", d)
+        assert "未成交(近365天) 1" in exec_log.get_summary(window_days=365)
+
+    def test_summary_keeps_executed_and_skipped(self, mock_exec_log):
+        """既有断言不回归: 已成交/已跳过 仍按全量统计。"""
+        exec_log.log_pending("000001", "A", "buy", 0.95, 100, "r1", "2026-07-23")
+        exec_log.log_executed("000001", "2026-07-23", 10.0, "2026-07-24")
+        exec_log.log_skipped("000002", "B", "2026-07-24", "超仓", "信号")
+        s = exec_log.get_summary()
+        assert "已成交 1" in s
+        assert "已跳过 1" in s
+
+
+class TestCleanupWiredIntoDailyFlow:
+    """cleanup_stale_pending 早在 2026-08-28 就有, 但从未被每日流程调用
+    (残留 pending 行因此持续虚高"待执行"); 2026-09-29 接线并加护栏防再次脱钩。"""
+
+    def test_daily_main_calls_cleanup(self):
+        import inspect
+
+        import daily_signal
+        src = inspect.getsource(daily_signal.main)
+        assert "cleanup_stale_pending()" in src, (
+            "daily_signal.main 必须调用 exec_log.cleanup_stale_pending(), "
+            "否则 execution_log 的残留 pending 行会再次累积")
+
+    def test_cleanup_keeps_live_pending_drops_orphan(self, mock_exec_log, monkeypatch):
+        """有 pending_orders.json 对应订单 → 保留; 孤儿行 → 清除。"""
+        exec_log.log_pending("000001", "A", "buy", 0.95, 100, "r1", "2026-09-28")
+        exec_log.log_pending("002460", "赣锋锂业", "sell", 0.0, 1000, "价格回归",
+                             "2026-09-01")           # 孤儿(队列里没有)
+        monkeypatch.setattr("orders.load_pending", lambda: [
+            {"symbol": "000001", "signal_date": "2026-09-28", "action": "buy"},
+        ])
+        assert exec_log.cleanup_stale_pending() == 1
+        df = exec_log._load()
+        assert list(df["symbol"]) == ["000001"]

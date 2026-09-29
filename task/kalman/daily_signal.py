@@ -891,6 +891,15 @@ def main() -> None:
     else:
         _execute_today_pending(config, today)
 
+    # 收敛 execution_log 残留 pending 行(2026-09-29 接线: cleanup_stale_pending
+    # 早在 2026-08-28 就有, 但从未被每日流程调用 → 残留行持续虚高"待执行"计数,
+    # 如 2026-09-01 赣锋锂业的 pending 行)
+    from exec_log import cleanup_stale_pending
+    n_stale = cleanup_stale_pending()
+    if n_stale and not args.quiet:
+        print(f"  🧹 清理 execution_log 陈旧 pending {n_stale} 条"
+              f"(以 pending_orders.json 为准)")
+
     positions_before = len(load_positions())
     results = []
     allocated_cash: Dict[str, float] = {}  # 本轮已承诺资金 {pool: amount}
@@ -1294,24 +1303,37 @@ def print_position_summary(config_path: Optional[str] = None) -> None:
     if not positions:
         print("\n  (当前无持仓)")
     else:
-        # 读取配置获取仓位上限
+        # 读取配置获取**分池**仓位上限
+        # 2026-09-29 修复: 原按"股票池"单一口径汇总**全部**持仓, 把 ETF 市值
+        # 算进股票池分母 → 合计占比虚高、ETF 行按股票池上限误判超标
+        # (与 2026-08-27 持仓总览配置串台修复 95ea5ee 同族的配置口径问题)
         import yaml
-        max_pct = 0.20
-        cash = 100000
+        from data_utils import is_etf as _is_etf
+        pools: Dict[str, Dict[str, float]] = {}
         cfg_loaded = False
         try:
             with open(config_path or CONFIG_FILE) as f:
                 cfg = yaml.safe_load(f)
-            stock_cfg = cfg.get("stock", {})
-            cash = float(stock_cfg.get("initial_cash", 200000))
-            max_pct = float(stock_cfg.get("single_position_pct", 0.20))
+            for key in ("stock", "etf"):
+                pc = cfg.get(key, {}) or {}
+                pools[key] = {
+                    "cash": float(pc.get("initial_cash", 0.0)),
+                    "max_pct": float(pc.get("single_position_pct", 0.20)),
+                }
             cfg_loaded = True
         except Exception:
             pass
-        max_value = cash * max_pct
         # 配置缺失时上限未知: 不显示臆造的上限, 也不误标超标
-        title = (f"持仓总览 (上限 {int(max_pct*100)}% = ¥{max_value:,.0f})"
-                 if cfg_loaded else "持仓总览 (上限未配置)")
+        if cfg_loaded:
+            caps = " · ".join(
+                f"{lbl}上限 {int(pools[k]['max_pct'] * 100)}% = "
+                f"¥{pools[k]['cash'] * pools[k]['max_pct']:,.0f}"
+                for k, lbl in (("stock", "股票"), ("etf", "ETF"))
+                if pools.get(k, {}).get("cash")
+            )
+            title = f"持仓总览 ({caps})"
+        else:
+            title = "持仓总览 (上限未配置)"
 
         print(f"\n{'=' * 80}")
         print(f"  {title:^72s}")
@@ -1319,8 +1341,6 @@ def print_position_summary(config_path: Optional[str] = None) -> None:
         print(f"  {'代码':<8s} {'名称':<8s} {'股数':>6s} {'成本':>8s} {'市值':>10s} {'占比':>6s} {'浮动盈亏':>10s} {'收益率':>8s}")
         print(f"  {'-' * 72}")
 
-        total_value = 0.0
-        total_pnl = 0.0
         try:
             if os.path.exists(SIGNALS_CSV):
                 latest = pd.read_csv(SIGNALS_CSV)
@@ -1332,23 +1352,40 @@ def print_position_summary(config_path: Optional[str] = None) -> None:
         except Exception:
             price_map = {}
 
+        pool_val = {"stock": 0.0, "etf": 0.0}
+        pool_pnl = {"stock": 0.0, "etf": 0.0}
         for sym, pos in sorted(positions.items()):
+            pool = "etf" if _is_etf(sym) else "stock"
+            pc = pools.get(pool, {}) if cfg_loaded else {}
+            cash = float(pc.get("cash", 0.0))
+            max_value = cash * float(pc.get("max_pct", 0.20)) if cash else 0.0
             price = price_map.get(sym, pos["avg_cost"])
             value = pos["shares"] * price
             pnl = (price - pos["avg_cost"]) * pos["shares"]
             pnl_pct = (price / pos["avg_cost"] - 1) * 100
             pct = value / cash * 100 if cash > 0 else 0
-            total_value += value
-            total_pnl += pnl
-            flag = " ⚠️超标" if cfg_loaded and value > max_value * 1.01 else ""
+            pool_val[pool] += value
+            pool_pnl[pool] += pnl
+            flag = " ⚠️超标" if max_value and value > max_value * 1.01 else ""
             print(
                 f"  {sym:<8s} {pos['name']:<8s} {pos['shares']:>6d}  "
                 f"{pos['avg_cost']:>8.2f} {value:>10.0f} {pct:>5.1f}% {pnl:>+10.0f} {pnl_pct:>+7.1f}%{flag}"
             )
 
         print(f"  {'-' * 72}")
-        total_pct = total_value / cash * 100 if cash > 0 else 0
-        print(f"  持仓市值: ¥{total_value:,.0f} / ¥{cash:,.0f} = {total_pct:.1f}%    浮动盈亏: ¥{total_pnl:+,.0f}")
+        for key, lbl in (("stock", "股票池"), ("etf", "ETF池")):
+            cash = float(pools.get(key, {}).get("cash", 0.0)) if cfg_loaded else 0.0
+            if cash > 0:
+                pct = pool_val[key] / cash * 100
+                print(f"  {lbl}: 市值 ¥{pool_val[key]:,.0f} / ¥{cash:,.0f} = {pct:.1f}%"
+                      f"    浮动盈亏 ¥{pool_pnl[key]:+,.0f}")
+            else:
+                # 配置缺该池(如早期只有 stock 段的 unlimited.yaml): 不臆造分母
+                print(f"  {lbl}: 市值 ¥{pool_val[key]:,.0f} / 上限未配置"
+                      f"    浮动盈亏 ¥{pool_pnl[key]:+,.0f}")
+        total_value = pool_val["stock"] + pool_val["etf"]
+        total_pnl = pool_pnl["stock"] + pool_pnl["etf"]
+        print(f"  两池合计: 市值 ¥{total_value:,.0f}    浮动盈亏 ¥{total_pnl:+,.0f}")
 
     # 执行日志摘要
     from exec_log import get_summary as _exec_summary, get_pending_count

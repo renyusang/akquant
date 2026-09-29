@@ -22,6 +22,25 @@ COLUMNS = [
     "exec_price", "status", "reason",
 ]
 
+# get_summary 中"未成交"的统计窗口(天): 历史失败行不应长期计为当前未成交
+FAILED_WINDOW_DAYS = 30
+
+# 需要按文本(而非被推断的 float64)处理的列
+_TEXT_COLS = ("exec_date", "name", "signal_reason", "exec_price", "status", "reason")
+
+
+def _coerce_text_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """把文本列统一为 object dtype。
+
+    修复(2026-09-29): 整列为空时 read_csv 推断成 float64, 之后
+    `df.at[idx, "reason"] = "无开盘价数据"` 触发 pandas FutureWarning
+    (未来版本直接报错) —— 见 log_failed 路径。
+    """
+    for col in _TEXT_COLS:
+        if col in df.columns:
+            df[col] = df[col].astype(object)
+    return df
+
 
 def _load() -> pd.DataFrame:
     if not os.path.exists(EXEC_LOG):
@@ -29,7 +48,7 @@ def _load() -> pd.DataFrame:
     try:
         df = pd.read_csv(EXEC_LOG, dtype={"symbol": str, "signal_date": str, "exec_date": str})
         df["symbol"] = df["symbol"].str.zfill(6)
-        return df
+        return _coerce_text_cols(df)
     except pd.errors.EmptyDataError:
         return pd.DataFrame(columns=COLUMNS)
 
@@ -57,7 +76,9 @@ def log_pending(
         "shares": shares, "signal_reason": signal_reason, "exec_price": "",
         "status": "pending", "reason": reason,
     }])
-    df = pd.concat([df, new_row], ignore_index=True)
+    # 空表直接用新行(2026-09-29): 空 DataFrame 的列全是 NA, concat 会触发
+    # pandas 弃用告警(all-NA 列的 dtype 推断将变)
+    df = new_row if df.empty else pd.concat([df, new_row], ignore_index=True)
     _save(df)
 
 
@@ -80,7 +101,7 @@ def log_executed(symbol: str, signal_date: str, exec_price: float, exec_date: st
         ref = df[df["symbol"] == sym]
         if len(ref):
             r = ref.iloc[-1]
-            df = pd.concat([df, pd.DataFrame([{
+            new_row = pd.DataFrame([{
                 "signal_date": signal_date, "exec_date": exec_date,
                 "symbol": sym, "name": r.get("name", sym),
                 "action": r.get("action", "buy"),
@@ -89,7 +110,8 @@ def log_executed(symbol: str, signal_date: str, exec_price: float, exec_date: st
                 "signal_reason": r.get("signal_reason", ""),
                 "exec_price": exec_price, "status": "executed",
                 "reason": r.get("reason", ""),
-            }])], ignore_index=True)
+            }])
+            df = new_row if df.empty else pd.concat([df, new_row], ignore_index=True)
     _save(df)
 
 
@@ -117,7 +139,9 @@ def log_skipped(
         "name": name, "action": action, "target_pct": 0, "shares": 0,
         "signal_reason": signal_reason, "exec_price": "", "status": "skipped", "reason": reason,
     }])
-    df = pd.concat([df, new_row], ignore_index=True)
+    # 空表直接用新行(2026-09-29): 空 DataFrame 的列全是 NA, concat 会触发
+    # pandas 弃用告警(all-NA 列的 dtype 推断将变)
+    df = new_row if df.empty else pd.concat([df, new_row], ignore_index=True)
     _save(df)
 
 
@@ -154,15 +178,27 @@ def get_pending_count() -> int:
     return int((df["status"] == "pending").sum())
 
 
-def get_summary() -> str:
+def get_summary(window_days: int = FAILED_WINDOW_DAYS) -> str:
+    """执行日志摘要。
+
+    修复(2026-09-29): `未成交` 只统计**近 window_days 天**的 failed 行 ——
+    历史失败行(如 2026-07-27 长江电力)会让摘要长期显示"未成交 1", 失真;
+    `待执行` 由 `cleanup_stale_pending()` 保证与 pending_orders.json 一致。
+    """
     df = _load()
     if df.empty:
         return "无执行记录"
     executed = (df["status"] == "executed").sum()
-    failed = (df["status"] == "failed").sum()
     pending = (df["status"] == "pending").sum()
     skipped = (df["status"] == "skipped").sum()
-    return f"已成交 {executed} | 未成交 {failed} | 待执行 {pending} | 已跳过 {skipped}"
+    failed_mask = df["status"] == "failed"
+    recent_failed = 0
+    if failed_mask.any():
+        d = pd.to_datetime(df.loc[failed_mask, "signal_date"], errors="coerce")
+        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=window_days)
+        recent_failed = int((d >= cutoff).sum())
+    return (f"已成交 {executed} | 未成交(近{window_days}天) {recent_failed} | "
+            f"待执行 {pending} | 已跳过 {skipped}")
 
 
 if __name__ == "__main__":

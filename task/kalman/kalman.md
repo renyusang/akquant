@@ -648,6 +648,17 @@ bash run_daily.sh                  # crontab 已默认开启 --deploy
 
 ## 已修复问题
 
+### 持仓总览分池口径 + execution_log 残留 pending 收敛 (2026-09-29)
+**问题**(2026-09-29 例行运行后分析发现, 两处都是既有代码):
+1. **持仓总览按股票池单一分母汇总全部持仓**: `print_position_summary` 取 `stock.initial_cash`(¥300,000) 作分母、`stock.single_position_pct`(20% = ¥60,000) 作上限, 但遍历的是**全部** positions → 实盘显示"持仓市值 ¥70,669 / ¥300,000 = 23.6%"(其中 ¥19,289 属 ETF 池), 且 ETF 行按股票池上限判超标而非自身上限(¥20,000)。与 2026-08-27 修过的"持仓总览配置串台"(95ea5ee)同族的配置口径问题。
+2. **`cleanup_stale_pending()` 存在但从未接线**: 该函数 2026-08-28 就已实现并有测试, 但**没有任何调用方**(仅 `python exec_log.py` 手工 CLI) → execution_log 残留 pending 行持续累积(如 2026-09-01 赣锋锂业卖单), 摘要"待执行 1"长期失真; "未成交 1"则来自 2026-07-27 长江电力的历史 failed 行。
+**修复**:
+1. 分池口径: 逐行按代码前缀(`data_utils.is_etf`)取该池 `initial_cash` / `single_position_pct` 计算占比、上限与超标标记; 底部改为"股票池 / ETF池 / 两池合计"三段小计; 标题并列两池上限; 配置缺某池时显示"上限未配置"而不臆造分母。
+2. `daily_signal.main` 在 `_execute_today_pending` 之后调用 `cleanup_stale_pending()` 并打印清理条数(以 pending_orders.json 为准); `exec_log.get_summary()` 的"未成交"改为**近 30 天**窗口(`FAILED_WINDOW_DAYS`, 可传 `window_days`), 标签写明窗口避免误导。
+3. 同模块顺带: `_load` 统一把文本列转 `object` dtype(全空列被 read_csv 推断为 float64 后, `log_failed` 赋值 reason 会触发 pandas FutureWarning, 未来版本将报错); `log_pending/log_skipped/log_executed` 三处 concat 在空表时直接用新行(消除 pandas "all-NA 列拼接"弃用告警)。
+**验证**: 新增 `TestPositionSummaryPoolScope` 3 例(分池占比按各自资金 / ETF 按自身上限判超标 / 缺 `etf` 段不臆造上限) + `test_exec_log.py` 7 例(失败窗口计数与可配、cleanup 保留队列内 pending 且清孤儿、**`main` 必须调用 cleanup 的护栏测试**防再次脱钩)。全套 **390 通过**。
+**遗留(未处理)**: `portfolio.record_trade` 与 `exec_log.log_executed` 追加分支仍有 pandas "concat with empty or all-NA entries" 弃用告警(未来 pandas 版本会改变 dtype 推断), 属既有代码, 本次未动。
+
 ### 浮盈保护研究立项 + 实盘峰值语义缺陷(未修) (2026-09-28) — 计划文档 `task/kalman/plan_profit_protection.md`
 **动机**: 用户观察"不少股票买入时盈利, 卖出时亏损"; 要求识别该行情并尽量保护浮盈。
 

@@ -1199,3 +1199,66 @@ class TestInsufficientBudgetReason:
                 {"stock": 0.0})
             assert "资金不足" in result["reason"]
             assert "1手(100股)¥50,000" in result["reason"]
+
+
+def _two_pool_positions():
+    """一只股票 + 一只 ETF(用于分池口径测试)。"""
+    return {
+        "600519": {"name": "贵州茅台", "shares": 100, "avg_cost": 1000.0,
+                   "first_buy_date": "2026-09-01"},       # 市值 10万
+        "512480": {"name": "半导体ETF", "shares": 100000, "avg_cost": 1.0,
+                   "first_buy_date": "2026-09-01"},      # 市值 10万
+    }
+
+
+class TestPositionSummaryPoolScope:
+    """2026-09-29 修复: 持仓总览原按"股票池"单一口径汇总全部持仓。
+
+    症状: ETF 市值被算进股票池分母 → 合计占比虚高(实盘 8 只持仓显示
+    "持仓市值 ¥70,669 / ¥300,000", 其中 ¥19,289 是 ETF), 且 ETF 行按股票池
+    上限(¥60,000)判超标, 与自身上限(¥20,000)不符。
+    """
+
+    def _run(self, monkeypatch, capsys, tmp_path, positions, cfg_text):
+        monkeypatch.setattr(daily_signal, "load_positions", lambda: positions)
+        monkeypatch.setattr(daily_signal, "SIGNALS_CSV",
+                            os.path.join(str(tmp_path), "absent.csv"))
+        (tmp_path / "pools.yaml").write_text(cfg_text, encoding="utf-8")
+        daily_signal.print_position_summary(str(tmp_path / "pools.yaml"))
+        return capsys.readouterr().out
+
+    CFG = ("stock:\n  initial_cash: 300000\n  single_position_pct: 0.20\n"
+           "etf:\n  initial_cash: 100000\n  single_position_pct: 0.20\n")
+
+    def test_each_pool_uses_own_cash(self, monkeypatch, capsys, tmp_path):
+        """ETF 行的占比按 ETF 池资金算, 不再除以股票池资金。"""
+        out = self._run(monkeypatch, capsys, tmp_path, _two_pool_positions(), self.CFG)
+        # 股票 10万/30万 = 33.3%; ETF 10万/10万 = 100.0%(而非 10万/30万 = 33.3%)
+        assert "33.3%" in out
+        assert "100.0%" in out
+        # 分池小计: 两池各 10万, 各自分母
+        assert "股票池: 市值 ¥100,000 / ¥300,000" in out
+        assert "ETF池: 市值 ¥100,000 / ¥100,000" in out
+        assert "两池合计: 市值 ¥200,000" in out
+
+    def test_etf_flagged_by_its_own_cap(self, monkeypatch, capsys, tmp_path):
+        """ETF 按自身上限(10万×20%=2万)判超标, 不套用股票池上限(6万)。"""
+        pos = {"512480": {"name": "半导体ETF", "shares": 30000, "avg_cost": 1.0,
+                          "first_buy_date": "2026-09-01"}}       # 市值 3万 > 2万
+        out = self._run(monkeypatch, capsys, tmp_path, pos, self.CFG)
+        assert "超标" in out
+        assert "ETF上限 20% = ¥20,000" in out
+
+    def test_missing_etf_section_is_safe(self, monkeypatch, capsys, tmp_path):
+        """配置只有 stock 段(unlimited 早期形态): ETF 行不臆造上限、不误标超标。"""
+        cfg = "stock:\n  initial_cash: 300000\n  single_position_pct: 0.20\n"
+        pos = {
+            "600519": {"name": "贵州茅台", "shares": 100, "avg_cost": 500.0,
+                       "first_buy_date": "2026-09-01"},   # 市值 5万 < 股票上限 6万
+            "512480": {"name": "半导体ETF", "shares": 100000, "avg_cost": 1.0,
+                       "first_buy_date": "2026-09-01"},   # 市值 10万(上限未配置)
+        }
+        out = self._run(monkeypatch, capsys, tmp_path, pos, cfg)
+        assert "超标" not in out
+        assert "ETF池: 市值 ¥100,000 / 上限未配置" in out
+        assert "股票池: 市值 ¥50,000 / ¥300,000" in out
