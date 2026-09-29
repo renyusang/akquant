@@ -2240,7 +2240,9 @@ class Strategy:
         """
         _buy_all_impl(self, symbol)
 
-    def close_position(self, symbol: Optional[str] = None) -> None:
+    def close_position(
+        self, symbol: Optional[str] = None, tag: Optional[str] = None
+    ) -> None:
         """
         平仓 (Close Position).
 
@@ -2248,8 +2250,9 @@ class Strategy:
 
         Args:
             symbol: 标的代码 (如果不填, 默认使用当前 Bar/Tick 的 symbol)
+            tag: 订单标签 (可选; 会写入成交记录的 exit_tag, 便于按出场规则归因)
         """
-        _close_position_impl(self, symbol)
+        _close_position_impl(self, symbol, tag=tag)
 
     def short(
         self,

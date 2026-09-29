@@ -496,7 +496,7 @@ class KalmanStrategy(Strategy):
             if self.max_hold_bars > 0:
                 held = int(getattr(self, "_hold_bars", {}).get(symbol, 0))
                 if held > self.max_hold_bars and result["signal"] != "buy":
-                    self.close_position(symbol)
+                    self.close_position(symbol, tag="出场:时间止盈")
                     self._opened_count = max(0, self._opened_count - 1)
                     self._trade_count += 1
                     self.log(
@@ -511,7 +511,7 @@ class KalmanStrategy(Strategy):
             if self.ma_exit_enabled and result["signal"] != "buy":
                 ma = self._calc_ma_n(symbol, close_price, self.ma_exit_period)
                 if close_price < ma:
-                    self.close_position(symbol)
+                    self.close_position(symbol, tag=f"出场:均线止盈({self.ma_exit_period})")
                     self._opened_count = max(0, self._opened_count - 1)
                     self._trade_count += 1
                     self.log(
@@ -543,7 +543,11 @@ class KalmanStrategy(Strategy):
                         )
                         return
                 entry_price = self._entry_prices.get(symbol, close_price)
-                self.close_position(symbol)
+                # 出场归因(2026-09-28): 引擎 reason 写入订单 tag → 成交记录 exit_tag,
+                # 便于按出场规则统计(此前 entry_tag/exit_tag 列全为空)
+                self.close_position(
+                    symbol, tag=f"出场:{str(result.get('reason') or '')[:48]}"
+                )
                 # 修复(2026-08-24): 卖出下单不立即释放名额——卖出订单 T+1
                 # 才成交, 若被拒持仓保留; 立即 -1 会让名额提前释放 → 同日
                 # 新买入 → 持仓净增(曾致最大持仓 10)。改为登记 _pending_sells,
@@ -566,7 +570,10 @@ class KalmanStrategy(Strategy):
                 target_value = self.initial_cash * target_pct
                 current_value = pos * close_price
                 if target_value > current_value * 1.05:
-                    self.order_target_value(symbol=symbol, target_value=target_value)
+                    self.order_target_value(
+                        symbol=symbol, target_value=target_value,
+                        tag="加仓:趋势翻转",
+                    )
                     self._entry_prices[symbol] = close_price
                     self._trade_count += 1
                     self.log(
@@ -653,6 +660,8 @@ class KalmanStrategy(Strategy):
             "kalman_price": kp,
             "kalman_velocity": float(result.get("kalman_velocity") or 0.0),
             "trend": str(result.get("trend") or ""),
+            # 入场原因(2026-09-28): 用于订单 tag / 交易归因, 同 on_bar 时刻捕获
+            "reason": str(result.get("reason") or ""),
             # 偏离度口径同 daily_signal (close/kalman_price - 1)
             "dev": (close_price / kp - 1.0) if kp > 0 else 0.0,
         }
@@ -688,9 +697,11 @@ class KalmanStrategy(Strategy):
         """新建仓下单 + 记账(旧/新路径共用; 表达式与原 on_bar 内一致)。"""
         target_pct = entry["target_pct"]
         # 按 initial_cash 固定金额下单(对齐 portfolio_backtest,无复利效应)
+        # 入场归因(2026-09-28): 引擎信号原因写入订单 tag → 成交记录 entry_tag
         self.order_target_value(
             symbol=symbol,
             target_value=self.initial_cash * target_pct,
+            tag=f"入场:{str(entry.get('reason') or '')[:48]}",
         )
         self._entry_prices[symbol] = entry["close"]
         self._entry_bars[symbol] = entry["bar_count"]

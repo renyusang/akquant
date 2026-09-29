@@ -1797,15 +1797,25 @@ def buy_all(strategy: Any, symbol: Optional[str] = None) -> None:
         buy(strategy, symbol=symbol, quantity=quantity)
 
 
-def close_position(strategy: Any, symbol: Optional[str] = None) -> None:
-    """平仓 (Close Position)."""
+def close_position(
+    strategy: Any,
+    symbol: Optional[str] = None,
+    tag: Optional[str] = None,
+) -> None:
+    """平仓 (Close Position).
+
+    Args:
+        strategy: 策略实例
+        symbol: 标的代码
+        tag: 订单标签 (可选; 传递到成交记录的 exit_tag, 便于按出场规则归因)
+    """
     symbol = resolve_symbol(strategy, symbol)
     position = get_position(strategy, symbol)
 
     if position > 0:
-        sell(strategy, symbol=symbol, quantity=position)
+        sell(strategy, symbol=symbol, quantity=position, tag=tag)
     elif position < 0:
-        buy(strategy, symbol=symbol, quantity=abs(position))
+        buy(strategy, symbol=symbol, quantity=abs(position), tag=tag)
 
 
 def short(
