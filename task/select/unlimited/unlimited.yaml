@@ -23,6 +23,10 @@ strategy:
   trailing_stop_pct: 0.04       # 2026-09-22 与实盘同步(批次3研究: 5%→4%)
   # ma_exit_enabled: true       # 均线止盈(可选, 默认关, 与实盘一致): +61.6pp/回撤-19%
   # ma_exit_period: 10
+  # ---- 峰值语义修复(2026-10-09 与实盘 P0 同步, 见 plan_profit_protection.md §3.5) ----
+  # 本系统引擎每次运行逐标的重建 → 不回填峰值时"峰值回撤止盈"退化为"-4% 成本止损"
+  peak_persist_enabled: false   # 修复开关(默认关: 交易行为暂不变); 切换前先跑影子期
+  peak_shadow_enabled: true     # 影子对照: 只记录"新语义会不会提前卖出", 不下单
   stop_loss_pct: 0.05
   trend_bear_pct: 0.3
   trend_confirm_bars: 1

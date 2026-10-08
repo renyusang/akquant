@@ -648,6 +648,17 @@ bash run_daily.sh                  # crontab 已默认开启 --deploy
 
 ## 已修复问题
 
+### 无限仓位系统 P0 峰值修复移植 (2026-10-09)
+**背景**: `plan_profit_protection.md` §3 的实盘峰值语义缺陷在 `task/select/unlimited/` **同样存在** —— 该系统的引擎也是每次运行逐标的**重建**(主流程逐个 `ds.evaluate_stock`), 不回填峰值则"峰值回撤止盈"同样退化为"-4% 成本止损"; 且它原先既不维护峰值台账, 也未重定向 `ds.LOG_DIR`(启用影子日志会把行写进实盘 `kalman/logs/`, 串台)。
+**变更**:
+1. `unlimited_signal.py`: 状态重定向块新增 `ds.LOG_DIR = <unlimited>/logs`; 扫描循环后调用 `ds._persist_peaks(results)` + `ds._persist_peak_shadow(results, today)`(与实盘同口径、同开关语义)。
+2. `unlimited.yaml`: 新增 `peak_persist_enabled: false`(**默认关 → 交易行为不变**) / `peak_shadow_enabled: true`(影子对照, 只记录不下单)。
+3. `manage.py`: 新增全局 `--task-dir`(约定同 `exec_log.py --task-dir`), 使 `seed-peaks` 等命令可用于变体目录(状态文件重定向, 数据缓存仍共用实盘 `.cache`)。
+4. **存量迁移已执行**: `python manage.py --task-dir ../select/unlimited seed-peaks` → 4 只持仓回填(光智科技 278.35 / 瑞芯微 223.01 / 纳斯达克ETF 2.374 / 长江电力 28.90), 实盘 `positions.json` 未被触碰(已核对隔离)。
+**修复价值实录**(迁移当日): **瑞芯微** 成本 ¥190.099、峰值 ¥223.010 → 新语义卖点 ¥214.09(**+12.6%**) vs 现状(峰值=成本)¥182.50(-4.0%), 单笔差 ≈**¥9,478**(300 股); **光智科技** 峰值 278.35 相当于成本 +24.1%; 长江电力/纳指ETF 峰值接近成本, 差异可忽略。
+**验证**: 新增 `tests/test_unlimited.py::TestPeakStateIsolation` 4 例 —— ①5 个状态路径(信号/持仓/待执行/执行日志/**影子日志**)全部重定向到无限仓位目录(子进程导入, 避免全局污染); ②两个持久化函数只认模块级路径(临时目录验证, 不写死 kalman); ③配置开关存在且 `persist=false`; ④**AST 护栏**: `unlimited_signal.main` 必须同时调用两个函数(防"函数写好了没接线", 同 `cleanup_stale_pending` 教训)。unlimited 15 通过 + 实盘 390 通过, 两套互不污染。
+**切换前置**: 与实盘一致 —— 影子期(`unlimited/logs/peak_shadow.csv`)复核后把 `peak_persist_enabled` 改为 `true`。
+
 ### 持仓总览分池口径 + execution_log 残留 pending 收敛 (2026-09-29)
 **问题**(2026-09-29 例行运行后分析发现, 两处都是既有代码):
 1. **持仓总览按股票池单一分母汇总全部持仓**: `print_position_summary` 取 `stock.initial_cash`(¥300,000) 作分母、`stock.single_position_pct`(20% = ¥60,000) 作上限, 但遍历的是**全部** positions → 实盘显示"持仓市值 ¥70,669 / ¥300,000 = 23.6%"(其中 ¥19,289 属 ETF 池), 且 ETF 行按股票池上限判超标而非自身上限(¥20,000)。与 2026-08-27 修过的"持仓总览配置串台"(95ea5ee)同族的配置口径问题。

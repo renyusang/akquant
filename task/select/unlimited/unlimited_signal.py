@@ -33,6 +33,9 @@ import state_check  # noqa: E402
 ds.TASK_DIR = UNLIMITED_DIR
 ds.CONFIG_FILE = os.path.join(UNLIMITED_DIR, "unlimited.yaml")
 ds.SIGNALS_CSV = os.path.join(UNLIMITED_DIR, "signals.csv")
+# 峰值影子日志必须落在本目录(2026-10-09): ds.LOG_DIR 是模块级常量, 默认指向
+# kalman/logs —— 不重定向会把无限仓位的影子行写进实盘日志(串台)
+ds.LOG_DIR = os.path.join(UNLIMITED_DIR, "logs")
 portfolio.POSITIONS_FILE = os.path.join(UNLIMITED_DIR, "positions.json")
 portfolio.TRADES_FILE = os.path.join(UNLIMITED_DIR, "trades.csv")
 orders.PENDING_FILE = os.path.join(UNLIMITED_DIR, "pending_orders.json")
@@ -108,6 +111,19 @@ def main() -> None:
                             "error": str(e), "signal": "error"})
             if not args.quiet:
                 print(f"  ❌ 错误: {e}")
+
+    # 峰值台账 + 影子对照(2026-10-09 与实盘 P0 同步, 见 plan_profit_protection.md §3.5):
+    # 本系统的引擎同样是每次运行逐标的重建, 不回填峰值则"峰值回撤止盈"退化为
+    # "-4% 成本止损"。开关在 unlimited.yaml 的 strategy 段(默认 persist=false,
+    # 即交易行为暂不变; shadow=true 只记录)。状态写入本目录(portfolio.POSITIONS_FILE
+    # 已重定向), 影子日志写入 ds.LOG_DIR(本目录 logs/)。
+    n_peaks = ds._persist_peaks(results)
+    n_shadow = ds._persist_peak_shadow(results, today)
+    if not args.quiet:
+        print(f"\n  [峰值台账] 已回写 {n_peaks} 只持仓的跨日峰值")
+        if n_shadow:
+            print(f"  [影子对照] 新语义下今日会**提前卖出** {n_shadow} 只 "
+                  f"(详见 logs/peak_shadow.csv; 未下单)")
 
     if not args.quiet:
         ds.print_summary(results)

@@ -188,6 +188,11 @@
 > **读法**: 修复的收益集中在"涨过又回吐"的持仓(正是立项动机); 对"从未浮盈"的持仓无影响(它们该止损止损)。
 > 光智科技一例 = 单笔 ≈**¥9,232**(200 股 × 46.16 元) —— 若不修复, 该仓位会一路持有到 -4% 才卖。
 
+**变体系统移植(2026-10-09 已完成)**: `task/select/unlimited/`(无限仓位系统)存在**同一缺陷**(引擎每次运行逐标的重建), 已按同一口径移植:
+`unlimited_signal.py` 重定向 `ds.LOG_DIR` + 扫描后调用两个持久化函数; `unlimited.yaml` 加同款开关(默认 `persist=false`/`shadow=true`);
+`manage.py` 加全局 `--task-dir` 使 `seed-peaks` 可用于变体目录; 存量 4 只持仓已回填(见 `kalman.md` 2026-10-09 条目)。
+修复价值实录: **瑞芯微**(成本 190.099 / 峰值 223.010)→ 新语义卖点 +12.6% vs 现状 -4.0%, 单笔差 ≈¥9,478。
+
 **切换生产的步骤(建议影子期 ≥10 个交易日后)**:
 1. 复核 `logs/peak_shadow.csv`: `shadow_earlier=true` 的每一行都要能解释(应为"涨过又回落"的持仓);
 2. 改 `stocks.yaml` → `peak_persist_enabled: true`(备份 `stocks.yaml.bak_YYYYMMDD`);

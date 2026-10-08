@@ -451,6 +451,9 @@ def cmd_restore(symbol: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="持仓手动管理工具")
+    parser.add_argument(
+        "--task-dir", default=None,
+        help="状态目录(默认本目录 kalman; 变体传 task/select/unlimited)")
     sub = parser.add_subparsers(dest="command", help="操作")
 
     p_show = sub.add_parser("show", help="查看持仓")
@@ -493,6 +496,17 @@ def main() -> None:
     p_rollback.add_argument("timestamp", nargs="?", default=None, help="备份时间戳 (默认最新)")
 
     args = parser.parse_args()
+
+    # 变体状态目录重定向(2026-10-09): 与 unlimited_signal.py / exec_log.py --task-dir
+    # 同约定 —— 数据缓存共用实盘 .cache, 状态文件留在各自目录
+    if args.task_dir:
+        import backup as _backup
+        import portfolio as _portfolio
+        tdir = os.path.abspath(args.task_dir)
+        _portfolio.POSITIONS_FILE = os.path.join(tdir, "positions.json")
+        _portfolio.TRADES_FILE = os.path.join(tdir, "trades.csv")
+        _backup.TASK_DIR = tdir
+        _backup.BACKUP_DIR = os.path.join(tdir, "backups")
 
     # 写操作前自动备份(影响持仓的操作;fill 只写 actual_fills,不备份)
     if args.command in ("add", "remove", "adjust", "restore", "split", "seed-peaks"):
