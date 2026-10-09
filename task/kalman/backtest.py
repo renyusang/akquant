@@ -418,9 +418,20 @@ _PARAM_MAP = {
 }
 
 
+# 仅实盘生效的键: 由 daily_signal 处理(峰值台账/影子对照), 不进回测。
+# 2026-10-09: 否则 stocks.yaml 里的 peak_persist_enabled(=实盘部署开关, 当前 false)
+# 会被 KalmanStrategy 当同名参数读走 → 回测基线被静默改成"修复前语义"(1,332,424→1,180,489),
+# 破坏"冻结基线"约定; 回测侧要 A/B 请显式传 `peak_persist_enabled` 参数。
+_LIVE_ONLY_KEYS = {"peak_persist_enabled", "peak_shadow_enabled"}
+
+
 def _map_strategy_params(yaml_params: Dict[str, Any]) -> Dict[str, Any]:
     """将 stocks.yaml 的策略参数名映射到 KalmanStrategy 构造参数名。"""
-    return {_PARAM_MAP.get(k, k): v for k, v in yaml_params.items()}
+    return {
+        _PARAM_MAP.get(k, k): v
+        for k, v in yaml_params.items()
+        if k not in _LIVE_ONLY_KEYS
+    }
 
 
 def _lot_size_map(symbols: list) -> Dict[str, int]:

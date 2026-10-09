@@ -323,6 +323,13 @@ class SignalEngine:
         self.mfi_period = int(_p("mfi_period", 14))
         # 峰值回撤止盈(2026-08-26 研究): 持仓峰值回撤 ≥ 该比例即卖出(0=禁用)
         self.trailing_stop_pct = float(_p("trailing_stop_pct", 0.0))
+        # 峰值是否跨 bar 累积(2026-10-09, 默认 True = 回测原有语义)
+        # True : 峰值单调累积 = 真·移动止盈(实盘修好后的语义)
+        # False: 每个 bar 把峰值重置为 max(入场价, 当日收盘) —— 复现实盘**修复前**的
+        #        行为(引擎每日重建 → 峰值退回成本 → "峰值回撤止盈"退化为 -4% 成本止损),
+        #        用于组合回测里量化 peak_persist_enabled 开/关的差异
+        #        (见 plan_profit_protection.md §3)
+        self.peak_persist_enabled = bool(_p("peak_persist_enabled", True))
         # 固定目标利润止盈(2026-08-27 研究): 持仓盈利 ≥ 该比例即卖出(0=禁用)
         self.target_profit_pct = float(_p("target_profit_pct", 0.0))
         # Chandelier 吊灯止盈(2026-08-27 研究): 峰值回撤 ≥ k×NATR 卖出——
@@ -733,8 +740,13 @@ class SignalEngine:
         self._trend.update(close, ma20_cur, ma20_prev, adx)
 
         # 峰值更新(持仓期, 峰值回撤止盈基准)
-        if self._has_position and close > self._peak_price:
-            self._peak_price = close
+        if self._has_position:
+            if self.peak_persist_enabled:
+                if close > self._peak_price:
+                    self._peak_price = close
+            else:
+                # 修复前语义: 峰值不跨 bar 累积(等价于每天重建引擎时的重置)
+                self._peak_price = max(self._entry_price, close)
         # ADX 峰值更新(持仓期, 衰减止盈基准)
         if self._has_position and self._last_adx is not None:
             self._adx_peak_since_entry = max(

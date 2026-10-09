@@ -697,6 +697,11 @@ A 行与批次3 生产基线**逐元吻合** ✅。**B 比 A 少 ¥-151,935(-38.
 
 **结论**: ①"更早离场保护浮盈"在**组合口径下仅对"真·移动止盈"成立**(+38.5pp, 但 ETF 池反向), 各类**收紧**版本一律为负 → 不投入; ②优先级给 **实盘峰值语义修复**(预期 +¥95k~152k 量级)+ 观测层(订单 tag 归因 / 回吐 KPI / 校准重放器入库)+ 尚未证伪候选(分批止盈、入场端"无跟随"识别); ③`entry_tag`/`exit_tag` 当前**全为空**(akquant `buy/sell` 已支持 `tag=`) → 先补归因。计划全文(门槛/批次/验收 KPI/复现命令)见 `task/kalman/plan_profit_protection.md`。
 
+**开关级 A/B(2026-10-09, 组合回测)**: 回测侧新增同名开关 `peak_persist_enabled`(`SignalEngine`→`KalmanStrategy`, 默认 `True`=原基线语义; `False`=复现实盘修复前: 峰值每 bar 重置为 max(成本,收盘))。`python sweep_params.py --param peak_persist_enabled --values 0,1 --period is,oos,full --pool {stock,etf}`:
+**股票池** IS +103.3%→**+133.6%**(夏普 1.01→1.29)、OOS +195.9%→**+224.9%**(2.53→2.87)、full +265.5%→**+323.4%**(1.31→1.59), 回撤三段均改善 3.5~5.3pp、买单 +63/+25/+88; **ETF 池反向** full -16.0%→**-37.9%**;
+**组合口径(30:10万)** IS +¥80,600(+20.2pp) / OOS +¥84,400(+21.1pp) / full **+¥151,800(+38.0pp)**。
+与 §3.3 的 monkeypatch 模拟**逐项吻合**(1,180,500 vs 1,180,489 / 1,332,300 vs 1,332,424)→ 开关实现正确; 股票池 IS/OOS 同向同幅、组合口径两段均 +20pp, **翻开关在账户层面为正**。⚠️ `stocks.yaml` 的 `peak_persist_enabled` 是实盘部署开关, 已列入 `backtest._LIVE_ONLY_KEYS` 从回测映射剔除(否则实盘开关会静默改写回测基线)。
+
 **落地状态(2026-09-28, 批次0 全完成 / 批次1 已实现待切开关)**:
 - **观测层**: ①`strategy.py` 给入场/加仓/出场订单打 tag → `portfolio_trades.csv` 的 `entry_tag`/`exit_tag` 由**全空**变为 100% 覆盖(单标的实测 105/105); ②`live_report.py` 持仓表新增 `持仓最高收盘 / 最大浮盈 / 已回吐` + `⚠️ 曾浮盈≥2% 已转亏` 标记(实盘首日即标记出 5G通信ETF); ③`study_giveback.py` 入库(自带校准门槛: 完全一致率 ≥90% 且 Δ≤净收益 1%, 不过则拒绝出结论)。
 - **P0 修复**: `signal_engine.set_position(..., peak_price=)` 恢复跨日峰值 + `positions.json.peak_close` 台账(新开仓=均价/加仓不重置/卖出清除/除权 `split` 同步缩放)+ `daily_signal._persist_peaks` 回写 + `manage.py seed-peaks` 存量迁移(已执行, 备份 20260928_233230, 8 只持仓回填)。**开关 `peak_persist_enabled: false`(默认未切换)**, 影子对照 `peak_shadow_enabled: true` 每日写 `logs/peak_shadow.csv`; 测试 381 全绿(新增 `tests/test_peak_persist.py` 19 例, 含实盘逐日重建引擎 vs 回测单引擎的**卖出日等价性**与"不修复则滞后"的缺陷回归)。

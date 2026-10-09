@@ -26,10 +26,12 @@ import manage
 import portfolio
 from signal_engine import SignalEngine
 
-# 只保留"峰值回撤止盈"一条规则, 隔离其它规则对结论的干扰
+# 只保留"峰值回撤止盈"一条规则, 隔离其它规则对结论的干扰。
+# stop_loss_pct 取生产值 0.05(注意: 设 0.0 不是"关闭", 而是"任何亏损都触发止损",
+# 会在 -5% 以内抢先于峰值规则出场, 掩盖要测的行为)
 ONLY_TRAIL = dict(
     trailing_stop_pct=0.04,
-    stop_loss_pct=0.0,
+    stop_loss_pct=0.05,
     use_price_signal=False,
     use_velocity_signal=False,
     trend_filter_enabled=False,
@@ -279,3 +281,72 @@ class TestShadowLog:
         assert daily_signal._persist_peak_shadow(
             [{"symbol": "000001", "shares": 100}], "2026-09-28") == 0
         assert not os.path.exists(os.path.join(self.tmp.name, "peak_shadow.csv"))
+
+
+class TestPeakPersistFlag:
+    """peak_persist_enabled(2026-10-09): 回测侧复现实盘"修复前"语义的开关。
+
+    True (默认) = 峰值跨 bar 累积(真移动止盈, 回测原有基线语义)
+    False       = 每 bar 重置为 max(入场价, 当日收盘) → 等价实盘每天重建引擎,
+                  使"峰值回撤止盈"退化为"-4% 成本止损"
+    """
+
+    def test_flag_off_degrades_to_cost_stop(self):
+        """关闭后: 曾涨到 130 也只在跌破成本 -4% 时卖出(浮盈不保护)。"""
+        e = SignalEngine(**ONLY_TRAIL, peak_persist_enabled=False)
+        assert e.peak_persist_enabled is False
+        e.set_position(True, 100.0)
+        for c in (110.0, 120.0, 130.0):
+            r = e.update(c, c, c)
+            assert r["signal"] == "hold"          # 新高不触发
+        r = e.update(124.0, 124.0, 124.0)
+        assert r["signal"] == "hold"              # 从 130 回撤 4.6% 也不卖
+        r = e.update(95.5, 95.5, 95.5)
+        assert r["signal"] == "sell"              # 只有跌破 100×0.96 才卖
+        assert "峰值回撤止盈" in r["reason"]
+
+    def test_flag_on_protects_peak(self):
+        """默认(开启)保持真移动止盈: 130 回撤 4% 即锁定浮盈。"""
+        e = SignalEngine(**ONLY_TRAIL)
+        assert e.peak_persist_enabled is True
+        e.set_position(True, 100.0)
+        for c in (110.0, 120.0, 130.0):
+            e.update(c, c, c)
+        r = e.update(124.0, 124.0, 124.0)
+        assert r["signal"] == "sell"
+        assert "峰值回撤止盈" in r["reason"]
+
+    def test_live_semantics_equivalence(self):
+        """关掉开关的单引擎(回测) == 实盘逐日重建引擎(不恢复峰值); 且开启时更早锁盈。"""
+        # 路径: 涨到 130 → 回撤到 124 → 跌回成本下方 95(跨过 -4% 成本止损线)
+        path = [100.0] * 5 + [110.0, 120.0, 130.0, 128.0, 124.0, 100.0, 95.0, 92.0]
+
+        def first_sell(engine_factory, restore_peak):
+            for i, c in enumerate(path):
+                e = engine_factory()
+                e.set_position(True, 100.0, peak_price=(None if not restore_peak else None))
+                if e.update(c, c, c)["signal"] == "sell":
+                    return i
+            return None
+
+        # 关闭开关(单引擎, 峰值每 bar 重置) —— 等价实盘修复前
+        off = SignalEngine(**ONLY_TRAIL, peak_persist_enabled=False)
+        off.set_position(True, 100.0)
+        bt_off = next((i for i, c in enumerate(path)
+                       if off.update(c, c, c)["signal"] == "sell"), None)
+        # 实盘逐日重建(不恢复峰值) —— 应与上面同日卖出
+        live_off = None
+        for i, c in enumerate(path):
+            e = SignalEngine(**ONLY_TRAIL)
+            e.set_position(True, 100.0)
+            if e.update(c, c, c)["signal"] == "sell":
+                live_off = i
+                break
+        # 开启开关(单引擎, 峰值跨 bar 累积) —— 应从峰值 130 回撤 4% 时提前锁盈
+        on = SignalEngine(**ONLY_TRAIL)
+        on.set_position(True, 100.0)
+        bt_on = next((i for i, c in enumerate(path)
+                      if on.update(c, c, c)["signal"] == "sell"), None)
+
+        assert bt_off is not None and bt_off == live_off, "关闭语义必须与实盘逐日重建一致"
+        assert bt_on is not None and bt_on < bt_off, "开启后应更早出场(保护浮盈)"

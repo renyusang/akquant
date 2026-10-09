@@ -137,6 +137,9 @@ class KalmanStrategy(Strategy):
     mfi_period = IntParam(14, ge=5, le=30, title="MFI周期")
     trailing_stop_pct = FloatParam(
         0.0, ge=0.0, le=0.5, title="峰值回撤止盈(持仓峰值回撤≥该比例卖出, 0=禁用)")
+    peak_persist_enabled = BoolParam(
+        True, title="峰值跨bar累积(True=真移动止盈; False=复现实盘修复前语义"
+                    "——峰值每bar重置为max(成本,收盘), 即 -4% 成本止损)")
     target_profit_pct = FloatParam(
         0.0, ge=0.0, le=1.0, title="固定目标利润止盈(盈利≥该比例卖出, 0=禁用)")
     max_hold_bars = IntParam(
@@ -214,6 +217,7 @@ class KalmanStrategy(Strategy):
         self.mfi_overbought = float(p("mfi_overbought"))
         self.mfi_period = max(5, int(p("mfi_period")))
         self.trailing_stop_pct = float(p("trailing_stop_pct"))
+        self.peak_persist_enabled = bool(p("peak_persist_enabled"))
         self.target_profit_pct = float(p("target_profit_pct"))
         self.max_hold_bars = max(0, int(p("max_hold_bars")))
         self.ma_exit_enabled = bool(p("ma_exit_enabled"))
@@ -296,6 +300,7 @@ class KalmanStrategy(Strategy):
                 mfi_overbought=self.mfi_overbought,
                 mfi_period=self.mfi_period,
                 trailing_stop_pct=self.trailing_stop_pct,
+                peak_persist_enabled=self.peak_persist_enabled,
                 target_profit_pct=self.target_profit_pct,
                 trailing_atr_factor=self.trailing_atr_factor,
                 adx_exit_enabled=self.adx_exit_enabled,
