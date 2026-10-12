@@ -240,19 +240,48 @@ ls -lt logs/
 
 ---
 
-## 组合回测
+## 回测
 
-对 `stocks.yaml` 的全部标的进行历史回测，验证策略有效性：
+**组合回测（当前入口 = `main.py --portfolio`）**：按 `stocks.yaml` 的完整 watchlist 与资金池配置，模拟 `daily_signal.py` 的 T+1 开盘价执行逻辑，股票池与 ETF 池各跑一次后合并权益与交易。
 
 ```bash
-# 默认参数
-python portfolio_backtest.py
+# 默认（读 stocks.yaml，2020-01-01 起，至回测当天）
+python main.py --portfolio
 
-# 指定时间和配置
-python portfolio_backtest.py --start 20230101 --end 20260724 --config stocks.yaml
+# 指定区间 + 跑完自动部署报告到服务器
+python main.py --portfolio --start 20200101 --end 20261231 --deploy
+
+# 换配置文件
+python main.py --portfolio --config other.yaml
 ```
 
-生成的 `portfolio_report.html` 包含权益曲线、月度热力图、年度 TOP5 等详细分析。详见 [kalman.md](kalman.md#组合回测)。
+产物：`report_portfolio.html`（组合汇总：权益曲线 / 回撤 / 月度热力图 / 年度 TOP5 / 交易明细）、
+`report_stock.html`、`report_etf.html`，以及 `portfolio_equity.csv` / `portfolio_trades.csv` / `portfolio_positions.csv`。
+
+**单标的回测 / 参数优化 / 组合级扫描**
+
+```bash
+python main.py --symbol 002594 [--start 20200101 --end 20251231]   # 单标的(出 kline/report/trades CSV)
+python main.py --symbol 002594 --backtest-only                     # 跳过绘图
+python main.py --symbol 002594 --walk-forward                      # 滚动窗口
+python main.py --symbol 002594 --use-best                          # 应用网格搜索结果
+python optimize.py --symbol 002594 [--full]                        # 单标的参数网格(grid_search_*.csv)
+python sweep_params.py --param <策略参数> --values v1,v2 \
+       --period is,oos,full --pool stock|etf                       # 组合级参数扫描(研究用)
+```
+
+> `sweep_params.py` 的 `--param` 要用**策略参数名**（如 `trailing_stop_pct`、`downtrend_entry_threshold`），
+> 不是 `stocks.yaml` 里的名字（两者不同名，写错会被静默忽略）；脚本自带"所有取值结果相同就报错"的自检。
+
+**三个必须知道的点**
+
+- 数据右端 = `.catalog` 末根 bar，`--end` 默认取**回测当天**；catalog **不会自动刷新**
+  （`load_cached_data` 只在缺失时下载），需手动全历史重下 —— 刷新脚本见 [kalman.md](kalman.md#组合回测)。
+  ⚠️ 全历史重下会按**当日 qfq 基准**重算复权，有除权的标的历史价格整体微调，刷新前后数字不完全可比。
+- ⚠️ **`portfolio_backtest.py` 是旧脚本**（自造循环、无手续费/涨停保护等），**不参与任何机制结论**，
+  仅留档可回滚；回测与参数研究一律用上面的入口。
+- 研究结论的采纳门槛（IS/OOS 同向、跨池复现、年度无单年依赖、夏普不恶化、非单调排除过拟合等）
+  与各参数的生产值依据见 [kalman.md](kalman.md#已修复问题)。
 
 ---
 
