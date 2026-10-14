@@ -373,12 +373,22 @@ def cmd_split(symbol: str, ratio: float) -> None:
     print(f"   提示: 现金分红不改变股数, 无需 split; 配股请用 adjust 手工调整")
 
 
-def cmd_seed_peaks(dry_run: bool = False) -> None:
-    """回填跨日峰值 `peak_close`(2026-09-28 一次性迁移)。
+# 数据缓存目录(与实盘共用; 2026-10-14 提为模块常量以便测试注入)
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 
-    背景: `peak_close` 是新字段, 存量持仓没有它 —— 若不回填, 修复上线首日
-    峰值仍从持仓成本起步, 历史高点丢失(高浮盈持仓得不到保护)。
-    取值 = max(该持仓 first_buy_date 以来缓存收盘价, 现有 peak_close, avg_cost)。
+
+def cmd_seed_peaks(dry_run: bool = False) -> None:
+    """回填/校准跨日峰值 `peak_close`(2026-09-28 引入, 2026-10-14 明确口径)。
+
+    `peak_close` 的语义 = **观测到的最高收盘**(只增不减, 不含成本锚点),
+    成本锚点由 `daily_signal` 在恢复时按 `max(avg_cost, peak_close)` 施加。
+    因此本命令取值 = **建仓成交日**以来的缓存最高收盘:
+    - ⚠️ `first_buy_date` 记的是**信号日**, 成交在其次一交易日(T+1);
+      故切片用**严格大于**信号日的 bar, 否则会把建仓前那根收盘算成观测高点
+      (赣锋案例: 信号 10-09 收 45.47、成交 10-12, 若按信号日切片会得到 45.47,
+       而真实观测高点只有 43.68);
+    - 有价格历史: 以历史最高收盘为准(可能**低于**存量里混入的成本锚点 → 需要下调);
+    - 无价格历史(缓存缺失): 保持存量值不变, 避免把合法高点抹成 0。
 
     用法:
       python manage.py seed-peaks --dry-run   # 先看
@@ -388,10 +398,10 @@ def cmd_seed_peaks(dry_run: bool = False) -> None:
     if not positions:
         print("无持仓")
         return
-    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+    cache_dir = CACHE_DIR
     changed: Dict[str, Dict[str, float]] = {}
     print(f"\n{'代码':<8}{'名称':<12}{'首买日':<12}{'成本':>9}{'历史最高收盘':>13}"
-          f"{'原峰值':>9}{'新峰值':>9}")
+          f"{'原峰值':>9}{'新峰值':>9}{'生效基准':>10}")
     for key, p in sorted(positions.items()):
         fb = str(p.get("first_buy_date") or "")[:10]
         cost = float(p.get("avg_cost") or 0.0)
@@ -403,26 +413,28 @@ def cmd_seed_peaks(dry_run: bool = False) -> None:
                 df = pd.read_parquet(fpath, columns=["date", "close"])
                 dates = pd.to_datetime(df["date"]).astype(str).str[:10]
                 closes = df["close"].astype(float)
-                sel = closes[dates >= fb] if fb else closes
+                # 严格大于信号日 = 从建仓成交那根 bar 起算(见 docstring)
+                sel = closes[dates > fb] if fb else closes
                 if len(sel):
                     hist_peak = float(sel.max())
             except Exception as e:
                 print(f"  ⚠️ {key} 缓存读取失败({e}), 跳过历史最高收盘")
-        new_peak = max(hist_peak, old_peak, cost)
+        new_peak = hist_peak if hist_peak > 0 else max(old_peak, cost)
+        effective = max(cost, new_peak)          # 引擎实际使用的止盈基准
         print(f"{key:<8}{str(p.get('name', ''))[:10]:<12}{fb:<12}{cost:>9.3f}"
-              f"{hist_peak:>13.3f}{old_peak:>9.3f}{new_peak:>9.3f}")
-        if new_peak > old_peak + 1e-9:
+              f"{hist_peak:>13.3f}{old_peak:>9.3f}{new_peak:>9.3f}{effective:>10.3f}")
+        if abs(new_peak - old_peak) > 1e-9:
             changed[key] = {"old": old_peak, "new": new_peak}
     if not changed:
-        print("\n✅ 无需回填(所有持仓峰值已是最新)")
+        print("\n✅ 无需调整(所有持仓峰值已是最新观测高点)")
         return
     if dry_run:
-        print(f"\n[dry-run] 将更新 {len(changed)} 只持仓的 peak_close, 未写入")
+        print(f"\n[dry-run] 将调整 {len(changed)} 只持仓的 peak_close, 未写入")
         return
     for key, v in changed.items():
         positions[key]["peak_close"] = round(v["new"], 4)
     save_positions(positions)
-    print(f"\n✅ 已回填 {len(changed)} 只持仓的 peak_close(峰值迁移完成)")
+    print(f"\n✅ 已校准 {len(changed)} 只持仓的 peak_close")
 
 
 def cmd_restore(symbol: str) -> None:

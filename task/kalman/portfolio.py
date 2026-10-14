@@ -68,8 +68,11 @@ def load_positions() -> Dict[str, Dict[str, Any]]:
     """加载当前持仓。
 
     返回 {symbol: {name, shares, avg_cost, first_buy_date, peak_close}} 字典。
-    `peak_close`(2026-09-28 新增): 持仓期内最高收盘价, 供 SignalEngine 跨日恢复
-    "峰值回撤止盈"基准(缺失时由调用方回退为 avg_cost), 见 plan_profit_protection.md §3。
+    `peak_close`(2026-09-28 新增, 2026-10-14 明确口径): **持仓期内观测到的最高收盘价**
+    —— 只记录真实出现过的高点, 只增不减, **不掺入成本锚点**; 加仓也不重算。
+    成本锚点在**使用时**按当时加权成本取: 引擎恢复值 = `max(avg_cost, peak_close)`,
+    因此加仓后止盈基准自动随加权成本调整, 而真实涨出来的高点不会被抹掉
+    (见 plan_profit_protection.md §3.4-1)。
     损坏时告警并提示从备份恢复(不静默丢失)。
     """
     if not os.path.exists(POSITIONS_FILE):
@@ -108,15 +111,15 @@ def add_position(
         old = positions[key]
         total_cost = old["shares"] * old["avg_cost"] + shares * avg_cost
         total_shares = old["shares"] + shares
-        # 峰值跨日保留(2026-09-28): 加仓**不重置**峰值 —— 与回测一致
-        # (`signal_engine.set_position` 仅在 0→1 开仓时重置); 旧文件缺字段时回退均价
-        peak = old.get("peak_close") or old["avg_cost"]
+        # 峰值只记"观测到的最高收盘"(2026-10-14): 加仓**既不重置也不重算** ——
+        # 成本锚点在引擎恢复时按 `max(avg_cost, peak_close)` 施加, 故加仓后基准
+        # 自动随加权成本调整, 而真实高点不被抹掉。
         positions[key] = {
             "name": name,
             "shares": total_shares,
             "avg_cost": round(total_cost / total_shares, 3),
             "first_buy_date": old["first_buy_date"],
-            "peak_close": round(float(peak), 4),
+            "peak_close": round(float(old.get("peak_close") or 0.0), 4),
         }
     else:
         positions[key] = {
@@ -124,10 +127,21 @@ def add_position(
             "shares": shares,
             "avg_cost": avg_cost,
             "first_buy_date": buy_date,
-            # 新开仓: 峰值初值 = 成交均价(含费), 等价回测的"峰值初值 = 入场价"
-            "peak_close": round(float(avg_cost), 4),
+            # 新开仓: 尚无观测高点(0.0) —— 当日收盘由 daily_signal 的峰值台账回写,
+            # 而"从未涨过成本"时由恢复端的 max(avg_cost, ...) 兜底 = -4% 成本止损
+            "peak_close": 0.0,
         }
     save_positions(positions)
+
+
+def effective_peak(avg_cost: float, peak_close: float) -> float:
+    """止盈基准 = max(当日加权成本, 观测到的最高收盘)。
+
+    2026-10-14 明确: `peak_close` 只存**观测高点**(不掺成本锚点), 成本锚点在使用时
+    施加 —— 于是加仓后基准自动随加权成本调整, 而真实涨出来的高点不会被抹掉。
+    "从未涨过成本"时结果为均价 → 规则等价 -4% 成本止损(与修复前实盘一致)。
+    """
+    return max(float(avg_cost or 0.0), float(peak_close or 0.0))
 
 
 def update_peak(symbol: str, peak: float) -> None:

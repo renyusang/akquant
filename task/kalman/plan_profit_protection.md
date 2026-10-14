@@ -197,8 +197,8 @@ OOS `1,000,300 → 1,084,700`(**+¥84,400 / +21.1pp**); full `1,180,500 → 1,33
 
 ### 3.4 次要分歧(同批对齐, 但影响小)
 
-1. **入场价基准**: 回测用**信号 bar 收盘**(`strategy.py:695`, `:570` 加仓), 实盘用 **`avg_cost`(含费加权)** → 阈值有 ~0.1~0.3% 系统偏差。
-2. **加仓时峰值是否重置**: 回测只在 0→1 开仓时重置(加仓不重置, 正确); 实盘每日重置(错误)。
+1. **入场价基准(2026-10-14 部分收敛)**: 台账已明确为"只记**观测高点**", 成本锚点在恢复时按 `max(当日加权成本, 观测高点)` 施加(`portfolio.effective_peak`) → **加仓后实盘基准随加权成本走**; 回测侧仍用**信号 bar 收盘**(`strategy.py:695`, `:570` 加仓)作初值 → 二者在"加仓后"或"费/滑点"量级上有差(赣锋案例约 1.2%)。**残余分歧已记档, 未动回测以免重基线化。**
+2. **加仓时峰值是否重置**: 回测只在 0→1 开仓时重置(加仓不重置 ✓); 台账同口径(加仓不重算观测高点) ✓ 两侧一致。
 3. 已知未对齐项(不在本计划范围, 见 `kalman.md` 9-17 条目): 预热语义、无复利资金语义、补仓、涨跌停近似、排序量纲。
 
 ### 3.5 修复实现与部署状态(批次1, 2026-09-28 已实现, 开关默认**关**)
@@ -206,7 +206,8 @@ OOS `1,000,300 → 1,084,700`(**+¥84,400 / +21.1pp**); full `1,180,500 → 1,33
 | 环节 | 实现 | 位置 |
 |---|---|---|
 | 引擎恢复峰值 | `set_position(has_position, entry_price, peak_price=None)` + `peak_price` 属性 | `signal_engine.py` |
-| 峰值台账 | `positions.json` 每持仓新增 `peak_close`(新开仓 = 均价; **加仓不重置**; 删除随 `remove_position`; 除权 `split` 同步缩放) | `portfolio.py`, `manage.py` |
+| 峰值台账 | `positions.json` 每持仓 `peak_close` = **观测到的最高收盘**(只增不减; 新开仓 = 0.0; 加仓不重算; 删除随 `remove_position`; 除权 `split` 同步缩放) | `portfolio.py`, `manage.py` |
+| 成本锚点 | **使用时施加**: `effective_peak(avg_cost, peak_close) = max(当日加权成本, 观测高点)` → 加仓后基准自动随加权成本调整, 真实高点不被抹掉(2026-10-14 决策) | `portfolio.py`, `daily_signal.py` |
 | 实盘接线 | `evaluate_stock` 读台账 → 恢复; 评估后 `_persist_peaks` 回写(`max(峰值, 今日收盘)`, 只增不减) | `daily_signal.py` |
 | 存量迁移 | `python manage.py seed-peaks`(取 `first_buy_date` 以来缓存最高收盘; 自动备份; 幂等) | `manage.py` |
 | **开关** | `stocks.yaml`: `peak_persist_enabled: false`(**未切换**), `peak_shadow_enabled: true` | `stocks.yaml` |

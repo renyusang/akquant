@@ -35,6 +35,7 @@ from orders import add_pending_order, execute_pending_orders
 from portfolio import (
     add_position,
     calc_fee,
+    effective_peak,
     get_position,
     has_position,
     load_positions,
@@ -244,10 +245,14 @@ def evaluate_stock(
     has_pos = pos_info is not None
     shares = pos_info["shares"] if pos_info else 0
     avg_price = pos_info["avg_cost"] if pos_info else 0.0
-    # 跨日峰值(2026-09-28): 引擎每天重建, 不回填则峰值被重置为持仓成本,
-    # "峰值回撤止盈"退化为"-4% 成本止损"(见 plan_profit_protection.md §3)。
-    # 旧持仓文件无该字段时回退均价(保持原行为)。
-    peak_prev = float(pos_info.get("peak_close") or avg_price) if pos_info else 0.0
+    # 跨日峰值(2026-09-28 引入, 2026-10-14 明确口径):
+    #   peak_obs = 台账里**观测到的最高收盘**(只增不减, 已剔除成本锚点)
+    #   peak_prev = 生效基准 = max(当日加权成本, peak_obs)
+    #     —— 成本锚点在使用时施加, 故加仓后自动随加权成本调整, 真实高点不受影响;
+    #        "从未涨过成本"时 = 均价 → 规则等价 -4% 成本止损(与修复前实盘一致)。
+    # 引擎每天重建, 不回填则峰值被重置为持仓成本(见 plan_profit_protection.md §3)。
+    peak_obs = float(pos_info.get("peak_close") or 0.0) if pos_info else 0.0
+    peak_prev = effective_peak(avg_price, peak_obs) if pos_info else 0.0
 
     # 3. 创建引擎并预热
     engine = SignalEngine(**params)
@@ -275,9 +280,9 @@ def evaluate_stock(
     result["date"] = str(last.get("date", ""))[:10]
     result["shares"] = shares
     result["kalman_price"] = engine.filtered_price
-    # 跨日峰值台账(2026-09-28): 定义 = 持仓期内最高收盘, 与引擎开关无关地维护,
-    # 由 _persist_peaks 回写。独立于引擎计算, 避免开关关闭时把"当日收盘"误当峰值。
-    result["peak_price"] = max(peak_prev, close) if has_pos else 0.0
+    # 跨日峰值台账(2026-09-28): 只记**观测到的最高收盘**(不含成本锚点),
+    # 由 _persist_peaks 回写; 独立于引擎计算, 避免开关关闭时把"当日收盘"误当峰值。
+    result["peak_price"] = max(peak_obs, close) if has_pos else 0.0
     # 影子对照(2026-09-28): 峰值语义修复后, 今天是否会提前卖出?
     if peak_shadow and has_pos and not result.get("error"):
         result["_shadow"] = _peak_shadow(peak_prev, avg_price, close, result, params)

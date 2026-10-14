@@ -133,27 +133,58 @@ class TestPortfolioPeakLedger:
         yield
         self.tmp.cleanup()
 
-    def test_new_position_peak_equals_cost(self):
-        """新开仓: 峰值初值 = 成交均价(等价回测"峰值初值 = 入场价")。"""
-        portfolio.add_position("000001", "测试", 100, 10.0)
-        assert portfolio.load_positions()["000001"]["peak_close"] == 10.0
+    def test_new_position_has_no_observed_peak(self):
+        """新开仓: 尚无观测高点(0.0) —— 当日收盘由台账回写;
 
-    def test_add_preserves_peak(self):
-        """加仓**不重置**峰值(与回测一致: 仅 0→1 开仓时重置)。"""
+        成本锚点在使用时施加(portfolio.effective_peak), 故"从未涨过成本"时
+        等价 -4% 成本止损(与修复前实盘一致)。
+        """
+        portfolio.add_position("000001", "测试", 100, 10.0)
+        p = portfolio.load_positions()["000001"]
+        assert p["peak_close"] == 0.0
+        assert portfolio.effective_peak(p["avg_cost"], p["peak_close"]) == 10.0
+
+    def test_add_keeps_observed_peak(self):
+        """加仓**不重算**观测高点, 且真实高点不会被抹掉(核心保护属性)。"""
         portfolio.add_position("000001", "测试", 100, 10.0)
         portfolio.update_peak("000001", 13.5)
         portfolio.add_position("000001", "测试", 100, 12.0)
         p = portfolio.load_positions()["000001"]
         assert p["peak_close"] == pytest.approx(13.5)
         assert p["shares"] == 200
+        assert portfolio.effective_peak(p["avg_cost"], p["peak_close"]) == pytest.approx(13.5)
 
-    def test_legacy_position_without_peak_migrates_on_add(self):
-        """旧文件无 peak_close: 加仓时以旧均价回退, 不报错也不丢字段。"""
+    def test_effective_peak_follows_weighted_cost(self):
+        """2026-10-14 决策: 加仓后生效基准随**加权成本**调整。
+
+        低位加仓(10→6, 均价 8)且从未涨过成本时, 基准 = 8(而非旧成本 10):
+        止盈线随之下移, 等价"-4% 当前成本止损"。
+        """
+        portfolio.add_position("000001", "测试", 100, 10.0)
+        portfolio.add_position("000001", "测试", 100, 6.0)
+        p = portfolio.load_positions()["000001"]
+        assert p["avg_cost"] == pytest.approx(8.0)
+        assert p["peak_close"] == 0.0                       # 无观测高点
+        assert portfolio.effective_peak(p["avg_cost"], p["peak_close"]) == pytest.approx(8.0)
+
+    def test_effective_peak_high_water_not_lowered_by_add(self):
+        """已涨出来的高点(13.5)不因低位加仓而降低 —— 与上一条互补的护栏。"""
+        portfolio.add_position("000001", "测试", 100, 10.0)
+        portfolio.update_peak("000001", 13.5)
+        portfolio.add_position("000001", "测试", 300, 6.0)   # 均价降至 7.0
+        p = portfolio.load_positions()["000001"]
+        assert p["avg_cost"] == pytest.approx(7.0)
+        assert portfolio.effective_peak(p["avg_cost"], p["peak_close"]) == pytest.approx(13.5)
+
+    def test_legacy_position_without_peak_is_safe_on_add(self):
+        """旧文件无 peak_close: 加仓不报错, 字段落为 0.0(无观测高点), 基准=均价。"""
         portfolio.save_positions({"000001": {
             "name": "测试", "shares": 100, "avg_cost": 10.0,
             "first_buy_date": "2026-01-01"}})
         portfolio.add_position("000001", "测试", 100, 12.0)
-        assert portfolio.load_positions()["000001"]["peak_close"] > 0
+        p = portfolio.load_positions()["000001"]
+        assert p["peak_close"] == 0.0
+        assert portfolio.effective_peak(p["avg_cost"], p["peak_close"]) == pytest.approx(11.0)
 
     def test_update_peaks_only_increases_and_skips_nonholdings(self):
         """批量回写: 只增不减; 无持仓的标的被跳过。"""
@@ -174,7 +205,7 @@ class TestPortfolioPeakLedger:
     def test_split_scales_peak(self, monkeypatch):
         """除权(送转)后峰值必须同比例缩放, 否则会误判为深度回撤而立刻卖出。"""
         portfolio.add_position("000001", "测试", 100, 10.0)
-        portfolio.update_peak("000001", 16.0)
+        portfolio.update_peak("000001", 16.0)          # 观测高点
         manage.cmd_split("000001", 2.0)                # 股价减半
         p = portfolio.load_positions()["000001"]
         assert p["avg_cost"] == pytest.approx(5.0)
@@ -350,3 +381,63 @@ class TestPeakPersistFlag:
 
         assert bt_off is not None and bt_off == live_off, "关闭语义必须与实盘逐日重建一致"
         assert bt_on is not None and bt_on < bt_off, "开启后应更早出场(保护浮盈)"
+
+
+class TestSeedPeaksSlice:
+    """seed-peaks 的切片规则(2026-10-14 修复)。
+
+    `first_buy_date` 记的是**信号日**, 成交在其**次一交易日** —— 按信号日切片会把
+    建仓前那根收盘算成观测高点(赣锋案例: 信号 10-09 收 45.47, 成交 10-12,
+    真实观测高点只有 43.68)。故必须严格大于信号日。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _tmp(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(portfolio, "POSITIONS_FILE",
+                            str(tmp_path / "positions.json"))
+        cache = tmp_path / ".cache"
+        cache.mkdir()
+        monkeypatch.setattr(manage, "CACHE_DIR", str(cache))
+        self.cache = cache
+        yield
+
+    def _write_cache(self, sym: str, rows) -> None:
+        pd.DataFrame(rows, columns=["date", "close"]).to_parquet(
+            self.cache / f"{sym}.parquet", index=False)
+
+    def test_signal_day_close_excluded(self):
+        """信号日收盘(12.0)不得计入观测高点; 只取成交日及之后(11.0)。"""
+        portfolio.add_position("000001", "测试", 100, 10.0, buy_date="2026-01-05")
+        self._write_cache("000001", [
+            ("2026-01-05", 12.0),   # 信号日(建仓前) —— 必须排除
+            ("2026-01-06", 11.0),   # 成交日
+            ("2026-01-07", 10.5),
+        ])
+        manage.cmd_seed_peaks()
+        p = portfolio.load_positions()["000001"]
+        assert p["peak_close"] == pytest.approx(11.0)
+
+    def test_observed_high_lowers_stale_cost_anchor(self):
+        """存量里混入的成本锚点(12.0)会被真实观测高点(11.0)替换。"""
+        portfolio.save_positions({"000001": {
+            "name": "测试", "shares": 100, "avg_cost": 10.0,
+            "first_buy_date": "2026-01-05", "peak_close": 12.0}})
+        self._write_cache("000001", [
+            ("2026-01-05", 12.0), ("2026-01-06", 11.0), ("2026-01-07", 10.5)])
+        manage.cmd_seed_peaks()
+        assert portfolio.load_positions()["000001"]["peak_close"] == pytest.approx(11.0)
+
+    def test_missing_cache_keeps_existing_value(self):
+        """无价格历史(缓存缺失)时保持存量, 不把合法高点抹成 0。"""
+        portfolio.save_positions({"000001": {
+            "name": "测试", "shares": 100, "avg_cost": 10.0,
+            "first_buy_date": "2026-01-05", "peak_close": 13.0}})
+        manage.cmd_seed_peaks()
+        assert portfolio.load_positions()["000001"]["peak_close"] == pytest.approx(13.0)
+
+    def test_dry_run_does_not_write(self):
+        """--dry-run 只打印。"""
+        portfolio.add_position("000001", "测试", 100, 10.0, buy_date="2026-01-05")
+        self._write_cache("000001", [("2026-01-06", 11.0)])
+        manage.cmd_seed_peaks(dry_run=True)
+        assert portfolio.load_positions()["000001"]["peak_close"] == 0.0
