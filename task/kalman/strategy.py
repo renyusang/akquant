@@ -192,6 +192,11 @@ class KalmanStrategy(Strategy):
         self.prime_enabled = bool(p("prime_enabled"))
         # 窗口前历史 {symbol: DataFrame}, 回测层加载传入(实盘语义: 有历史才评估)
         self.prime_data = dict(kwargs.get("prime_data") or {})
+        # 按日期切换候选池(2026-10-20): {date_str: [symbols]}。只限制"新建仓",
+        # 已持仓标的继续正常管理(加仓/卖出), 解决换池时被迫清仓的问题。
+        self.pool_schedule = {str(k)[:10]: set(v)
+                              for k, v in (kwargs.get("pool_schedule") or {}).items()}
+        self._pool_dates = sorted(self.pool_schedule)
         self.initial_cash = float(p("initial_cash"))
         # 名额优先级(2026-09-17): ChoiceParam 不做运行时校验, 非法值显式回退
         _pm = str(p("priority_mode")).strip().lower()
@@ -410,6 +415,9 @@ class KalmanStrategy(Strategy):
 
         if pos == 0:
             if result["signal"] == "buy":
+                if not self._in_pool(symbol, self._local_date_str(bar.timestamp)):
+                    self.log(f"[不在候选池] {bar.timestamp_iso} {symbol} 跳过新建仓")
+                    return
                 # 大盘环境过滤(2026-08-14 研究): 弱市禁止新开仓,
                 # 持仓中的补仓/卖出不受影响
                 if self.market_filter_enabled:
@@ -653,6 +661,18 @@ class KalmanStrategy(Strategy):
         _ts = datetime.fromtimestamp(int(ts_ns) / 1e9, tz=timezone.utc)
         return (_ts + timedelta(hours=8)).strftime("%Y-%m-%d")
 
+    def _pool_for_date(self, date_str: str):
+        """返回该日期生效的候选池; 未配置/早于首个日期 → None(不限制)。"""
+        if not self._pool_dates:
+            return None
+        import bisect
+        i = bisect.bisect_right(self._pool_dates, date_str) - 1
+        return self.pool_schedule[self._pool_dates[i]] if i >= 0 else None
+
+    def _in_pool(self, symbol: str, date_str: str) -> bool:
+        pool = self._pool_for_date(date_str)
+        return True if pool is None else symbol in pool
+
     def _make_entry(self, close_price: float, target_pct: float,
                     result: Dict[str, Any], ts_iso: str) -> Dict[str, Any]:
         """构造候选记录(旧/新路径共用同一份捕获值)。
@@ -766,6 +786,8 @@ class KalmanStrategy(Strategy):
             self.log("[priority] 全部候选 trend=up(趋势过滤未启用?), "
                      "uptrend_first 退化为 deviation")
         for symbol in sorted(cands, key=lambda s: self._entry_sort_key(cands[s])):
+            if not self._in_pool(symbol, day_key[:10]):
+                continue
             if float(self.get_position(symbol)) > 0:
                 # 收盘单由引擎按当时持仓算 delta, 与 on_bar 时点不同 → 丢弃
                 self.log(f"[候选丢弃] {symbol} 收盘前已持仓, 跳过新建仓单")
