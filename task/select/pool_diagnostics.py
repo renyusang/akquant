@@ -21,7 +21,13 @@ import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KALMAN = os.path.join(HERE, "..", "kalman")
-CATALOG = os.path.join(KALMAN, ".catalog")
+CATALOG = os.path.join(HERE, ".catalog_pool")
+FALLBACK = os.path.join(KALMAN, ".catalog")
+
+
+def _path(sym):
+    p = os.path.join(CATALOG, sym, "data.parquet")
+    return p if os.path.exists(p) else os.path.join(FALLBACK, sym, "data.parquet")
 sys.path.insert(0, HERE)
 
 
@@ -49,6 +55,8 @@ def _panel(start="2025-07-01", end="2026-06-30", fwd_start="2026-07-01",
             pre = d.loc[start:end]
             fwd = d.loc[fwd_start:fwd_end]
             if len(pre) < 200 or len(fwd) < 20:
+                continue
+            if pd.Timestamp(fwd.index[-1]) < pd.Timestamp(fwd_end) - pd.Timedelta(days=3):
                 continue
             rows.append((sym, pre.iloc[-1] / pre.iloc[0] - 1,
                          np.diff(np.log(pre.values)).std() * np.sqrt(252),

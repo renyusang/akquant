@@ -3,3 +3,10 @@ adx_validation*.csv
 oscillation_signals.csv
 volume_signals.csv
 stocks_hs300_*.yaml
+
+# 候选池独立 catalog(2026-10-19, refresh_pool_catalog.py 可重建)
+.catalog_pool/
+
+# 生成物(脚本可重建)
+industry_map.csv
+pool_panel.parquet
