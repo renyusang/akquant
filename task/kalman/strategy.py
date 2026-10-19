@@ -536,8 +536,12 @@ class KalmanStrategy(Strategy):
                 # 最小持仓周期: 买入后 N 根内抑制价格回归/速度反转卖出,
                 # 仅止损可卖出(止损优先级最高,防止小回撤被洗出形成高频磨损)
                 if self.min_hold_bars > 0:
-                    held = self._bar_count - self._entry_bars.get(
-                        symbol, self._bar_count
+                    # 2026-10-19 修复: 原用全局 _bar_count —— 多标的轮转时
+                    # 一根 bar 会同时推进所有标的, 25 只池里 10 根≈0.4 个交易日,
+                    # 阈值永远不到(实测 min_hold 0/5/10 结果逐笔相同)。
+                    # 改为各标的自己的 bar 计数, 语义才是"买入后 N 根"。
+                    held = self._symbol_bars.get(symbol, 0) - self._entry_bars.get(
+                        symbol, self._symbol_bars.get(symbol, 0)
                     )
                     is_stop_loss = "止损" in str(result["reason"])
                     if held < self.min_hold_bars and not is_stop_loss:
@@ -709,7 +713,8 @@ class KalmanStrategy(Strategy):
             tag=f"入场:{str(entry.get('reason') or '')[:48]}",
         )
         self._entry_prices[symbol] = entry["close"]
-        self._entry_bars[symbol] = entry["bar_count"]
+        # 按标的自有 bar 计数记入场(与 min_hold 口径一致; _pending_buys 仍用全局)
+        self._entry_bars[symbol] = self._symbol_bars.get(symbol, 0)
         self._pending_buys[symbol] = (entry["close"], entry["bar_count"])
         self._opened_count += 1
         self._trade_count += 1
