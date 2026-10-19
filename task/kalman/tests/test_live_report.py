@@ -329,6 +329,11 @@ class TestBuildReportSmoke:
         assert "trades-table" in html
         assert "免责声明" in html
 
+        # 个股累计盈亏(2026-10-19): 章节 + 表格必须出现在报告里
+        assert "<h2>个股累计盈亏</h2>" in html
+        assert "pnl-table" in html
+        assert "000001" in html.split("<h2>个股累计盈亏</h2>", 1)[1][:2000]
+
     def test_empty_monthly_chart_no_box(self, monkeypatch, tmp_path):
         """无月度数据时 chart2 为空 → 不产生空 chart-box 容器(边界)。"""
         out = self._prepare(monkeypatch, tmp_path)
@@ -986,3 +991,92 @@ class TestGivebackKpi:
         assert "pos-table" in html
         assert "持仓最高收盘" in html
         assert "曾浮盈≥2% 已转亏" not in html
+
+
+class TestSymbolPnl:
+    """个股累计盈亏(2026-10-19): 已实现 + 浮动, 覆盖已清仓与在持标的。"""
+
+    @staticmethod
+    def _trades(rows):
+        return pd.DataFrame(rows, columns=[
+            "entry_date", "exit_date", "symbol", "name", "shares",
+            "entry_price", "exit_price", "pnl", "pnl_pct", "fee"])
+
+    def test_realized_and_floating_combine(self):
+        trades = self._trades([
+            ["2026-07-01", "2026-07-10", "600001", "甲", 100, 9, 10, 100, 10, 5],
+            ["2026-07-11", "2026-07-20", "600001", "甲", 100, 10, 9.5, -50, -5, 5],
+            ["2026-07-01", "2026-07-10", "600002", "乙", 100, 9, 9.3, 30, 3, 5],
+        ])
+        positions = {"600001": {"name": "甲", "shares": 100, "avg_cost": 10.0}}
+        html = live_report._symbol_pnl_table(
+            trades, positions, {"600001": 12.0}, {}, lambda s: False)
+
+        assert "共 2 只标的" in html
+        # 已实现 100-50+30=80; 浮动 (12-10)*100=200; 累计 280
+        assert "¥+80" in html and "¥+200" in html and "¥+280" in html
+        # 600001 平 2 笔 1 胜 → 50%
+        assert "50%" in html
+        # 按累计降序: 600001(250) 在 600002(30) 前
+        assert html.index("600001") < html.index("600002")
+
+    def test_held_symbol_without_trades(self):
+        positions = {"512800": {"name": "银行ETF", "shares": 22200,
+                                "avg_cost": 0.85}}
+        html = live_report._symbol_pnl_table(
+            self._trades([]), positions, {"512800": 0.877}, {}, lambda s: True)
+        assert "共 1 只标的" in html
+        assert "持仓中" in html
+        assert "已平笔数" in html
+        assert "—" in html                     # 无平仓 → 已实现/胜率占位
+        assert "¥+599" in html                 # (0.877-0.85)*22200 = 599.4
+        assert "ETF" in html
+
+    def test_closed_symbol_floating_placeholder(self):
+        trades = self._trades([
+            ["2026-07-01", "2026-07-10", "600002", "乙", 100, 9, 9.3, 30, 3, 5],
+        ])
+        html = live_report._symbol_pnl_table(
+            trades, {}, {}, {}, lambda s: False)
+        assert "已清仓" in html
+        assert "¥+30" in html
+        # 该行浮动列占位(—), 不显示 +0; 汇总行仍保留"浮动 ¥+0"口径
+        row = html.split("600002", 1)[1].split("</tr>", 1)[0]
+        assert "—" in row
+        assert "¥+0" not in row
+
+    def test_symbol_zero_fill_merges(self):
+        """trades 里 2594 与 positions 里 002594 必须合并为一行。"""
+        trades = self._trades([
+            ["2026-07-01", "2026-07-10", "2594", "比亚迪", 100, 9, 10, 100, 10, 5],
+        ])
+        positions = {"002594": {"name": "比亚迪", "shares": 100, "avg_cost": 10.0}}
+        html = live_report._symbol_pnl_table(
+            trades, positions, {"002594": 11.0}, {}, lambda s: False)
+        assert "共 1 只标的" in html
+        assert "持仓中" in html
+        assert "¥+200" in html                 # 已实现 100 + 浮动 100
+
+    def test_empty_placeholder(self):
+        html = live_report._symbol_pnl_table(
+            self._trades([]), {}, {}, {}, lambda s: False)
+        assert "暂无交易记录" in html
+
+    def test_totals_match_core_metrics(self):
+        """合计恒等式: Σ已实现 + Σ浮动 = 核心指标总盈亏。"""
+        trades = self._trades([
+            ["2026-07-01", "2026-07-10", "600001", "甲", 100, 9, 10, 100, 10, 5],
+            ["2026-07-01", "2026-07-10", "600003", "丙", 100, 9, 8, -100, -11, 5],
+        ])
+        positions = {"600001": {"name": "甲", "shares": 100, "avg_cost": 10.0},
+                     "512800": {"name": "银行ETF", "shares": 1000, "avg_cost": 0.8}}
+        price_map = {"600001": 12.0, "512800": 0.9}
+        html = live_report._symbol_pnl_table(
+            trades, positions, price_map, {}, lambda s: s.startswith("51"))
+
+        realized = float(trades["pnl"].sum())                       # 0
+        floating = (12.0 - 10.0) * 100 + (0.9 - 0.8) * 1000        # 300
+        assert f"¥{realized:+,.0f}" in html
+        assert f"¥{floating:+,.0f}" in html
+        assert f"¥{realized + floating:+,.0f}" in html
+        assert "共 3 只标的" in html

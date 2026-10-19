@@ -319,6 +319,9 @@ def build_live_report():
 
     pos_stock_html = _positions_table(stock_pos, name_map, "股票", stock_cash)
     pos_etf_html = _positions_table(etf_pos, name_map, "ETF", etf_cash)
+    # 个股累计盈亏(2026-10-19): 已实现 + 浮动, 覆盖已清仓与在持标的
+    symbol_pnl_html = _symbol_pnl_table(trades, positions, price_map,
+                                        name_map, is_etf)
     trades_html = _trades_table(trades, name_map)
     details_html = _trade_details(buys_log, trades, name_map)
     monthly_table = _monthly_heatmap(eq, trades, initial_cash,
@@ -393,6 +396,7 @@ def build_live_report():
 <details open><summary><h2>当前持仓</h2></summary>
 <div class='col2'><div><h3>股票</h3>{pos_stock_html}</div><div><h3>ETF</h3>{pos_etf_html}</div></div>
 {f'<h4>📰 持仓消息面</h4>{pos_news_html}' if pos_news_html else ''}</details>
+<details open><summary><h2>个股累计盈亏</h2></summary>{symbol_pnl_html}</details>
 <details open><summary><h2>待执行订单</h2></summary>{pending_html}</details>
 <details open><summary><h2>已完成交易</h2></summary>
 <div class='vscroll'>{trades_html}</div></details>
@@ -730,6 +734,91 @@ def _positions_table(pos_list, name_map, label, pool_cash):
             for n, f in zip(df["name"], df["giveback_flag"])
         ]
     table = disp.to_html(index=False, classes="data-table pos-table", border=0, justify="center", escape=False)
+    return summary + _wrap_table(table)
+
+
+def _symbol_pnl_table(trades, positions, price_map, name_map, is_etf):
+    """个股累计盈亏(2026-10-19): 已实现 + 浮动, 覆盖已清仓与在持标的。
+
+    口径:
+    - 已实现 = trades.csv 的 pnl 求和(已扣卖出费; 买入费含在成本中)
+    - 浮动   = (最新价 - 成本) × 当前股数(已清仓为 0)
+    - 累计   = 已实现 + 浮动 → 全部标的的合计恒等于核心指标"总盈亏"
+      (即 realized_pnl + pos_pnl), 可作为报告内部对账口径。
+    """
+    rows = {}
+    if trades is not None and len(trades) > 0:
+        for sym, g in trades.groupby("symbol", sort=False):
+            code = str(sym).zfill(6)
+            rows[code] = {
+                "code": code,
+                "name": str(g["name"].iloc[-1]) if "name" in g.columns else "",
+                "closed": int(len(g)),
+                "wins": int((g["pnl"].astype(float) > 0).sum()),
+                "realized": float(g["pnl"].astype(float).sum()),
+                "shares": 0.0,
+                "floating": 0.0,
+            }
+    for sym, p in (positions or {}).items():
+        code = str(sym).zfill(6)
+        rec = rows.get(code)
+        if rec is None:
+            rec = rows[code] = {"code": code, "name": "", "closed": 0,
+                                "wins": 0, "realized": 0.0,
+                                "shares": 0.0, "floating": 0.0}
+        rec["name"] = rec["name"] or str(p.get("name") or "")
+        shares = float(p.get("shares", 0) or 0)
+        cost = float(p.get("avg_cost", 0) or 0)
+        price = float(price_map.get(code, cost) or cost)
+        rec["shares"] = shares
+        rec["floating"] = (price - cost) * shares
+    if not rows:
+        return "<p>暂无交易记录</p>"
+
+    items = sorted(rows.values(),
+                   key=lambda r: (-(r["realized"] + r["floating"]), r["code"]))
+    for r in items:
+        r["name"] = r["name"] or name_map.get(r["code"], r["code"])
+        r["total"] = r["realized"] + r["floating"]
+        r["pool"] = "ETF" if is_etf(r["code"]) else "股票"
+
+    total_realized = sum(r["realized"] for r in items)
+    total_floating = sum(r["floating"] for r in items)
+    total = total_realized + total_floating
+    n_up = sum(1 for r in items if r["total"] > 0)
+    n_down = sum(1 for r in items if r["total"] < 0)
+    cls = lambda v: "positive" if v > 0 else "negative" if v < 0 else ""
+
+    def _money(v, applicable=True):
+        if not applicable:
+            return "—"
+        return f"<span class='{cls(v)}'>{v:+,.0f}</span>"
+
+    disp = pd.DataFrame([{
+        "代码": r["code"],
+        "名称": r["name"],
+        "池": r["pool"],
+        "状态": "持仓中" if r["shares"] > 0 else "已清仓",
+        "已平笔数": str(r["closed"]) if r["closed"] else "—",
+        "胜率": (f"{r['wins'] / r['closed'] * 100:.0f}%"
+                 if r["closed"] else "—"),
+        "已实现盈亏": _money(r["realized"], r["closed"] > 0),
+        "浮动盈亏": _money(r["floating"], r["shares"] > 0),
+        "累计盈亏": _money(r["total"]),
+    } for r in items])
+
+    summary = (
+        f"<div class='summary-text'>共 {len(items)} 只标的 | "
+        f"累计盈利 {n_up} 只 / 累计亏损 {n_down} 只 | "
+        f"已实现 <span class='{cls(total_realized)}'>¥{total_realized:+,.0f}</span>"
+        f" + 浮动 <span class='{cls(total_floating)}'>¥{total_floating:+,.0f}</span>"
+        f" = 累计 <span class='{cls(total)}'><b>¥{total:+,.0f}</b></span></div>"
+        "<div style='color:#888;font-size:12px;margin:-4px 0 8px'>"
+        "已实现盈亏已扣卖出费(买入费含在成本中)；累计 = 已实现 + 浮动，"
+        "合计应等于核心指标「总盈亏」。</div>"
+    )
+    table = disp.to_html(index=False, classes="data-table pnl-table",
+                         border=0, justify="center", escape=False)
     return summary + _wrap_table(table)
 
 
