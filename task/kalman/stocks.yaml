@@ -51,7 +51,8 @@ strategy:
   # ---- 峰值语义修复(2026-09-28, 见 plan_profit_protection.md §3) ----
   # 现状缺陷: daily_signal 每天重建引擎, 峰值被重置为持仓成本 →
   # "峰值回撤止盈"退化为"-4% 成本止损", 完全不保护浮盈(回测口径下该规则价值股票池 +38.5pp)。
-  peak_persist_enabled: false   # 修复开关: true = 引擎恢复跨日峰值(修复后语义)
+  peak_persist_enabled: true   # 修复开关: true = 引擎恢复跨日峰值(修复后语义)
+                               # 2026-10-19 影子期 10 个交易日后切换(备份 stocks.yaml.bak_20261019)
                                 #   切换前应先跑影子期(logs/peak_shadow.csv)并执行一次
                                 #   `python manage.py seed-peaks`(回填存量持仓峰值)
   peak_shadow_enabled: true     # 影子对照: 只记录"新语义今日会不会提前卖出", 不影响下单

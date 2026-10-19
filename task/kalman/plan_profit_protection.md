@@ -292,7 +292,9 @@ OOS `1,000,300 → 1,084,700`(**+¥84,400 / +21.1pp**); full `1,180,500 → 1,33
 - ✅ `SignalEngine.set_position(..., peak_price=...)` 恢复入口 + `peak_price` 属性, `daily_signal.evaluate_stock` 调用;
 - ✅ 入场价基准: 峰值初值 = **成交均价**(实盘 `avg_cost` / 回测信号 bar 收盘仍略有差异, 见 §3.4-1, 未动回测以免重基线化);
 - ✅ 单测 19 例: 恢复/回退 / 加仓不重置 / 卖出后清除 / 除权缩放 / **实盘逐日重建引擎与回测单引擎卖出日等价**;
-- ⏳ **影子运行 ≥10 个交易日**(`logs/peak_shadow.csv` 已开始记录), 复核后再把 `peak_persist_enabled` 改为 `true`。
+- ✅ **影子期 10 个交易日复核完成(2026-10-19)**: 43 条持仓日、4 条"新语义会卖"、其中仅 1 条
+  `shadow_earlier=true`(光智 9-29), 反事实 +¥3,000(200 股×(265.00-250.00)); 无反向证据。
+  已切 `peak_persist_enabled: true`(备份 `stocks.yaml.bak_20261019`)。
 
 **P1 — 观测层(零风险, 让回吐变成可追踪 KPI)**
 - P1.1 **订单 tag 归因**: akquant 的 `buy/sell/close_position` 均支持 `tag=`
@@ -348,7 +350,7 @@ OOS `1,000,300 → 1,084,700`(**+¥84,400 / +21.1pp**); full `1,180,500 → 1,33
 | 批次 | 内容 | 产出/交付 | 完成判据 |
 |---|---|---|---|
 | **批次0**(本周) | ✅0.1 复核并更正 `kalman.md` 9-17 "trailing -0.7pp" 行(§3.3-5, 已加注"仅适用 dt3/trail5"); ✅0.2 P1.1 订单 tag + P1.2 报告 KPI; ✅0.3 P1.3 校准重放器入库(`study_giveback.py`); ✅0.4 P0 设计评审 | ✅全部落地 | ✅测试全绿(381 例); ✅重放器自校准 92.9%; ✅报告已含回吐列; ✅-0.7pp 行已定位并加注 |
-| **批次1** | ✅ 实现 P0(状态持久化 + 除权缩放 + 单测 + 等价性测试 + 存量迁移 + 影子开关) / ⏳ **影子运行 ≥10 个交易日** → 切 `peak_persist_enabled: true` | ✅ `positions.json.peak_close`、`signal_engine.set_position(peak_price=)`、`logs/peak_shadow.csv`、`manage.py seed-peaks` | ⏳ 影子期 `shadow_earlier=true` 每行可解释; ✅测试全绿 |
+| **批次1** | ✅ 实现 P0(状态持久化 + 除权缩放 + 单测 + 等价性测试 + 存量迁移 + 影子开关) / ✅ **影子期 10 日复核(2026-10-19) → 已切 `peak_persist_enabled: true`** | ✅ `positions.json.peak_close`、`signal_engine.set_position(peak_price=)`、`logs/peak_shadow.csv`、`manage.py seed-peaks` | ✅ 影子期 `shadow_earlier=true` 仅 1 行且可解释(光智 9-29); ✅测试全绿 |
 | **批次2** | P2.1 分批止盈 + P2.2 入场端候选的**组合回测**(IS/OOS × 双池 × 年度) | 研究报告章节 | 按 §6 全部门槛; 不过则归档为证伪 |
 | **批次3** | 采纳者落地(配置 + `stocks.yaml.bak_YYYYMMDD` 备份 + 测试计数 + 报告重生成部署) 或证伪归档 | `kalman.md` 条目 | 报告已部署; 文档回写完成 |
 

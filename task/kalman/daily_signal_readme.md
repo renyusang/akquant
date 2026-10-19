@@ -154,7 +154,7 @@ strategy:                     # 全局策略参数
   downtrend_entry: 0.04       # 下跌趋势入场偏离(批次2 采纳 3%→4%)
   mfi_filter_enabled: true
   priority_mode: deviation    # 名额优先级(与实盘同口径)
-  peak_persist_enabled: false # 峰值跨日持久化(实盘开关; 翻前先过影子期, 见研究计划)
+  peak_persist_enabled: true  # 峰值跨日持久化(2026-10-19 影子期 10 日后切换)
 
 stock:                        # 股票池
   initial_cash: 300000
