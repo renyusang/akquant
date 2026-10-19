@@ -10,3 +10,8 @@ stocks_hs300_*.yaml
 # 生成物(脚本可重建)
 industry_map.csv
 pool_panel.parquet
+
+# 池台账(运行时状态)
+pool_state.json
+pool_history.csv
+pool_kpi.csv

@@ -72,6 +72,15 @@ def load_industry():
     return out
 
 
+def load_quality_bad(date: str):
+    """质量因子不合格集合(可选; quality_panel.parquet 缺失时返回空)。"""
+    try:
+        import quality_filter
+        return quality_filter.bad_symbols(date)
+    except Exception:
+        return {}
+
+
 def load_red_lines():
     p = os.path.join(HERE, "risk_flags.csv")
     if not os.path.exists(p):
@@ -108,19 +117,24 @@ def features(date: str):
             continue
     df = pd.DataFrame(rows)
     ind = load_industry()
+    qbad = load_quality_bad(date)
+    df["quality_bad"] = [qbad.get(s) for s in df.symbol]
     df["theme"] = [ind.get(s, ("", ""))[0] for s in df.symbol]
     df["industry"] = [ind.get(s, ("", ""))[1] for s in df.symbol]
     _FEAT_CACHE[date] = df
     return df
 
 
-def build_pool(date: str, top: int = 40, reserve: int = 10, verbose=False):
+def build_pool(date: str, top: int = 40, reserve: int = 10, verbose=False,
+               quality: bool = False):
     """返回 (selected_df, reserve_df)。"""
     d = features(date)
     if d.empty:
         return d, d
     red = load_red_lines()
     d = d[~d.symbol.isin(red)].copy()
+    if quality and "quality_bad" in d.columns:
+        d = d[d.quality_bad.isna()].copy()
     d = d[d.amount20 >= MIN_AMOUNT]
     d = d[d.vol <= d.vol.quantile(VOL_PCT)]
     d["pct"] = d.ret12.rank(pct=True) * 100
@@ -201,8 +215,11 @@ def main():
     ap.add_argument("--top", type=int, default=40)
     ap.add_argument("--reserve", type=int, default=10)
     ap.add_argument("--out", default="")
+    ap.add_argument("--quality", action="store_true",
+                    help="启用质量排除(实测不提升收益, 默认关; 见方法论 §6.5)")
     args = ap.parse_args()
-    sel, rs = build_pool(args.date, args.top, args.reserve, verbose=True)
+    sel, rs = build_pool(args.date, args.top, args.reserve, verbose=True,
+                         quality=args.quality)
     if args.out:
         sel.to_csv(args.out, index=False, encoding="utf-8-sig")
         print(f"写入 {args.out}")
