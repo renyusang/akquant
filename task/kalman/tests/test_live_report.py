@@ -333,6 +333,10 @@ class TestBuildReportSmoke:
         assert "<h2>个股累计盈亏</h2>" in html
         assert "pnl-table" in html
         assert "000001" in html.split("<h2>个股累计盈亏</h2>", 1)[1][:2000]
+        # 章节顺序: 待执行订单 → 个股累计盈亏 → 已完成交易
+        assert (html.index("<h2>待执行订单</h2>")
+                < html.index("<h2>个股累计盈亏</h2>")
+                < html.index("<h2>已完成交易</h2>"))
 
     def test_empty_monthly_chart_no_box(self, monkeypatch, tmp_path):
         """无月度数据时 chart2 为空 → 不产生空 chart-box 容器(边界)。"""

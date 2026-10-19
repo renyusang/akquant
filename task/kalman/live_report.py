@@ -396,8 +396,8 @@ def build_live_report():
 <details open><summary><h2>当前持仓</h2></summary>
 <div class='col2'><div><h3>股票</h3>{pos_stock_html}</div><div><h3>ETF</h3>{pos_etf_html}</div></div>
 {f'<h4>📰 持仓消息面</h4>{pos_news_html}' if pos_news_html else ''}</details>
-<details open><summary><h2>个股累计盈亏</h2></summary>{symbol_pnl_html}</details>
 <details open><summary><h2>待执行订单</h2></summary>{pending_html}</details>
+<details open><summary><h2>个股累计盈亏</h2></summary>{symbol_pnl_html}</details>
 <details open><summary><h2>已完成交易</h2></summary>
 <div class='vscroll'>{trades_html}</div></details>
 <details open><summary><h2>交易明细</h2></summary>
