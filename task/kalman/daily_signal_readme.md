@@ -29,12 +29,14 @@ python manage.py show           # 查看持仓
   ├── 逐只扫描，生成买卖信号
   ├── 峰值台账回写（positions.json 的 peak_close）+ 影子对照（logs/peak_shadow.csv）
   ├── 消息面自动刷新（当日持仓/待买候选，写 score=0 / auto=True 的中性标题）
+  ├── 写出妙想复查清单 → logs/review_queue_<日期>.md（当日必须消化，见下节）
   ├── 买入信号 → pending_orders.json → 次日开盘成交
   ├── 卖出信号 → pending_orders.json → 次日开盘成交
   └── 输出持仓表 + 交易汇总 + 生成并部署报告
 
-收盘后（人工，建议紧接在运行之后）
-  └── 妙想复查 → 覆盖当晚的自动消息面记录 → 重新生成并部署报告
+收盘后（人工/助手，建议紧接在运行之后）
+  ├── 妙想复查：按清单逐只评分 → news_notes.json
+  └── 重新生成并部署报告（评分才会出现在页面上）
 ```
 
 **关键规则**：
@@ -82,14 +84,38 @@ python manage.py show           # 查看持仓
 
 **覆盖范围**：当日**持仓** + **次日待买入候选**（即最近一次运行涉及的标的），不是整个监控池。
 
+**清单与核验（2026-10-19 起，已接入例行运行）**
+
+例行运行结束时会写一份清单并在输出里打印待办：
+
+```
+⏳ 妙想复查待办: 2 只 (512800 银行ETF, 159928 消费ETF)
+   清单: logs/review_queue_2026-10-19.md  (须当日完成, 次日运行会覆盖评分)
+```
+
+清单含：代码/名称/股数/成本/收盘/浮亏、**自动抓取的新闻标题（底稿）**、以及每只的写入命令。
+json 边车 `logs/review_queue_<日期>.json` 记录当次范围与完成状态。
+
+```bash
+# 核验完成度（待复查 >0 时退出码 1，便于脚本/助手判断）
+python news_notes.py --status
+
+# 写入一条复查记录（score -2..2；date 自动取当天）
+python news_notes.py --set 512800 1 "10-19 **+1.50%**收0.877(浮盈+2.9%); ..."
+
+# 按当前持仓/待买重新生成清单
+python news_notes.py --queue
+```
+
 **推荐顺序**
 
 ```bash
-# 1) 例行运行（crontab 20:00 自动，或手动）
+# 1) 例行运行（crontab 20:00 自动，或手动）—— 会落清单并打印待办
 bash run_daily.sh
 
-# 2) 逐只妙想复查（对上述范围），写入 news_notes.json
-#    格式: {symbol: {"date": "<交易日>", "score": -2..2, "summary": "..."}}  ← 复查记录不带 auto 字段
+# 2) 按清单逐只复查：读 logs/review_queue_<日期>.md，用 --set 写入评分
+python news_notes.py --set <symbol> <score> "<summary>"
+python news_notes.py --status            # 待复查 0 只即完成
 
 # 3) 让评分出现在报告页面上（运行时的报告用的是自动记录，需重新生成 + 部署）
 python -c "from live_report import build_live_report; build_live_report()"

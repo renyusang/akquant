@@ -1021,19 +1021,53 @@ def main() -> None:
     # 消息面自动更新(2026-09-10): 持仓 + 待买入(含被跳过候选)
     # 人工/妙想记录(无 auto 标记)7 天内保留; 自动记录每日重抓
     try:
-        from news_notes import auto_update_notes
+        from news_notes import auto_update_notes, review_status, write_review_queue
         from orders import load_pending as _lp
         _watch_syms = list(load_positions().keys())
         _watch_syms += [o["symbol"] for o in _lp() if o.get("action") == "buy"]
         for r in results:
             if r.get("_skipped"):
                 _watch_syms.append(r["symbol"])
+        _watch_syms = list(dict.fromkeys(_watch_syms))
         _news_res = auto_update_notes(TASK_DIR, _watch_syms)
         if not args.quiet and (_news_res["updated"] or _news_res["failed"]):
             print(f"  📰 消息面: 更新 {len(_news_res['updated'])} 只, "
                   f"保留 {len(_news_res['kept'])} 只"
                   + (f", 失败 {len(_news_res['failed'])} 只"
                      if _news_res["failed"] else ""))
+
+        # 妙想复查清单(2026-10-19): 运行后落一份当日清单, 避免"该复查哪些标的"
+        # 只靠人记。评分只在当天有效(次日运行会重抓为中性标题), 故清单必须
+        # 当日消化; 完成度用 `python news_notes.py --status` 核验。
+        _pos_all = load_positions()
+        _rows: Dict[str, Any] = {}
+        for r in results:
+            sym = str(r.get("symbol") or "").zfill(6)
+            if sym not in _watch_syms:
+                continue
+            p = _pos_all.get(sym) or {}
+            close = float(r.get("close") or 0)
+            cost = float(p.get("avg_cost") or 0)
+            _rows[sym] = {
+                "name": r.get("name") or p.get("name") or "",
+                "shares": p.get("shares", 0),
+                "avg_cost": cost,
+                "close": close,
+                "pnl_pct": ((close / cost - 1) * 100
+                            if cost > 0 and close > 0 else None),
+            }
+        _queue_path = write_review_queue(TASK_DIR, _watch_syms, rows=_rows, today=today)
+        _rev = review_status(TASK_DIR, _watch_syms, today=today)
+        if not args.quiet:
+            if _rev["pending"]:
+                _pend_names = ", ".join(
+                    f"{s} {(_rows.get(s) or {}).get('name', '')}".strip()
+                    for s in _rev["pending"])
+                print(f"  ⏳ 妙想复查待办: {len(_rev['pending'])} 只 ({_pend_names})")
+                print(f"     清单: {os.path.relpath(_queue_path, TASK_DIR)}"
+                      "  (须当日完成, 次日运行会覆盖评分)")
+            else:
+                print(f"  ✅ 妙想复查: 已完成 {len(_rev['reviewed'])} 只")
     except Exception as e:
         if not args.quiet:
             print(f"  ⚠️ 消息面更新异常: {e}")

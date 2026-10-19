@@ -644,7 +644,7 @@ bash run_daily.sh                  # crontab 已默认开启 --deploy
 - **③ 用窗口前真实历史预热(prime_enabled + 2018-2019 数据, 18/25 只可得)结果不降反升**: 冷启动 +276.1%/1.43/-14.7% → 预热 **+278.2%/夏普 1.52/-14.5%**(买单 1305)。即冷启动期那几笔交易**不是**收益虚高来源, 反而略拖累。
 **结论**: 预热语义分歧**对结论影响很小**(≤2pp 收益、夏普 +0.09), **不需要重新基线化**; 语义上 `prime_enabled` 是更忠实实盘的模式(需窗口前数据), 保留为研究参数(默认关)。摸底脚本的 burn-in 处理(50, 敏感性一致)依然够用。新增 `tests/test_strategy_warmup.py` 8 例。
 
-20. **消息面复查时序(2026-10-12)**: `news_notes.py` 的刷新策略是**只保留"当天"记录** —— 非当天(含此前已妙想复查的评分)一律重抓为中性标题(`score=0, auto=True`)。因此 **妙想复查必须在同一交易日、例行运行之后做**; 做完整查后需 `python -c "from live_report import build_live_report; build_live_report()"` + `bash deploy.sh --live-only` 重新生成并部署报告, 评分才会出现在页面上。**补做的复查(次日/非交易日)不会进报告, 只留在 git 历史**(2026-10-11 周末复查 6 只即为此例, 提交 `02098b1`)。覆盖范围 = 当日持仓 + 次日待买候选; 评分口径与摘要写法见 `daily_signal_readme.md` 的"消息面复查(妙想)"节。
+20. **消息面复查时序(2026-10-12)**: `news_notes.py` 的刷新策略是**只保留"当天"记录** —— 非当天(含此前已妙想复查的评分)一律重抓为中性标题(`score=0, auto=True`)。因此 **妙想复查必须在同一交易日、例行运行之后做**; 做完整查后需 `python -c "from live_report import build_live_report; build_live_report()"` + `bash deploy.sh --live-only` 重新生成并部署报告, 评分才会出现在页面上。**补做的复查(次日/非交易日)不会进报告, 只留在 git 历史**(2026-10-11 周末复查 6 只即为此例, 提交 `02098b1`)。覆盖范围 = 当日持仓 + 次日待买候选; 评分口径与摘要写法见 `daily_signal_readme.md` 的"消息面复查(妙想)"节。**清单化(2026-10-19)**: 例行运行结束自动写 `logs/review_queue_<日期>.md`(含自动新闻底稿/股数/成本/收盘/浮盈)并在输出打印"⏳ 妙想复查待办: N 只"; `python news_notes.py --status` 核验完成度(待复查 >0 退出码 1)、`--set <symbol> <score> "<summary>"` 写入记录、`--queue` 手工重生成清单; json 边车 `review_queue_<日期>.json` 记录范围与状态(范围含"被跳过候选"时仍可准确核验)。`tests/test_news_notes.py` 覆盖清单/写入/核验, 并有 AST 护栏确保 `daily_signal.main` 真的接线(防"函数写了没调用")。
 
 ---
 
