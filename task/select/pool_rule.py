@@ -62,12 +62,13 @@ def load_industry():
                 out[str(r.symbol).zfill(6)] = (
                     str(r.get("theme") or ""), str(r.get("industry") or ""))
     p2 = os.path.join(HERE, "industry_map.csv")
-    if os.path.exists(p2):
+    if not os.path.exists(p) and os.path.exists(p2):
+        # 仅在 cninfo 映射整体缺失时回退 Sina; 个别缺失留空(算"未映射", 避免
+        # "金融"/"金融行业" 这类命名混用把同一个 cap 拆成两组)
         d = pd.read_csv(p2, dtype={"symbol": str})
         for _, r in d.iterrows():
             s = str(r.symbol).zfill(6)
-            if s not in out:
-                out[s] = (str(r.get("sector") or ""), str(r.get("sector") or ""))
+            out.setdefault(s, (str(r.get("sector") or ""), str(r.get("sector") or "")))
     return out
 
 
