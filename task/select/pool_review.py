@@ -121,6 +121,20 @@ def main():
         add = [s for s in pool if s not in keep][:slots]
     new_members = keep + add
 
+    # 换池时把"当前持仓"并入池子(2026-10-20 用户要求): 持仓股即使不在规则排名里,
+    # 也保留在池内继续交易; ETF 不进入股票池。
+    held = {}
+    pos_path = os.path.join(os.path.dirname(HERE), "kalman", "positions.json")
+    if os.path.exists(pos_path):
+        import json as _json
+        for sym, p in _json.load(open(pos_path, encoding="utf-8")).items():
+            sym = str(sym).zfill(6)
+            if sym.startswith(("51", "15", "58", "56")):
+                continue
+            held[sym] = p.get("name", "")
+    hold_added = [s for s in held if s not in new_members]
+    new_members += hold_added
+
     rows = []
     for s in dropped:
         rows.append({"date": args.date, "action": "remove", "symbol": s,
@@ -133,15 +147,21 @@ def main():
                      "name": i.get("name", ""), "reason": "补充空缺",
                      "bucket": i.get("bucket", ""), "theme": i.get("theme", ""),
                      "industry": i.get("industry", "")})
+    for s in hold_added:
+        rows.append({"date": args.date, "action": "hold", "symbol": s,
+                     "name": held[s], "reason": "换池时保留持仓",
+                     "bucket": "", "theme": "", "industry": ""})
 
     state.update({
         "asof": args.date, "members": new_members,
         "names": {**{s: names.get(s, "") for s in keep},
-                  **{s: (info.get(s) or res.get(s, {})).get("name", "") for s in add}},
+                  **{s: (info.get(s) or res.get(s, {})).get("name", "") for s in add},
+                  **{s: held[s] for s in hold_added}},
         "reserve": list(res), "updated": args.date,
     })
     print(f"[review] {args.date}: 池 {len(new_members)} 只 | "
-          f"剔除 {len(dropped)} / 补入 {len(add)} / 保留 {len(keep)}")
+          f"剔除 {len(dropped)} / 补入 {len(add)} / 保留 {len(keep)} / "
+          f"持仓并入 {len(hold_added)}")
     for r in rows:
         print(f"  {r['action']:7s} {r['symbol']} {r['name']}  {r['reason']}")
     if not args.dry_run:

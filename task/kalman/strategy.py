@@ -197,6 +197,10 @@ class KalmanStrategy(Strategy):
         self.pool_schedule = {str(k)[:10]: set(v)
                               for k, v in (kwargs.get("pool_schedule") or {}).items()}
         self._pool_dates = sorted(self.pool_schedule)
+        self._pool_idx = -1
+        # 换池时把"末期持仓"并入当期池子(2026-10-20 用户要求), 使持仓卖出后
+        # 仍可在本期内重新买入/加仓, 直到下个换池日重新快照。
+        self._held_at_rebalance: set = set()
         self.initial_cash = float(p("initial_cash"))
         # 名额优先级(2026-09-17): ChoiceParam 不做运行时校验, 非法值显式回退
         _pm = str(p("priority_mode")).strip().lower()
@@ -667,7 +671,11 @@ class KalmanStrategy(Strategy):
             return None
         import bisect
         i = bisect.bisect_right(self._pool_dates, date_str) - 1
-        return self.pool_schedule[self._pool_dates[i]] if i >= 0 else None
+        if i != self._pool_idx:
+            self._pool_idx = i
+            self._held_at_rebalance = set(self._entry_prices) if i >= 0 else set()
+        pool = self.pool_schedule[self._pool_dates[i]] if i >= 0 else set()
+        return pool | self._held_at_rebalance
 
     def _in_pool(self, symbol: str, date_str: str) -> bool:
         pool = self._pool_for_date(date_str)
