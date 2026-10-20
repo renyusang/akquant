@@ -21,7 +21,7 @@ FALLBACK = os.path.join(KALMAN, ".catalog")
 sys.path.insert(0, HERE)
 import pool_rule as pr  # noqa: E402
 
-WINDOWS = {"ret3": 63, "ret6": 126, "ret12": 252, "ret24": 504}
+WINDOWS = {"ret1": 21, "ret3": 63, "ret6": 126, "ret12": 252, "ret24": 504}
 END = pd.Timestamp("2026-10-19")
 
 

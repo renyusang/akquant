@@ -140,11 +140,12 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     args = ap.parse_args()
     panel = pd.read_parquet(os.path.join(HERE, "pool_monthly_panel.parquet"))
-    dates_all = sorted(d for d in panel.date.unique() if d >= "2022-04-01")
-    panel = panel[panel.date >= "2022-04-01"]
+    dates_all = sorted(d for d in panel.date.unique()
+                       if "2022-04-01" <= d <= "2026-09-30")
+    panel = panel[(panel.date >= "2022-04-01") & (panel.date <= "2026-09-30")]
     jobs, meta = [], {}
     for freq in ["monthly", "quarterly"]:
-        for look in [3, 6, 12, 24]:
+        for look in [1, 3, 6, 12, 24]:
             name = f"{'M' if freq=='monthly' else 'Q'}-{look}M"
             sched, churn = build(panel, freq, look, dates_all)
             # 等权选择层: 周期内按月末复利(季度=3 个月), 池子固定不再平衡
