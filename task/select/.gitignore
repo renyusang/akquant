@@ -15,3 +15,6 @@ pool_panel.parquet
 pool_state.json
 pool_history.csv
 pool_kpi.csv
+
+# 月度面板(可重建)
+pool_monthly_panel.parquet
